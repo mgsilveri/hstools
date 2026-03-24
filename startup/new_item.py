@@ -17,30 +17,29 @@ class OBJECT_OT_create_empty_mesh(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # Store the current mode
+        # Store the current mode and active object (before any deselection)
         original_mode = context.mode
+        source_object = context.active_object
 
-        # Determine target collection
-        # If there's a selected object, use its collection
-        # Otherwise, use the active collection
-        if context.selected_objects:
-            # Get the first collection that contains the first selected object
+        # Determine parent to inherit (if the source object is nested under another)
+        target_parent = source_object.parent if source_object else None
+
+        # Determine target collection from the source object or active collection
+        if source_object:
             target_collection = None
-            for collection in context.selected_objects[0].users_collection:
+            for collection in source_object.users_collection:
                 target_collection = collection
                 break
-            # If object is not in any collection, fall back to active collection
             if target_collection is None:
                 target_collection = context.view_layer.active_layer_collection.collection
         else:
-            # No selected objects, use the active collection
             target_collection = context.view_layer.active_layer_collection.collection
 
         # Deselect all currently selected objects
         for obj in context.selected_objects:
             obj.select_set(False)
 
-        # If in Edit Mode, switch to Object Mode to deselect geometry
+        # If in Edit Mode, switch to Object Mode
         if original_mode == 'EDIT_MESH':
             bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -52,6 +51,11 @@ class OBJECT_OT_create_empty_mesh(bpy.types.Operator):
 
         # Link the object to the target collection
         target_collection.objects.link(obj)
+
+        # If the source object had a parent, nest the new object under the same parent
+        if target_parent is not None:
+            obj.parent = target_parent
+            obj.matrix_parent_inverse = target_parent.matrix_world.inverted()
 
         # Make the new object the active object
         context.view_layer.objects.active = obj
