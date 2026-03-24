@@ -1,0 +1,133 @@
+"""
+Shared mutable state for modo_style_selection_for_blender.
+
+All module-level globals that are read or written by more than one submodule
+live here.  Import with ``from . import state`` then access as
+``state._varname``.  Assign with ``state._varname = new_value``
+(no ``global`` keyword required in the calling function).
+"""
+
+# ── Backface visualization ────────────────────────────────────────────────────
+_saved_viewport_settings: dict = {}   # space_id → dict of saved values
+_bfv_previous_mode: str = ""          # tracks last-seen context.mode
+_back_edge_draw_handle = None         # handle returned by draw_handler_add
+_back_edge_cache: list = []           # world-space edge-coord pairs for GPU draw
+_uv_cache_dirty_time: float = 0.0    # timestamp of last depsgraph MESH update
+_UV_STABLE_DELAY: float = 0.05        # seconds mesh must be stable before UV cache update
+
+# ── 3D View transform tools (W / E / R) ──────────────────────────────────────
+# 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
+_active_transform_mode = None
+
+# True while Modo Materials mode (key 4) is active.
+_material_mode_active: bool = False
+
+# Per-mesh independent selection memory (Modo: each mode keeps its own selection).
+# Structure: {mesh_data_name: {'VERT': {indices}, 'EDGE': {indices}, 'FACE': {indices}}}
+_selection_memory: dict = {}
+
+# Per-mesh independent UV selection memory (sync OFF only).
+_uv_selection_memory: dict = {}
+
+# Saved pivot / cursor before W snapped them to CURSOR.
+_saved_pivot_point = None          # str | None
+_saved_cursor_location = None      # Vector | None
+_saved_snap_target = None          # str | None  (snap_target / snap_source)
+
+# Anchor tracking for the Move tool.
+_reposition_anchor = None          # Vector | None
+_last_known_median = None          # Vector | None
+_anchor_timer_running: bool = False
+
+# Draw handle for the pivot crosshair overlay.
+_pivot_crosshair_draw_handle = None
+
+# True when the gizmo activated with nothing selected (auto-selected all).
+_implicit_select_all: bool = False
+
+# ── Snap highlight (3D View) ──────────────────────────────────────────────────
+# Keys: 'screen_pos' (x,y), 'world_pos' Vector, 'elem_type' str
+_snap_highlight = None             # dict | None
+_snap_highlight_draw_handle = None
+
+# ── UV transform ─────────────────────────────────────────────────────────────
+_uv_active_transform_mode = None   # 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
+_uv_gizmo_center = None            # (u, v) tuple | None
+_uv_transform_targets = None       # list | None
+_uv_f9_original_targets = None     # list | None
+_uv_sel_targets = None             # list | None
+_uv_sel_corner_set = None          # dict | None
+_uv_handle_modal_active: bool = False
+
+# ── UV snap highlight ─────────────────────────────────────────────────────────
+_uv_snap_highlight = None          # dict | None — keys: screen_pos, uv_pos, elem_type
+_uv_snap_highlight_draw_handle = None
+
+# ── UV gizmo ──────────────────────────────────────────────────────────────────
+_uv_gizmo_draw_handle = None
+_uv_gizmo_hover_axis = None        # None | 'X' | 'Y' | 'CENTER'
+
+# ── UV overlays ───────────────────────────────────────────────────────────────
+_uv_boundary_draw_handle = None
+_uv_flipped_face_draw_handle = None
+_flipped_face_uv_cache: list = []
+_uv_boundary_cache: dict = {'uv_mode': None, 'points': [], 'segments': []}
+
+# ── Instance tagging ─────────────────────────────────────────────────────────
+_INST_PREFIX = 'inst_'
+_INST_COLLECTION = 'Instances'
+_INST_COLLECTION_TAG = 'COLOR_07'   # pink
+_instance_tag_last_run: float = 0.0
+
+# ── Keymap ────────────────────────────────────────────────────────────────────
+addon_keymaps = []
+_registered_kmi_ids = []
+_disabled_kmi_ids = []
+_saved_rmb_menus = {}
+
+_OUR_IDNAMES = {
+    'mesh.modo_select_element_under_mouse',
+    'mesh.modo_select_shortest_path',
+    'mesh.modo_lasso_select',
+    'mesh.modo_boundary_select',
+    'mesh.modo_material_mode',
+    'object.modo_click_select',
+    'object.modo_lasso_select',
+    'view3d.modo_component_mode',
+    'view3d.modo_transform',
+    'view3d.modo_drop_transform',
+    'view3d.modo_screen_move',
+    'image.modo_uv_snap_highlight',
+    'image.modo_uv_transform',
+    'image.modo_uv_drop_transform',
+    'image.modo_uv_handle_reposition',
+    'image.modo_uv_stitch',
+    'image.modo_uv_component_mode',
+    'image.modo_uv_paint_selection',
+    'image.modo_uv_click_select',
+    'image.modo_uv_lasso_select',
+    'image.modo_uv_double_click_select',
+}
+
+_NAV_IDNAMES = {
+    'view3d.rotate',
+    'view3d.move',
+    'view3d.zoom',
+    'view3d.zoom_border',
+    'view3d.view_axis',
+    'view3d.view_center_pick',
+    'image.view_pan',
+    'image.view_zoom',
+}
+
+# ── Deferred keymap setup ─────────────────────────────────────────────────────
+_deferred_retry_count = 0
+_DEFERRED_MAX_RETRIES = 10
+_DEFERRED_RETRY_INTERVAL = 0.5
+_deferred_timer_registered = False
+
+_UV_TOOL_GUARDIAN_INTERVAL = 5.0
+_uv_tool_guardian_running = False
+
+# ── Header patch ─────────────────────────────────────────────────────────────
+_orig_editor_menus_draw_collapsible = None

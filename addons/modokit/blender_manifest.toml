@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "modokit"
+version = "1.0.0"
+name = "ModoKit"
+tagline = "Modo-style selection, transforms and UV tools for Blender"
+maintainer = "Hector Silveri"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+tags = ["Mesh", "UV", "User Interface"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+]
