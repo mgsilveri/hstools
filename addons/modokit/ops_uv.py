@@ -6,11 +6,12 @@ UV editor operators:
   IMAGE_OT_modo_uv_handle_reposition  (LMB drag/click on the gizmo)
 """
 
+import json
 import math
 import time
 import bpy
 import bmesh
-from bpy.props import EnumProperty, FloatProperty
+from bpy.props import EnumProperty, FloatProperty, StringProperty
 
 from . import state
 from .utils import get_addon_preferences, _uv_debug_log
@@ -333,6 +334,7 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
     angle: FloatProperty(name='Angle', default=0.0, subtype='ANGLE', precision=2)
     center_u: FloatProperty(options={'HIDDEN'})
     center_v: FloatProperty(options={'HIDDEN'})
+    original_targets_json: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
 
     _HANDLE_HIT_RADIUS = 85.0
     _DRAG_THRESHOLD    = 3
@@ -388,14 +390,14 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                     loops[li][uv_layer].uv.y = v
         bmesh.update_edit_mesh(obj.data, destructive=finish)
 
-    # ── F9 execute ────────────────────────────────────────────────────────────
-
     def execute(self, context):
         cx = self.center_u
         cy = self.center_v
         if cx == 0.0 and cy == 0.0 and state._uv_gizmo_center is not None:
             cx, cy = state._uv_gizmo_center
-        targets = state._uv_f9_original_targets
+        targets = None
+        if self.original_targets_json:
+            targets = [tuple(t) for t in json.loads(self.original_targets_json)]
         if not targets:
             targets = _collect_uv_transform_targets(context)
         if not targets:
@@ -787,6 +789,17 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                                           cx + (iu - cx) * sx,
                                           cy + (iv - cy) * sy))
 
+            # Keep operator properties in sync so the live redo panel shows current values
+            self.transform_mode = self._mode
+            if self._mode == 'TRANSLATE':
+                self.offset_u = self._last_du
+                self.offset_v = self._last_dv
+            elif self._mode == 'ROTATE':
+                self.angle = self._last_angle_rad
+            elif self._mode == 'RESIZE':
+                self.scale_x = self._last_sx * 100.0
+                self.scale_y = self._last_sy * 100.0
+
             self._apply_uvs(context, new_positions)
             if context.area:
                 context.area.tag_redraw()
@@ -836,18 +849,7 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             self._restore_uv_selection(context)
 
             if self._dragging:
-                state._uv_f9_original_targets = list(self._uv_info)
-                self.transform_mode = state._uv_active_transform_mode or 'RESIZE'
-                self.center_u = self._center_start[0]
-                self.center_v = self._center_start[1]
-                if self.transform_mode == 'RESIZE':
-                    self.scale_x = getattr(self, '_last_sx', 1.0) * 100.0
-                    self.scale_y = getattr(self, '_last_sy', 1.0) * 100.0
-                elif self.transform_mode == 'TRANSLATE':
-                    self.offset_u = getattr(self, '_last_du', 0.0)
-                    self.offset_v = getattr(self, '_last_dv', 0.0)
-                elif self.transform_mode == 'ROTATE':
-                    self.angle = getattr(self, '_last_angle_rad', 0.0)
+                self.original_targets_json = json.dumps(self._uv_info)
             return {'FINISHED'}
 
         elif event.type in {'RIGHTMOUSE', 'ESC'}:

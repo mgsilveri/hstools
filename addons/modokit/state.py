@@ -54,7 +54,6 @@ _snap_highlight_draw_handle = None
 _uv_active_transform_mode = None   # 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
 _uv_gizmo_center = None            # (u, v) tuple | None
 _uv_transform_targets = None       # list | None
-_uv_f9_original_targets = None     # list | None
 _uv_sel_targets = None             # list | None
 _uv_sel_corner_set = None          # dict | None
 _uv_handle_modal_active: bool = False
