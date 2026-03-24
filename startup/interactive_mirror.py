@@ -1242,16 +1242,32 @@ class MESH_OT_interactive_mirror(bpy.types.Operator):
                 bm.edges.ensure_lookup_table()
                 
                 # Recreate faces
-                for vert_indices, selected, smooth, mat_idx in backup['faces']:
+                created_face_indices = []
+                for face_idx, (vert_indices, selected, smooth, mat_idx) in enumerate(backup['faces']):
                     try:
                         f = bm.faces.new([new_verts[i] for i in vert_indices])
                         f.select = selected
                         f.smooth = smooth
                         f.material_index = mat_idx
+                        created_face_indices.append(face_idx)
                     except (ValueError, IndexError):
                         pass
                 
                 bm.faces.ensure_lookup_table()
+                
+                # Restore UV layers
+                if 'uv_layers' in backup:
+                    for layer_name, face_uvs in backup['uv_layers'].items():
+                        if layer_name not in bm.loops.layers.uv:
+                            bm.loops.layers.uv.new(layer_name)
+                        uv_layer = bm.loops.layers.uv[layer_name]
+                        for bm_face_i, backup_face_idx in enumerate(created_face_indices):
+                            if bm_face_i < len(bm.faces) and backup_face_idx < len(face_uvs):
+                                loop_uvs = face_uvs[backup_face_idx]
+                                for loop_i, loop in enumerate(bm.faces[bm_face_i].loops):
+                                    if loop_i < len(loop_uvs):
+                                        loop[uv_layer].uv = loop_uvs[loop_i]
+                
                 bm.normal_update()
                 bmesh.update_edit_mesh(mesh)
                 
@@ -2023,16 +2039,32 @@ class MESH_OT_interactive_mirror(bpy.types.Operator):
         bm.edges.ensure_lookup_table()
         
         # Recreate faces
-        for vert_indices, selected, smooth, mat_idx in backup['faces']:
+        created_face_indices = []
+        for face_idx, (vert_indices, selected, smooth, mat_idx) in enumerate(backup['faces']):
             try:
                 f = bm.faces.new([new_verts[i] for i in vert_indices])
                 f.select = selected
                 f.smooth = smooth
                 f.material_index = mat_idx
+                created_face_indices.append(face_idx)
             except (ValueError, IndexError):
                 pass  # Face might already exist or invalid indices
         
         bm.faces.ensure_lookup_table()
+        
+        # Restore UV layers
+        if 'uv_layers' in backup:
+            for layer_name, face_uvs in backup['uv_layers'].items():
+                if layer_name not in bm.loops.layers.uv:
+                    bm.loops.layers.uv.new(layer_name)
+                uv_layer = bm.loops.layers.uv[layer_name]
+                for bm_face_i, backup_face_idx in enumerate(created_face_indices):
+                    if bm_face_i < len(bm.faces) and backup_face_idx < len(face_uvs):
+                        loop_uvs = face_uvs[backup_face_idx]
+                        for loop_i, loop in enumerate(bm.faces[bm_face_i].loops):
+                            if loop_i < len(loop_uvs):
+                                loop[uv_layer].uv = loop_uvs[loop_i]
+        
         bm.normal_update()
         
         bmesh.update_edit_mesh(mesh)
@@ -2247,10 +2279,19 @@ class MESH_OT_interactive_mirror(bpy.types.Operator):
             bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             
+            uv_layer_names = [layer.name for layer in bm.loops.layers.uv.values()]
+            uv_data = {}
+            for layer_name in uv_layer_names:
+                layer = bm.loops.layers.uv[layer_name]
+                uv_data[layer_name] = [
+                    [loop[layer].uv.copy() for loop in f.loops]
+                    for f in bm.faces
+                ]
             self._original_mesh_backup = {
                 'verts': [(v.co.copy(), v.select) for v in bm.verts],
                 'edges': [(tuple(v.index for v in e.verts), e.select, e.smooth) for e in bm.edges],
-                'faces': [(tuple(v.index for v in f.verts), f.select, f.smooth, f.material_index) for f in bm.faces]
+                'faces': [(tuple(v.index for v in f.verts), f.select, f.smooth, f.material_index) for f in bm.faces],
+                'uv_layers': uv_data,
             }
             
             # Create the preview geometry using the helper
