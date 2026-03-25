@@ -224,6 +224,23 @@ def register_keymaps():
                 except Exception as e:
                     print(f"[preselect] keymap '{_uv_name}' registration failed: {e}")
 
+            # Clear stale highlight when a transform/modal key is pressed.
+            # The operator returns PASS_THROUGH so the actual operator still fires.
+            # Mesh edit-mode: grab, rotate, scale, extrude, inset, bevel, knife
+            for _key in ('G', 'R', 'S', 'E', 'I', 'K'):
+                kmi = km.keymap_items.new(
+                    'view3d.modo_clear_preselect_for_transform',
+                    type=_key, value='PRESS', head=True,
+                )
+                state.addon_keymaps.append((km, kmi))
+            # Object mode: grab, rotate, scale
+            for _key in ('G', 'R', 'S'):
+                kmi = km_obj.keymap_items.new(
+                    'view3d.modo_clear_preselect_for_transform',
+                    type=_key, value='PRESS', head=True,
+                )
+                state.addon_keymaps.append((km_obj, kmi))
+
         if prefs.enable_mouse_selection:
             for shift_val, ctrl_val, sel_mode, ev_value in (
                 (False, False, 'set',    'PRESS'),

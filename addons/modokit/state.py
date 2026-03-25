@@ -106,6 +106,7 @@ _OUR_IDNAMES = {
     'view3d.modo_transform',
     'view3d.modo_drop_transform',
     'view3d.modo_screen_move',
+    'view3d.modo_clear_preselect_for_transform',
     'view3d.modo_preselect_highlight',
     'image.modo_preselect_highlight',
     'image.modo_uv_snap_highlight',

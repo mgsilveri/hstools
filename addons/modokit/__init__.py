@@ -27,6 +27,7 @@ from . import (
     shortest_path,
     raycast,
     backface_viz,
+    preselect,
     ops_edit,
     ops_object,
     panel_menu,
@@ -48,6 +49,9 @@ from .utils import _uv_debug_log
 
 _ALL_CLASSES = (
     prefs.ModoSelectionPreferences,
+    preselect.VIEW3D_OT_modo_clear_preselect_for_transform,
+    preselect.VIEW3D_OT_modo_preselect_highlight,
+    preselect.IMAGE_OT_modo_preselect_highlight,
     ops_edit.MESH_OT_modo_select_element_under_mouse,
     ops_edit.MESH_OT_modo_select_shortest_path,
     ops_edit.MESH_OT_modo_lasso_select,
@@ -84,6 +88,13 @@ def register():
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
 
+    # Pre-selection highlight handler
+    if preselect._preselect_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            preselect._preselect_depsgraph_handler)
+    # Start draw handlers immediately (keymap MOUSEMOVE drives hit updates)
+    preselect._start_preselect()
+
     # Backface visualisation handler (always registered; checks prefs at runtime)
     if backface_viz._backface_viz_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(
@@ -103,7 +114,12 @@ def register():
     def _initial_uv_cache_populate():
         try:
             ctx = bpy.context
-            if getattr(ctx, 'mode', None) == 'EDIT_MESH':
+            mode = getattr(ctx, 'mode', None)
+            if mode in ('EDIT_MESH', 'OBJECT'):
+                p = ctx.preferences.addons.get('modokit')
+                if p is None or p.preferences.enable_preselect_highlight:
+                    pass  # draw handles already started in register()
+            if mode == 'EDIT_MESH':
                 _uv_debug_log("[UV-INIT] seeding UV boundary cache on addon load")
                 uv_overlays._start_uv_boundary_overlay()
                 uv_overlays._start_uv_flipped_face_viz()
@@ -177,6 +193,11 @@ def unregister():
         bpy.app.handlers.load_post.remove(backface_viz._uv_cache_clear_load_post_handler)
     if keymap._keymap_load_post_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(keymap._keymap_load_post_handler)
+
+    if preselect._preselect_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(
+            preselect._preselect_depsgraph_handler)
+    preselect._stop_preselect()
 
     if backface_viz._backface_viz_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(

@@ -974,6 +974,28 @@ def _stop_preselect():
         state._preselect_draw_handle_uv = None
 
 
+# ── Clear-on-transform operator ───────────────────────────────────────────────
+
+class VIEW3D_OT_modo_clear_preselect_for_transform(bpy.types.Operator):
+    """Clear pre-selection highlight when a transform/modal op key is pressed.
+    Returns PASS_THROUGH so the actual operator (G/R/S/E/…) still fires."""
+    bl_idname  = 'view3d.modo_clear_preselect_for_transform'
+    bl_label   = ''
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state._preselect_hits)
+
+    def invoke(self, context, event):
+        state._preselect_hits = []
+        if context.area:
+            context.area.tag_redraw()
+        for area in _iter_image_editor_areas(context):
+            area.tag_redraw()
+        return {'PASS_THROUGH'}
+
+
 # ── Non-modal operator (invoked from MOUSEMOVE keymap entry) ─────────────────
 
 class VIEW3D_OT_modo_preselect_highlight(bpy.types.Operator):
@@ -1063,44 +1085,22 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
-# ── Depsgraph handler — mode-change + mesh/selection cache invalidation ──────
+# ── Depsgraph handler — mode-change cache invalidation ───────────────────────
 
 @bpy.app.handlers.persistent
 def _preselect_depsgraph_handler(scene, depsgraph):
-    """Clear BVH cache and highlight state when the context mode changes or
-    when mesh/object data is modified (selection state, geometry edits,
-    transforms).  Without this the draw callback shows stale 'selected'
-    values until the next mouse move."""
+    """Clear BVH cache and highlight state when the context mode changes."""
     try:
         context      = bpy.context
         current_mode = getattr(context, 'mode', None)
-        mode_changed = current_mode != state._preselect_mode
-
-        # Mesh data updated (vertex positions, face topology, selection flags).
-        mesh_updated = depsgraph.id_type_updated('MESH')
-
-        # Object transform / selection updated (relevant in Object mode).
-        obj_updated  = (current_mode == 'OBJECT'
-                        and depsgraph.id_type_updated('OBJECT'))
-
-        if not mode_changed and not mesh_updated and not obj_updated:
+        if current_mode == state._preselect_mode:
             return
-
-        if mode_changed:
-            state._preselect_mode = current_mode
-
-        # Clear BVH whenever mesh data changes — vertex positions may have
-        # shifted while vert/face count stayed the same (e.g. grab transform),
-        # which would leave positionally-stale trees.
-        if mode_changed or mesh_updated:
-            clear_bvh_cache()
-
-        # Only redraw if there is something already drawn to erase.
-        if state._preselect_hits:
-            state._preselect_hits = []
-            for window in bpy.context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type in ('VIEW_3D', 'IMAGE_EDITOR'):
-                        area.tag_redraw()
+        state._preselect_mode = current_mode
+        clear_bvh_cache()
+        state._preselect_hits = []
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in ('VIEW_3D', 'IMAGE_EDITOR'):
+                    area.tag_redraw()
     except Exception:
         pass
