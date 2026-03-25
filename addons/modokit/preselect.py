@@ -49,32 +49,6 @@ _Z_BIAS               = 5e-4 # fraction of dist to nudge verts toward camera (av
 # Set True to print diagnostics to the Blender System Console (Window → Toggle System Console)
 _PRESELECT_DEBUG = False
 
-# Tool idnames that count as "selection" mode — highlights are ENABLED for these.
-# Any other active tool (Move, Rotate, Scale, Bevel, Extrude, …) suppresses highlighting.
-_SELECT_TOOL_IDNAMES = frozenset({
-    'builtin.select',
-    'builtin.select_box',
-    'builtin.select_circle',
-    'builtin.select_lasso',
-})
-
-
-def _active_tool_is_select(context):
-    """Return True when the currently active tool is a plain selection tool.
-
-    Any interactive tool (Move, Rotate, Scale, Bevel, Extrude, etc.) returns
-    False, which suppresses the pre-selection highlight — matching Modo behaviour.
-    Falls back to True on any error so highlights are not accidentally disabled.
-    """
-    try:
-        tool = context.workspace.tools.from_space_type_and_mode(
-            context.space_data.type,
-            context.mode,
-        )
-        return tool is None or tool.idname in _SELECT_TOOL_IDNAMES
-    except Exception:
-        return True
-
 # Stipple (checkerboard) shader — discards every other pixel so the face fill
 # appears as solid-colored dots (~50% coverage) rather than a semi-transparent wash.
 # Cached at module level; reset to None by Reload Scripts.
@@ -195,6 +169,18 @@ def _iter_image_editor_areas(context):
         for area in window.screen.areas:
             if area.type == 'IMAGE_EDITOR':
                 yield area
+
+
+def _is_transforming(context):
+    """Return True while a transform (grab/scale/rotate/slide…) modal is running.
+    Checked at every MOUSEMOVE so we suppress highlights during interactive ops."""
+    try:
+        for op in context.window.modal_operators:
+            if op.bl_idname.startswith('transform.'):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # ── Hit collection — Edit Mode ────────────────────────────────────────────────
@@ -1025,7 +1011,7 @@ class VIEW3D_OT_modo_preselect_highlight(bpy.types.Operator):
                     context.area.tag_redraw()
             return {'PASS_THROUGH'}
 
-        if not _active_tool_is_select(context):
+        if _is_transforming(context):
             if state._preselect_hits:
                 state._preselect_hits = []
                 if context.area:
@@ -1084,7 +1070,7 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
                     a.tag_redraw()
             return {'PASS_THROUGH'}
 
-        if not _active_tool_is_select(context):
+        if _is_transforming(context):
             if state._preselect_hits:
                 state._preselect_hits = []
                 context.area.tag_redraw()
