@@ -716,9 +716,48 @@ def _compute_uv_seam_partner_segments(obj):
         return []
 
 
+def _compute_uv_selected_verts(obj):
+    """Return (u, v) tuples of currently-selected UV verts."""
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            return []
+        ts = bpy.context.tool_settings
+        use_sync = ts.use_uv_select_sync
+        points = []
+        seen = set()
+        for face in bm.faces:
+            if not use_sync and not face.select:
+                continue
+            for loop in face.loops:
+                if use_sync:
+                    if not loop.vert.select:
+                        continue
+                else:
+                    try:
+                        sel = loop.uv_select_vert
+                    except AttributeError:
+                        try:
+                            sel = loop[uv_layer].select
+                        except (AttributeError, KeyError):
+                            sel = False
+                    if not sel:
+                        continue
+                uv = loop[uv_layer].uv
+                key = (round(uv.x, 5), round(uv.y, 5))
+                if key in seen:
+                    continue
+                seen.add(key)
+                points.append((uv.x, uv.y))
+        return points
+    except Exception:
+        return []
+
+
 def _compute_uv_boundary_cache(context):
     """Populate state._uv_boundary_cache from live BMesh. Safe Python context only."""
-    state._uv_boundary_cache = {'uv_mode': None, 'points': [], 'segments': []}
+    state._uv_boundary_cache = {'uv_mode': None, 'points': [], 'sel_points': [], 'segments': []}
     _uv_debug_log("[UV-UBC] _compute_uv_boundary_cache called")
     try:
         if getattr(context, 'mode', None) != 'EDIT_MESH':
@@ -750,6 +789,7 @@ def _compute_uv_boundary_cache(context):
         if uv_mode == 'VERTEX':
             state._uv_boundary_cache['uv_mode'] = 'VERTEX'
             state._uv_boundary_cache['points'] = _compute_uv_seam_partner_verts(obj)
+            state._uv_boundary_cache['sel_points'] = _compute_uv_selected_verts(obj)
         elif uv_mode == 'EDGE':
             state._uv_boundary_cache['uv_mode'] = 'EDGE'
             state._uv_boundary_cache['segments'] = _compute_uv_seam_partner_segments(obj)
@@ -782,31 +822,53 @@ def _uv_boundary_draw_callback():
         if region is None:
             return
 
-        COLOR = (0.6, 0.6, 1.0, 1.0)
+        COLOR = (0.66, 0.66, 1.0, 1.0)
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         shader.bind()
         shader.uniform_float('color', COLOR)
 
         if uv_mode == 'VERTEX':
+            r = 4.0  # half-size of the square
+
+            # Selected verts — use theme vertex_select color
+            sel_points = state._uv_boundary_cache.get('sel_points', [])
+            if sel_points:
+                try:
+                    sc_theme = bpy.context.preferences.themes[0].image_editor.vertex_select
+                    sel_color = (sc_theme.r, sc_theme.g, sc_theme.b, 1.0)
+                except Exception:
+                    sel_color = (1.0, 0.62, 0.0, 1.0)
+                shader.uniform_float('color', sel_color)
+                tris = []
+                for (u, v) in sel_points:
+                    sc = _uv_view_to_region(region, sima, u, v)
+                    if sc is None:
+                        continue
+                    cx, cy = sc
+                    tris += [
+                        (cx - r, cy - r), (cx + r, cy - r), (cx + r, cy + r),
+                        (cx - r, cy - r), (cx + r, cy + r), (cx - r, cy + r),
+                    ]
+                if tris:
+                    batch_for_shader(shader, 'TRIS', {'pos': tris}).draw(shader)
+
+            # Seam-partner verts — purple
             points = state._uv_boundary_cache.get('points', [])
             if not points:
                 gpu.state.blend_set('NONE')
                 return
-            import math as _math
-            RADIUS = 4.375; SEGMENTS = 16
+            shader.uniform_float('color', COLOR)
             tris = []
             for (u, v) in points:
                 sc = _uv_view_to_region(region, sima, u, v)
                 if sc is None:
                     continue
                 cx, cy = sc
-                for i in range(SEGMENTS):
-                    a0 = 2.0 * _math.pi * i / SEGMENTS
-                    a1 = 2.0 * _math.pi * (i + 1) / SEGMENTS
-                    tris += [(cx, cy),
-                             (cx + RADIUS * _math.cos(a0), cy + RADIUS * _math.sin(a0)),
-                             (cx + RADIUS * _math.cos(a1), cy + RADIUS * _math.sin(a1))]
+                tris += [
+                    (cx - r, cy - r), (cx + r, cy - r), (cx + r, cy + r),
+                    (cx - r, cy - r), (cx + r, cy + r), (cx - r, cy + r),
+                ]
             if tris:
                 batch_for_shader(shader, 'TRIS', {'pos': tris}).draw(shader)
 

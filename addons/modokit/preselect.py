@@ -111,7 +111,8 @@ def _get_stipple_shader(mode_2d=False):
 
 
 def _nudge_toward_camera(coords, rv3d):
-    """Offset world-space coords slightly toward the camera so they win LESS_EQUAL depth test."""
+    """Offset world-space coords slightly toward the camera so they win LESS_EQUAL depth test.
+    Uses a fixed minimum offset + proportional term so it works at any distance."""
     if rv3d is None:
         return coords
     cam_pos = rv3d.view_matrix.inverted_safe().translation
@@ -121,7 +122,8 @@ def _nudge_toward_camera(coords, rv3d):
         to_cam = cam_pos - v
         dist = to_cam.length
         if dist > 1e-6:
-            v = v + to_cam.normalized() * (dist * _Z_BIAS)
+            nudge = max(0.005, dist * _Z_BIAS)
+            v = v + to_cam.normalized() * nudge
         result.append(tuple(v))
     return result
 
@@ -174,14 +176,19 @@ def _iter_image_editor_areas(context):
 
 
 def _is_transforming(context):
-    """Return True while a transform/extrude-move modal is running.
+    """Return True while a transform/extrude-move modal or viewport navigation modal is running.
     modal_operators uses internal RNA names (TRANSFORM_OT_translate, not transform.translate)."""
     try:
         wm = bpy.context.window_manager
         for window in wm.windows:
             for op in window.modal_operators:
                 idname = op.bl_idname
-                if idname.startswith('TRANSFORM_OT_') or idname == 'MESH_OT_extrude_region_move':
+                if (idname.startswith('TRANSFORM_OT_')
+                        or idname == 'MESH_OT_extrude_region_move'
+                        or idname in ('VIEW3D_OT_rotate', 'VIEW3D_OT_move',
+                                      'VIEW3D_OT_zoom', 'VIEW3D_OT_dolly',
+                                      'VIEW3D_OT_view_roll',
+                                      'IMAGE_OT_view_pan', 'IMAGE_OT_view_zoom')):
                     return True
     except Exception:
         pass
@@ -852,7 +859,7 @@ def _preselect_draw_3d_inner():
                 gpu.state.depth_test_set('ALWAYS')
                 from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
                 aa3d = _get_aa_line_3d_shader()
-                hw = 2.0
+                hw = 1.0
                 vp = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
                 if aa3d is not None:
                     pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(segs, hw)
@@ -865,7 +872,7 @@ def _preselect_draw_3d_inner():
                     b.draw(aa3d)
                 else:
                     coords = [p for p0, p1 in segs for p in (p0, p1)]
-                    gpu.state.line_width_set(2.0)
+                    gpu.state.line_width_set(1.0)
                     batch = batch_for_shader(shader, 'LINES', {'pos': coords})
                     shader.bind()
                     shader.uniform_float('color', color)
@@ -880,6 +887,7 @@ def _preselect_draw_3d_inner():
                 tris = []
                 for i in range(1, len(verts) - 1):
                     tris.extend([verts[0], verts[i], verts[i + 1]])
+                gpu.state.depth_test_set('ALWAYS')  # beat wireframe at any distance
                 stip = _get_stipple_shader(mode_2d=False)
                 if stip is not None:
                     batch = batch_for_shader(stip, 'TRIS', {"pos": tris})
@@ -896,7 +904,7 @@ def _preselect_draw_3d_inner():
                 if n >= 2:
                     from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
                     aa3d = _get_aa_line_3d_shader()
-                    hw = 1.5
+                    hw = 1.0
                     vp = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
                     edge_segs = [(hit['coords'][i], hit['coords'][(i+1) % n]) for i in range(n)]
                     if aa3d is not None:
@@ -942,6 +950,8 @@ def _preselect_draw_3d_px_inner():
         return
 
     if _is_transforming(context):
+        if state._preselect_hits:
+            state._preselect_hits = []
         return
 
     rv3d   = getattr(context, 'region_data', None)
@@ -977,7 +987,7 @@ def _preselect_draw_3d_px_inner():
                     continue
                 from .uv_overlays import _get_aa_line_shader, _aa_line_quads
                 aa = _get_aa_line_shader()
-                hw = 2.0  # 1.5px core + 0.5px fringe each side
+                hw = 1.0
                 if aa is not None:
                     pos, t_vals = _aa_line_quads([(pts[0], pts[1])], hw)
                     aa.bind()
@@ -1032,13 +1042,14 @@ def _preselect_draw_uv_inner():
     except Exception:
         return
 
-    if _is_transforming(context):
+    if _is_transforming(context) or state._uv_lmb_down:
+        if state._preselect_hits:
+            state._preselect_hits = []
         return
 
-    prefs = _get_prefs(context)
+    prefs       = _get_prefs(context)
     if prefs is not None and not prefs.enable_preselect_highlight:
         return
-
     hover_col   = _hover_color(prefs)
     hover_solid = (hover_col[0], hover_col[1], hover_col[2], 1.0)
     sel_col     = _selected_hover_color(context)
@@ -1106,7 +1117,7 @@ def _preselect_draw_uv_inner():
                         from .uv_overlays import _get_aa_line_shader, _aa_line_quads
                         aa = _get_aa_line_shader()
                         if aa is not None:
-                            hw = 1.5
+                            hw = 1.0
                             edge_segs = [(px_verts[i], px_verts[(i + 1) % n]) for i in range(n)]
                             pos, t_vals = _aa_line_quads(edge_segs, hw)
                             aa.bind()
@@ -1127,7 +1138,7 @@ def _preselect_draw_uv_inner():
                         continue
                     from .uv_overlays import _get_aa_line_shader, _aa_line_quads
                     aa = _get_aa_line_shader()
-                    hw = 2.0
+                    hw = 1.0
                     if aa is not None:
                         pos, t_vals = _aa_line_quads(seg_pts, hw)
                         aa.bind()
@@ -1137,7 +1148,7 @@ def _preselect_draw_uv_inner():
                     else:
                         line_pts = [p for seg in seg_pts for p in seg]
                         batch = batch_for_shader(shader, 'LINES', {'pos': line_pts})
-                        gpu.state.line_width_set(2.25)
+                        gpu.state.line_width_set(1.0)
                         shader.bind()
                         shader.uniform_float('color', color)
                         batch.draw(shader)
@@ -1151,7 +1162,7 @@ def _preselect_draw_uv_inner():
                             pts.append((p[0], p[1]))
                     if not pts:
                         continue
-                    r = _POINT_SIZE * 0.75  # 50% bigger than the 3D view (which uses /2.0)
+                    r = 4.0
                     tris = []
                     for (px, py) in pts:
                         tris.extend([
@@ -1236,7 +1247,8 @@ class VIEW3D_OT_modo_preselect_highlight(bpy.types.Operator):
                     context.area.tag_redraw()
             return {'PASS_THROUGH'}
 
-        if _is_transforming(context):
+        navigating = _is_transforming(context)
+        if navigating:
             if state._preselect_hits:
                 state._preselect_hits = []
                 if context.area:
@@ -1295,7 +1307,8 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
                     a.tag_redraw()
             return {'PASS_THROUGH'}
 
-        if _is_transforming(context) or state._uv_lmb_down:
+        navigating = _is_transforming(context)
+        if navigating or state._uv_lmb_down:
             if state._preselect_hits:
                 state._preselect_hits = []
                 context.area.tag_redraw()

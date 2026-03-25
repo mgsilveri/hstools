@@ -168,6 +168,7 @@ def _back_edge_draw_callback_inner() -> None:
         area = getattr(context, 'area', None)
         if area is None or area.type != 'VIEW_3D':
             return
+        region = getattr(context, 'region', None)
     except Exception:
         return
 
@@ -195,31 +196,41 @@ def _back_edge_draw_callback_inner() -> None:
 
     _diag("DRAW back_edge GPU start n=" + str(len(coords)))
     try:
-        # vert_mode already determined above via sm
         vert_mode = sm[0]
+        viewport = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
 
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-        batch  = batch_for_shader(shader, 'LINES', {"pos": coords})
+        from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
+        aa3d = _get_aa_line_3d_shader()
+        hw = 1.0
+
+        def _draw_aa3d(color_arg, depth_test):
+            if aa3d is not None:
+                pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, hw)
+                batch = batch_for_shader(aa3d, 'TRIS',
+                                         {'pos0': pos0_l, 'pos1': pos1_l,
+                                          'which': which_l, 'side': side_l})
+                gpu.state.depth_test_set(depth_test)
+                aa3d.bind()
+                aa3d.uniform_float('ucolor', color_arg)
+                aa3d.uniform_float('uhalf_w', hw)
+                aa3d.uniform_float('uviewport', viewport)
+                batch.draw(aa3d)
+            else:
+                shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+                batch  = batch_for_shader(shader, 'LINES', {"pos": coords})
+                gpu.state.depth_test_set(depth_test)
+                shader.bind()
+                shader.uniform_float("color", color_arg)
+                batch.draw(shader)
+
         gpu.state.blend_set('ALPHA')
-        shader.bind()
         if vert_mode:
-            # Vert mode: edges respect depth — only draw where visible,
-            # no occluded pass (native orange gradient already handles this).
-            gpu.state.depth_test_set('LESS_EQUAL')
-            shader.uniform_float("color", color)
-            batch.draw(shader)
+            _draw_aa3d(color, 'LESS_EQUAL')
         else:
-            # Edge/face mode: only draw occluded pass.
-            # Blender's native drawing already handles visible selected edges
-            # (including the active-edge color), so we only supplement with
-            # the through-mesh "ghost" for edges behind the surface.
-            # Desaturate toward luminance so occluded edges look ghostly, not vivid.
             lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
             t = 0.65
             ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
-            gpu.state.depth_test_set('GREATER')
-            shader.uniform_float("color", (ghost[0], ghost[1], ghost[2], 0.5))
-            batch.draw(shader)
+            _draw_aa3d((ghost[0], ghost[1], ghost[2], 0.5), 'GREATER')
         _diag("DRAW back_edge GPU done")
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.blend_set('NONE')
@@ -434,17 +445,19 @@ def _apply_bfv_to_all(context) -> None:
     global _back_edge_draw_handle, _back_vert_draw_handle, _back_face_draw_handle
     for space in _iter_view3d_spaces(context):
         _save_and_apply_bfv(space)
-    if _back_edge_draw_handle is None:
-        _back_edge_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-            _back_edge_draw_callback, (), 'WINDOW', 'POST_VIEW'
+    # Register face fill FIRST so it draws before edges — this ensures edges
+    # always composite on top of the stipple face pattern with no fighting.
+    if _back_face_draw_handle is None:
+        _back_face_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _back_face_draw_callback, (), 'WINDOW', 'POST_VIEW'
         )
     if _back_vert_draw_handle is None:
         _back_vert_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             _back_vert_draw_callback, (), 'WINDOW', 'POST_VIEW'
         )
-    if _back_face_draw_handle is None:
-        _back_face_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-            _back_face_draw_callback, (), 'WINDOW', 'POST_VIEW'
+    if _back_edge_draw_handle is None:
+        _back_edge_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _back_edge_draw_callback, (), 'WINDOW', 'POST_VIEW'
         )
 
 
