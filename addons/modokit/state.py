@@ -66,6 +66,9 @@ _uv_snap_highlight_draw_handle = None
 _uv_gizmo_draw_handle = None
 _uv_gizmo_hover_axis = None        # None | 'X' | 'Y' | 'CENTER'
 
+# ── UV preselect drag suppression ─────────────────────────────────────────────
+_uv_lmb_down: bool = False         # True while LMB is held in the UV editor
+
 # ── UV overlays ───────────────────────────────────────────────────────────────
 _uv_boundary_draw_handle = None
 _uv_flipped_face_draw_handle = None
@@ -106,7 +109,6 @@ _OUR_IDNAMES = {
     'view3d.modo_transform',
     'view3d.modo_drop_transform',
     'view3d.modo_screen_move',
-    'view3d.modo_clear_preselect_for_transform',
     'view3d.modo_preselect_highlight',
     'image.modo_preselect_highlight',
     'image.modo_uv_snap_highlight',

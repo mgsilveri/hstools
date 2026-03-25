@@ -48,6 +48,8 @@ _Z_BIAS               = 5e-4 # fraction of dist to nudge verts toward camera (av
 
 # Set True to print diagnostics to the Blender System Console (Window → Toggle System Console)
 _PRESELECT_DEBUG = False
+# Set True to print per-edge ring + distance data for the 3D view edge detection
+_EDGE_DEBUG = False
 
 # Stipple (checkerboard) shader — discards every other pixel so the face fill
 # appears as solid-colored dots (~50% coverage) rather than a semi-transparent wash.
@@ -259,9 +261,44 @@ def _collect_edit_hits(context, mx, my):
 
         bvh     = _get_cached_bvh(obj, bm_obj)
         loc_local, _normal, face_index, _dist = bvh.ray_cast(ro_loc, rd_loc)
-        if loc_local is None or face_index is None:
+        bvh_hit = (loc_local is not None
+                   and face_index is not None
+                   and face_index < len(bm_obj.faces))
+
+        # Edge mode: when BVH misses (cursor near an edge of a topologically
+        # isolated face but not over its interior) fall back to a full
+        # screen-space scan — same approach vert mode uses above.
+        if not bvh_hit and edge_mode:
+            mx_w_3x3 = mx_w.to_3x3()
+            edge_candidates = []
+            for edge in bm_obj.edges:
+                if not any(
+                    (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
+                    for f in edge.link_faces
+                ):
+                    continue
+                v0w = mx_w @ edge.verts[0].co
+                v1w = mx_w @ edge.verts[1].co
+                sc0 = view3d_utils.location_3d_to_region_2d(region, rv3d, v0w)
+                sc1 = view3d_utils.location_3d_to_region_2d(region, rv3d, v1w)
+                if sc0 is None or sc1 is None:
+                    continue
+                sdist = _point_to_segment_2d((mx, my), sc0, sc1)
+                near_a = math.hypot(sc0.x - mx, sc0.y - my) <= _VERT_PIXEL_THRESHOLD
+                near_b = math.hypot(sc1.x - mx, sc1.y - my) <= _VERT_PIXEL_THRESHOLD
+                if sdist <= _EDGE_PIXEL_THRESHOLD or near_a or near_b:
+                    edge_candidates.append((sdist, {
+                        'type': 'EDGE',
+                        'coords': [tuple(v0w), tuple(v1w)],
+                        'selected': edge.select,
+                        'obj': obj,
+                        'edge_index': edge.index,
+                    }))
+            edge_candidates.sort(key=lambda x: x[0])
+            hits.extend(h for _, h in edge_candidates)
             continue
-        if face_index >= len(bm_obj.faces):
+
+        if not bvh_hit:
             continue
 
         location   = mx_w @ loc_local
@@ -292,6 +329,29 @@ def _collect_edit_hits(context, mx, my):
                     'obj': obj,
                     'face_index': face.index,
                 })
+            # Supplementary pass: catch topologically isolated faces (e.g. cut-pasted
+            # islands) whose vertices happen to project near the cursor but have no
+            # topological connection to the BVH hit face.
+            seen_ring = {h['face_index'] for h in hits}
+            mx_w_3x3 = mx_w.to_3x3()
+            for face in bm_obj.faces:
+                if face.index in seen_ring:
+                    continue
+                # Front-face cull
+                if (mx_w_3x3 @ face.normal).normalized().dot(view_vec) >= 0:
+                    continue
+                for v in face.verts:
+                    vsc = view3d_utils.location_3d_to_region_2d(region, rv3d, mx_w @ v.co)
+                    if vsc is not None and math.hypot(vsc.x - mx, vsc.y - my) <= _EDGE_PIXEL_THRESHOLD:
+                        coords = [tuple(mx_w @ fv.co) for fv in face.verts]
+                        hits.append({
+                            'type': 'FACE',
+                            'coords': coords,
+                            'selected': face.select,
+                            'obj': obj,
+                            'face_index': face.index,
+                        })
+                        break
             # Always push at least the BVH-hit face so there's always feedback
             if not hits:
                 face = bm_obj.faces[face_index]
@@ -310,12 +370,63 @@ def _collect_edit_hits(context, mx, my):
             # Sorted by screen distance so the closest edge is always first.
             hit_face = bm_obj.faces[face_index]
             ring_edges = set(hit_face.edges)
-            for f in {f for e in hit_face.edges for f in e.link_faces}:
-                ring_edges.update(f.edges)
+            # Expand via vertex 1-ring (not just edge 1-ring) so edges belonging
+            # to faces that share only a vertex with the hit face are included.
+            # This matches face mode's ring_faces expansion and fixes the
+            # "3 of 4 edges near a vertex" miss.
+            for v in hit_face.verts:
+                for f in v.link_faces:
+                    ring_edges.update(f.edges)
             mx_w_3x3 = mx_w.to_3x3()
             edge_candidates = []
+            if _EDGE_DEBUG:
+                print(f"[EDGE-DBG] BVH hit face={face_index}  ring_edges={len(ring_edges)}  cursor=({mx},{my})")
             for edge in ring_edges:
                 # Only show edge if at least one adjacent face is front-facing
+                front_facing = any(
+                    (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
+                    for f in edge.link_faces
+                )
+                if not front_facing:
+                    if _EDGE_DEBUG:
+                        print(f"  edge {edge.index}: SKIP (back-facing)")
+                    continue
+                v0w = mx_w @ edge.verts[0].co
+                v1w = mx_w @ edge.verts[1].co
+                sc0 = view3d_utils.location_3d_to_region_2d(region, rv3d, v0w)
+                sc1 = view3d_utils.location_3d_to_region_2d(region, rv3d, v1w)
+                if sc0 is None or sc1 is None:
+                    if _EDGE_DEBUG:
+                        print(f"  edge {edge.index}: SKIP (off-screen  sc0={sc0} sc1={sc1})")
+                    continue
+                sdist = _point_to_segment_2d((mx, my), sc0, sc1)
+                near_a = math.hypot(sc0.x - mx, sc0.y - my) <= _VERT_PIXEL_THRESHOLD
+                near_b = math.hypot(sc1.x - mx, sc1.y - my) <= _VERT_PIXEL_THRESHOLD
+                da = math.hypot(sc0.x - mx, sc0.y - my)
+                db = math.hypot(sc1.x - mx, sc1.y - my)
+                passed = sdist <= _EDGE_PIXEL_THRESHOLD or near_a or near_b
+                if _EDGE_DEBUG:
+                    print(f"  edge {edge.index}: sdist={sdist:.1f} da={da:.1f} db={db:.1f} "
+                          f"near_a={near_a} near_b={near_b} -> {'HIT' if passed else 'miss'}")
+                if passed:
+                    edge_candidates.append((sdist, {
+                        'type': 'EDGE',
+                        'coords': [tuple(v0w), tuple(v1w)],
+                        'selected': edge.select,
+                        'obj': obj,
+                        'edge_index': edge.index,
+                    }))
+            if _EDGE_DEBUG:
+                print(f"  => {len(edge_candidates)} candidate(s) from ring")
+
+            # Supplementary pass: catch topologically isolated edges (e.g. a
+            # cut-pasted face island) that share a screen-space vertex position
+            # with the ring but have no topological connection to the BVH hit face.
+            # Only uses endpoint proximity — no segment distance check needed.
+            seen_ring = {c[1]['edge_index'] for c in edge_candidates}
+            for edge in bm_obj.edges:
+                if edge.index in seen_ring:
+                    continue
                 if not any(
                     (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
                     for f in edge.link_faces
@@ -327,8 +438,14 @@ def _collect_edit_hits(context, mx, my):
                 sc1 = view3d_utils.location_3d_to_region_2d(region, rv3d, v1w)
                 if sc0 is None or sc1 is None:
                     continue
-                sdist = _point_to_segment_2d((mx, my), sc0, sc1)
-                if sdist <= _EDGE_PIXEL_THRESHOLD:
+                near_a = math.hypot(sc0.x - mx, sc0.y - my) <= _VERT_PIXEL_THRESHOLD
+                near_b = math.hypot(sc1.x - mx, sc1.y - my) <= _VERT_PIXEL_THRESHOLD
+                if near_a or near_b:
+                    sdist = _point_to_segment_2d((mx, my), sc0, sc1)
+                    if _EDGE_DEBUG:
+                        print(f"  edge {edge.index} (isolated): sdist={sdist:.1f} "
+                              f"da={math.hypot(sc0.x-mx,sc0.y-my):.1f} "
+                              f"db={math.hypot(sc1.x-mx,sc1.y-my):.1f} -> HIT")
                     edge_candidates.append((sdist, {
                         'type': 'EDGE',
                         'coords': [tuple(v0w), tuple(v1w)],
@@ -336,6 +453,9 @@ def _collect_edit_hits(context, mx, my):
                         'obj': obj,
                         'edge_index': edge.index,
                     }))
+
+            if _EDGE_DEBUG:
+                print(f"  => {len(edge_candidates)} total candidate(s)")
             edge_candidates.sort(key=lambda x: x[0])
             hits.extend(h for _, h in edge_candidates)
 
@@ -523,7 +643,7 @@ def _collect_uv_hits(context, mx, my):
 
         if face_mode:
             for face in bm.faces:
-                # Project each loop's UV to screen and test polygon containment
+                # Project each loop's UV to screen
                 screen_pts = []
                 ok = True
                 for loop in face.loops:
@@ -535,7 +655,14 @@ def _collect_uv_hits(context, mx, my):
                     screen_pts.append(sc)
                 if not ok or len(screen_pts) < 3:
                     continue
-                if _point_in_polygon_2d((mx, my), screen_pts):
+                # Highlight if cursor is inside the polygon OR near any UV vertex
+                # (mirrors 3D view face mode which uses vertex proximity).
+                near = (
+                    _point_in_polygon_2d((mx, my), screen_pts)
+                    or any(math.hypot(sc[0] - mx, sc[1] - my) <= _EDGE_PIXEL_THRESHOLD
+                           for sc in screen_pts)
+                )
+                if near:
                     coords = [tuple(mx_w @ v.co) for v in face.verts]
                     uv_coords = [tuple(loop[uv_layer].uv) for loop in face.loops]
                     hits.append({
@@ -548,20 +675,30 @@ def _collect_uv_hits(context, mx, my):
                     })
 
         elif edge_mode:
-            for edge in bm.edges:
-                for loop in edge.link_loops:
+            class _V:  # lightweight vec2 duck-type for _point_to_segment_2d
+                def __init__(self, x, y): self.x = x; self.y = y
+            # Deduplicate by UV endpoint pair — two loops sharing the same 3D edge
+            # but different UV positions (seam) are distinct visual edges and must
+            # both be checked independently.
+            seen_uv_edges = set()
+            for face in bm.faces:
+                for loop in face.loops:
+                    edge = loop.edge
                     uv_a = loop[uv_layer].uv
                     uv_b = loop.link_loop_next[uv_layer].uv
+                    uv_key = (round(uv_a.x, 5), round(uv_a.y, 5),
+                              round(uv_b.x, 5), round(uv_b.y, 5))
+                    uv_key_rev = (uv_key[2], uv_key[3], uv_key[0], uv_key[1])
+                    if uv_key in seen_uv_edges or uv_key_rev in seen_uv_edges:
+                        continue
                     sa = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
                     sb = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
                     if sa is None or sb is None:
                         continue
-
-                    class _V:  # lightweight vec2 duck-type for _point_to_segment_2d
-                        def __init__(self, x, y): self.x = x; self.y = y
-
                     sdist = _point_to_segment_2d((mx, my), _V(*sa), _V(*sb))
-                    if sdist <= _EDGE_PIXEL_THRESHOLD:
+                    near_a = math.hypot(sa[0] - mx, sa[1] - my) <= _VERT_PIXEL_THRESHOLD
+                    near_b = math.hypot(sb[0] - mx, sb[1] - my) <= _VERT_PIXEL_THRESHOLD
+                    if sdist <= _EDGE_PIXEL_THRESHOLD or near_a or near_b:
                         v0w = tuple(mx_w @ edge.verts[0].co)
                         v1w = tuple(mx_w @ edge.verts[1].co)
                         hits.append({
@@ -572,7 +709,7 @@ def _collect_uv_hits(context, mx, my):
                             'edge_index': edge.index,
                             '_uv': {'type': 'EDGE', 'coords': [(tuple(uv_a), tuple(uv_b))], 'selected': edge.select},
                         })
-                        break  # one loop hit is enough
+                        seen_uv_edges.add(uv_key)
 
         elif vert_mode:
             for vert in bm.verts:
@@ -709,22 +846,31 @@ def _preselect_draw_3d_inner():
                 continue  # EDGE/VERT drawn in POST_PIXEL callback instead
 
             if htype == 'OBJECT':
-                coords = []
-                for p0, p1 in hit['edge_coords']:
-                    coords.append(p0)
-                    coords.append(p1)
-                if not coords:
+                segs = list(hit['edge_coords'])
+                if not segs:
                     continue
-                # Use ALWAYS depth so the wireframe draws correctly in both
-                # solid and wireframe display modes, and avoids Z-fighting at
-                # grazing angles (ray_cast already guarantees topmost object).
                 gpu.state.depth_test_set('ALWAYS')
-                gpu.state.line_width_set(2.0)
-                batch = batch_for_shader(shader, 'LINES', {"pos": coords})
-                shader.bind()
-                shader.uniform_float("color", color)
-                batch.draw(shader)
-                gpu.state.line_width_set(1.0)
+                from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
+                aa3d = _get_aa_line_3d_shader()
+                hw = 2.0
+                vp = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
+                if aa3d is not None:
+                    pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(segs, hw)
+                    b = batch_for_shader(aa3d, 'TRIS',
+                        {'pos0': pos0_l, 'pos1': pos1_l, 'which': which_l, 'side': side_l})
+                    aa3d.bind()
+                    aa3d.uniform_float('ucolor', color)
+                    aa3d.uniform_float('uhalf_w', hw)
+                    aa3d.uniform_float('uviewport', vp)
+                    b.draw(aa3d)
+                else:
+                    coords = [p for p0, p1 in segs for p in (p0, p1)]
+                    gpu.state.line_width_set(2.0)
+                    batch = batch_for_shader(shader, 'LINES', {'pos': coords})
+                    shader.bind()
+                    shader.uniform_float('color', color)
+                    batch.draw(shader)
+                    gpu.state.line_width_set(1.0)
                 gpu.state.depth_test_set('LESS_EQUAL')
 
             elif htype == 'FACE':
@@ -745,6 +891,30 @@ def _preselect_draw_3d_inner():
                     shader.bind()
                     shader.uniform_float("color", hover_col)
                     batch.draw(shader)
+                # AA edge outline on top of face fill
+                n = len(hit['coords'])
+                if n >= 2:
+                    from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
+                    aa3d = _get_aa_line_3d_shader()
+                    hw = 1.5
+                    vp = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
+                    edge_segs = [(hit['coords'][i], hit['coords'][(i+1) % n]) for i in range(n)]
+                    if aa3d is not None:
+                        pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(edge_segs, hw)
+                        b = batch_for_shader(aa3d, 'TRIS',
+                            {'pos0': pos0_l, 'pos1': pos1_l, 'which': which_l, 'side': side_l})
+                        aa3d.bind()
+                        aa3d.uniform_float('ucolor', hover_solid)
+                        aa3d.uniform_float('uhalf_w', hw)
+                        aa3d.uniform_float('uviewport', vp)
+                        b.draw(aa3d)
+                    else:
+                        coords = [p for seg in edge_segs for p in seg]
+                        gpu.state.line_width_set(1.0)
+                        batch = batch_for_shader(shader, 'LINES', {'pos': coords})
+                        shader.bind()
+                        shader.uniform_float('color', hover_solid)
+                        batch.draw(shader)
     finally:
         gpu.state.depth_mask_set(True)
         gpu.state.depth_test_set('LESS_EQUAL')
@@ -805,12 +975,22 @@ def _preselect_draw_3d_px_inner():
                     pts.append((sc.x, sc.y))
                 if len(pts) != 2:
                     continue
-                batch = batch_for_shader(shader, 'LINES', {"pos": pts})
-                gpu.state.line_width_set(3.0)
-                shader.bind()
-                shader.uniform_float("color", color)
-                batch.draw(shader)
-                gpu.state.line_width_set(1.0)
+                from .uv_overlays import _get_aa_line_shader, _aa_line_quads
+                aa = _get_aa_line_shader()
+                hw = 2.0  # 1.5px core + 0.5px fringe each side
+                if aa is not None:
+                    pos, t_vals = _aa_line_quads([(pts[0], pts[1])], hw)
+                    aa.bind()
+                    aa.uniform_float('ucolor', color)
+                    aa.uniform_float('uhalf_w', hw)
+                    batch_for_shader(aa, 'TRIS', {'pos': pos, 't': t_vals}).draw(aa)
+                else:
+                    batch = batch_for_shader(shader, 'LINES', {'pos': pts})
+                    gpu.state.line_width_set(3.0)
+                    shader.bind()
+                    shader.uniform_float('color', color)
+                    batch.draw(shader)
+                    gpu.state.line_width_set(1.0)
 
             elif htype == 'VERT':
                 if not hit['coords']:
@@ -920,23 +1100,48 @@ def _preselect_draw_uv_inner():
                         shader.uniform_float("color", hover_col)
                         batch.draw(shader)
 
+                    # AA perimeter edge outline
+                    n = len(px_verts)
+                    if n >= 2:
+                        from .uv_overlays import _get_aa_line_shader, _aa_line_quads
+                        aa = _get_aa_line_shader()
+                        if aa is not None:
+                            hw = 1.5
+                            edge_segs = [(px_verts[i], px_verts[(i + 1) % n]) for i in range(n)]
+                            pos, t_vals = _aa_line_quads(edge_segs, hw)
+                            aa.bind()
+                            aa.uniform_float('ucolor', hover_col)
+                            aa.uniform_float('uhalf_w', hw)
+                            batch_for_shader(aa, 'TRIS', {'pos': pos, 't': t_vals}).draw(aa)
+
                 elif utype == 'EDGE':
                     segs = uv_hit['coords']   # list of ((u0,v0),(u1,v1))
-                    line_pts = []
+                    seg_pts = []
                     for (u0, v0), (u1, v1) in segs:
                         p0 = _uv_view_to_region(region, sima, u0, v0)
                         p1 = _uv_view_to_region(region, sima, u1, v1)
                         if p0 is None or p1 is None:
                             continue
-                        line_pts.extend([(p0[0], p0[1]), (p1[0], p1[1])])
-                    if not line_pts:
+                        seg_pts.append(((p0[0], p0[1]), (p1[0], p1[1])))
+                    if not seg_pts:
                         continue
-                    batch = batch_for_shader(shader, 'LINES', {"pos": line_pts})
-                    gpu.state.line_width_set(2.25)  # 75% of the 3D view's 3.0
-                    shader.bind()
-                    shader.uniform_float("color", color)
-                    batch.draw(shader)
-                    gpu.state.line_width_set(1.0)
+                    from .uv_overlays import _get_aa_line_shader, _aa_line_quads
+                    aa = _get_aa_line_shader()
+                    hw = 2.0
+                    if aa is not None:
+                        pos, t_vals = _aa_line_quads(seg_pts, hw)
+                        aa.bind()
+                        aa.uniform_float('ucolor', color)
+                        aa.uniform_float('uhalf_w', hw)
+                        batch_for_shader(aa, 'TRIS', {'pos': pos, 't': t_vals}).draw(aa)
+                    else:
+                        line_pts = [p for seg in seg_pts for p in seg]
+                        batch = batch_for_shader(shader, 'LINES', {'pos': line_pts})
+                        gpu.state.line_width_set(2.25)
+                        shader.bind()
+                        shader.uniform_float('color', color)
+                        batch.draw(shader)
+                        gpu.state.line_width_set(1.0)
 
                 elif utype == 'VERT':
                     pts = []
@@ -1090,7 +1295,7 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
                     a.tag_redraw()
             return {'PASS_THROUGH'}
 
-        if _is_transforming(context):
+        if _is_transforming(context) or state._uv_lmb_down:
             if state._preselect_hits:
                 state._preselect_hits = []
                 context.area.tag_redraw()
@@ -1107,6 +1312,29 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
         for a in _iter_view3d_areas(context):
             a.tag_redraw()
 
+        return {'PASS_THROUGH'}
+
+
+class IMAGE_OT_modo_preselect_lmb_track(bpy.types.Operator):
+    """Track LMB press/release to suppress preselect highlight during drag-select."""
+    bl_idname  = 'image.modo_preselect_lmb_track'
+    bl_label   = 'Modo Preselect LMB Track'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.space_data is not None
+                and context.space_data.type == 'IMAGE_EDITOR')
+
+    def invoke(self, context, event):
+        if event.value == 'PRESS':
+            state._uv_lmb_down = True
+            if state._preselect_hits:
+                state._preselect_hits = []
+                if context.area:
+                    context.area.tag_redraw()
+        else:
+            state._uv_lmb_down = False
         return {'PASS_THROUGH'}
 
 

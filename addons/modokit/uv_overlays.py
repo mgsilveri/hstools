@@ -20,6 +20,191 @@ from .utils import get_addon_preferences, _uv_debug_log, _diag
 
 # _get_snap_elements is used by uv_snap.py — imported lazily there.
 
+# ── AA line shader (soft-edge quads, Vulkan/OpenGL safe) ──────────────────────
+# Draws lines as screen-space quads with a smoothstep alpha falloff toward the
+# edges, giving antialiased appearance without relying on gl_LineWidth (which
+# is an optional Vulkan feature and often clamped to 1px).
+_aa_line_shader_cache = None
+_aa_line_3d_shader_cache = None
+
+_AA_LINE_VERT_SRC = (
+    'void main() {\n'
+    '    gl_Position = ModelViewProjectionMatrix * vec4(pos, 0.0, 1.0);\n'
+    '    vT = t;\n'   # t is in screen pixels: 0=centerline, ±half_w=geometric edge
+    '}\n'
+)
+_AA_LINE_FRAG_SRC = (
+    # vT in pixel distance from centerline; uhalf_w = quad half-width in pixels.
+    # Solid core from 0 to (uhalf_w - 1.0), then 1px linear fade to transparent.
+    'void main() {\n'
+    '    float d = abs(vT);\n'
+    '    float a = 1.0 - smoothstep(uhalf_w - 1.0, uhalf_w, d);\n'
+    '    fragColor = vec4(ucolor.rgb, ucolor.a * a);\n'
+    '}\n'
+)
+
+
+def _get_aa_line_shader():
+    global _aa_line_shader_cache
+    if _aa_line_shader_cache is None:
+        try:
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+            info.push_constant('VEC4', 'ucolor')
+            info.push_constant('FLOAT', 'uhalf_w')
+            info.vertex_in(0, 'VEC2', 'pos')
+            info.vertex_in(1, 'FLOAT', 't')
+            iface = gpu.types.GPUStageInterfaceInfo('aa_iface')
+            iface.smooth('FLOAT', 'vT')
+            info.vertex_out(iface)
+            info.fragment_out(0, 'VEC4', 'fragColor')
+            info.vertex_source(_AA_LINE_VERT_SRC)
+            info.fragment_source(_AA_LINE_FRAG_SRC)
+            _aa_line_shader_cache = gpu.shader.create_from_info(info)
+        except Exception as e:
+            print(f'[modokit] aa_line shader failed: {e}')
+    return _aa_line_shader_cache
+
+
+def _aa_line_quads(segments, half_w):
+    """Build pos + t arrays for AA line quads from a list of (p0, p1) segments.
+
+    t is in screen pixels (0 = centerline, ±half_w = geometric quad edge).
+    half_w = visual_half_width + 1.0 to leave room for the 1px fringe.
+    Returns (pos_list, t_list).
+    """
+    pos = []
+    t_vals = []
+    for (x0, y0), (x1, y1) in segments:
+        dx = x1 - x0
+        dy = y1 - y0
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1e-6:
+            continue
+        # Perpendicular unit vector scaled to half_w pixels
+        nx = -dy / length * half_w
+        ny =  dx / length * half_w
+        a = (x0 + nx, y0 + ny);  ta =  half_w
+        b = (x0 - nx, y0 - ny);  tb = -half_w
+        c = (x1 + nx, y1 + ny);  tc =  half_w
+        d = (x1 - nx, y1 - ny);  td = -half_w
+        pos    += [a, b, c, b, d, c]
+        t_vals += [ta, tb, tc, tb, td, tc]
+    return pos, t_vals
+
+
+# ── AA line shader — 3D world-space (POST_VIEW callbacks) ─────────────────────
+# Uses "screen-space line expansion": each vertex carries its own 3D pos plus
+# the other endpoint of the segment. The vertex shader projects both to NDC,
+# computes the perpendicular in screen space, and offsets by ±half_w pixels.
+# This gives true sub-pixel AA regardless of backend or camera angle.
+_aa_line_3d_shader_cache = None
+
+_AA_LINE_3D_VERT_SRC = (
+    'void main() {\n'
+    '    vec4 c0 = ModelViewProjectionMatrix * vec4(pos0, 1.0);\n'
+    '    vec4 c1 = ModelViewProjectionMatrix * vec4(pos1, 1.0);\n'
+    # Select the actual clip position for this vertex (which=0→p0, 1→p1)
+    '    vec4 cp = mix(c0, c1, which);\n'
+    # Direction always p0→p1 in NDC so perp is consistent for all 6 verts
+    '    vec2 n0 = c0.xy / c0.w;\n'
+    '    vec2 n1 = c1.xy / c1.w;\n'
+    '    vec2 d  = n1 - n0;\n'
+    '    float dl = length(d);\n'
+    '    if (dl < 0.0001) { gl_Position = cp; vT = 0.0; return; }\n'
+    '    d /= dl;\n'
+    '    vec2 perp = vec2(-d.y, d.x);\n'
+    '    vec2 off = perp * side * vec2(2.0 / uviewport.x, 2.0 / uviewport.y);\n'
+    '    cp.xy += off * cp.w;\n'
+    '    gl_Position = cp;\n'
+    '    vT = side;\n'
+    '}\n'
+)
+# Fragment shader is identical to the 2D version — reuse _AA_LINE_FRAG_SRC
+
+
+def _get_aa_line_3d_shader():
+    global _aa_line_3d_shader_cache
+    if _aa_line_3d_shader_cache is None:
+        try:
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+            info.push_constant('VEC4', 'ucolor')
+            info.push_constant('FLOAT', 'uhalf_w')
+            info.push_constant('VEC2', 'uviewport')
+            info.vertex_in(0, 'VEC3', 'pos0')
+            info.vertex_in(1, 'VEC3', 'pos1')
+            info.vertex_in(2, 'FLOAT', 'which')
+            info.vertex_in(3, 'FLOAT', 'side')
+            iface = gpu.types.GPUStageInterfaceInfo('aa3d_iface')
+            iface.smooth('FLOAT', 'vT')
+            info.vertex_out(iface)
+            info.fragment_out(0, 'VEC4', 'fragColor')
+            info.vertex_source(_AA_LINE_3D_VERT_SRC)
+            info.fragment_source(_AA_LINE_FRAG_SRC)
+            _aa_line_3d_shader_cache = gpu.shader.create_from_info(info)
+        except Exception as e:
+            print(f'[modokit] aa_line_3d shader failed: {e}')
+    return _aa_line_3d_shader_cache
+
+
+def _aa_line_quads_3d(segments, half_w):
+    """Build pos0/pos1/which/side arrays for the 3D AA line shader.
+
+    All 6 verts per segment carry both endpoints; direction is always p0→p1
+    so the perpendicular is consistent and the quad doesn't twist.
+    """
+    pos0_l  = []
+    pos1_l  = []
+    which_l = []
+    side_l  = []
+    hw = float(half_w)
+    for p0, p1 in segments:
+        # 6 verts: tri1=(v0+,v0-,v1+)  tri2=(v0-,v1-,v1+)
+        # which=0.0 → at p0, which=1.0 → at p1
+        pos0_l  += [p0, p0, p0,  p0, p0, p0]
+        pos1_l  += [p1, p1, p1,  p1, p1, p1]
+        which_l += [0.0, 0.0, 1.0,  0.0, 1.0, 1.0]
+        side_l  += [hw, -hw,  hw,  -hw,  hw, -hw]
+    return pos0_l, pos1_l, which_l, side_l
+
+
+# ── SDF circle shader (for the centre dot) ────────────────────────────────────
+_dot_shader_cache = None
+
+_DOT_VERT_SRC = (
+    'void main() {\n'
+    '    gl_Position = ModelViewProjectionMatrix * vec4(pos, 0.0, 1.0);\n'
+    '}\n'
+)
+_DOT_FRAG_SRC = (
+    # gl_FragCoord.xy is in region pixel space (same as cx/cy from _uv_view_to_region).
+    'void main() {\n'
+    '    float d = length(gl_FragCoord.xy - ucenter) - uradius;\n'
+    '    float a = 1.0 - smoothstep(-0.5, 0.5, d);\n'
+    '    fragColor = vec4(ucolor.rgb, ucolor.a * a);\n'
+    '}\n'
+)
+
+
+def _get_dot_shader():
+    global _dot_shader_cache
+    if _dot_shader_cache is None:
+        try:
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+            info.push_constant('VEC4', 'ucolor')
+            info.push_constant('VEC2', 'ucenter')
+            info.push_constant('FLOAT', 'uradius')
+            info.vertex_in(0, 'VEC2', 'pos')
+            info.fragment_out(0, 'VEC4', 'fragColor')
+            info.vertex_source(_DOT_VERT_SRC)
+            info.fragment_source(_DOT_FRAG_SRC)
+            _dot_shader_cache = gpu.shader.create_from_info(info)
+        except Exception as e:
+            print(f'[modokit] dot shader failed: {e}')
+    return _dot_shader_cache
+
 
 # ── Sync / read gizmo centre to/from BMesh ────────────────────────────────────
 
@@ -208,7 +393,7 @@ def _uv_gizmo_draw_callback():
             return
         cx, cy = sc
 
-        ARM = 80.0; GAP = 10.0; SHAFT_W = 2.5; HL_W = 3.5
+        ARM = 80.0; GAP = 10.0; SHAFT_W = 1.0; HL_W = 1.75
         ARROW_L = 14.0; ARROW_HW = 5.5; SQ = 5.0; DOT_R = 5.0
 
         COL_X  = (0.93, 0.21, 0.31, 1.0)
@@ -219,83 +404,130 @@ def _uv_gizmo_draw_callback():
         hover = state._uv_gizmo_hover_axis
         x_col = COL_HL if hover == 'X' else COL_X
         y_col = COL_HL if hover == 'Y' else COL_Y
-        x_w   = HL_W   if hover == 'X' else SHAFT_W
-        y_w   = HL_W   if hover == 'Y' else SHAFT_W
+        x_hw  = (HL_W   if hover == 'X' else SHAFT_W) * 0.5 + 1.0   # core_half + 1px fringe
+        y_hw  = (HL_W   if hover == 'Y' else SHAFT_W) * 0.5 + 1.0
 
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        flat   = gpu.shader.from_builtin('UNIFORM_COLOR')
+        aa     = _get_aa_line_shader()
+        sdot   = _get_dot_shader()
         gpu.state.blend_set('ALPHA')
-        shader.bind()
+
+        def _draw_aa_line(segments, color, half_w, shader=aa, fallback=flat):
+            """Draw line segments as AA quads if shader available, else LINES."""
+            if shader is not None:
+                pos, t_vals = _aa_line_quads(segments, half_w)
+                if not pos:
+                    return
+                batch = batch_for_shader(shader, 'TRIS', {'pos': pos, 't': t_vals})
+                shader.bind()
+                shader.uniform_float('ucolor', color)
+                shader.uniform_float('uhalf_w', half_w)
+                batch.draw(shader)
+            else:
+                pts = []
+                for p0, p1 in segments:
+                    pts += [p0, p1]
+                fallback.bind()
+                fallback.uniform_float('color', color)
+                gpu.state.line_width_set((half_w - 0.5) * 2)
+                batch_for_shader(fallback, 'LINES', {'pos': pts}).draw(fallback)
+                gpu.state.line_width_set(1.0)
+
+        def _draw_arrow_aa(tip, bl, br, color):
+            """Draw a filled arrow triangle then add AA outline along its 3 edges."""
+            flat.bind()
+            flat.uniform_float('color', color)
+            batch_for_shader(flat, 'TRIS', {'pos': [tip, bl, br]}).draw(flat)
+            # 1px AA fringe along each edge
+            _draw_aa_line([(tip, br), (br, bl), (bl, tip)], color, 1.5)
 
         mode = state._uv_active_transform_mode
         if mode == 'TRANSLATE':
-            gpu.state.line_width_set(x_w)
-            shader.uniform_float('color', x_col)
-            batch_for_shader(shader, 'LINES', {'pos': [
-                (cx + GAP, cy), (cx + ARM - ARROW_L, cy),
-            ]}).draw(shader)
-            batch_for_shader(shader, 'TRIS', {'pos': [
-                (cx + ARM, cy), (cx + ARM - ARROW_L, cy + ARROW_HW),
+            _draw_aa_line(
+                [((cx + GAP, cy), (cx + ARM - ARROW_L, cy))],
+                x_col, x_hw)
+            _draw_arrow_aa(
+                (cx + ARM, cy),
                 (cx + ARM - ARROW_L, cy - ARROW_HW),
-            ]}).draw(shader)
-            gpu.state.line_width_set(y_w)
-            shader.uniform_float('color', y_col)
-            batch_for_shader(shader, 'LINES', {'pos': [
-                (cx, cy + GAP), (cx, cy + ARM - ARROW_L),
-            ]}).draw(shader)
-            batch_for_shader(shader, 'TRIS', {'pos': [
-                (cx, cy + ARM), (cx + ARROW_HW, cy + ARM - ARROW_L),
+                (cx + ARM - ARROW_L, cy + ARROW_HW),
+                x_col)
+
+            _draw_aa_line(
+                [((cx, cy + GAP), (cx, cy + ARM - ARROW_L))],
+                y_col, y_hw)
+            _draw_arrow_aa(
+                (cx, cy + ARM),
                 (cx - ARROW_HW, cy + ARM - ARROW_L),
-            ]}).draw(shader)
+                (cx + ARROW_HW, cy + ARM - ARROW_L),
+                y_col)
 
         elif mode == 'ROTATE':
             SEGMENTS = 64; RADIUS = ARM * 0.65
-            gpu.state.line_width_set(SHAFT_W)
-            shader.uniform_float('color', COL_WHITE)
-            arc = []
+            arc_segs = []
             for i in range(SEGMENTS):
                 a0 = 2.0 * _math.pi * i / SEGMENTS
                 a1 = 2.0 * _math.pi * (i + 1) / SEGMENTS
-                arc += [(cx + RADIUS * _math.cos(a0), cy + RADIUS * _math.sin(a0)),
-                        (cx + RADIUS * _math.cos(a1), cy + RADIUS * _math.sin(a1))]
-            batch_for_shader(shader, 'LINES', {'pos': arc}).draw(shader)
+                arc_segs.append((
+                    (cx + RADIUS * _math.cos(a0), cy + RADIUS * _math.sin(a0)),
+                    (cx + RADIUS * _math.cos(a1), cy + RADIUS * _math.sin(a1)),
+                ))
+            _draw_aa_line(arc_segs, COL_WHITE, SHAFT_W * 0.5 + 1.0)
 
         elif mode == 'RESIZE':
-            gpu.state.line_width_set(x_w)
-            shader.uniform_float('color', x_col)
-            batch_for_shader(shader, 'LINES', {'pos': [
-                (cx + GAP, cy), (cx + ARM - SQ, cy),
-            ]}).draw(shader)
+            _draw_aa_line(
+                [((cx + GAP, cy), (cx + ARM - SQ, cy))],
+                x_col, x_hw)
             ex = cx + ARM
-            batch_for_shader(shader, 'TRIS', {'pos': [
-                (ex - SQ, cy - SQ), (ex + SQ, cy - SQ), (ex + SQ, cy + SQ),
-                (ex - SQ, cy - SQ), (ex + SQ, cy + SQ), (ex - SQ, cy + SQ),
-            ]}).draw(shader)
-            gpu.state.line_width_set(y_w)
-            shader.uniform_float('color', y_col)
-            batch_for_shader(shader, 'LINES', {'pos': [
-                (cx, cy + GAP), (cx, cy + ARM - SQ),
-            ]}).draw(shader)
-            ey = cy + ARM
-            batch_for_shader(shader, 'TRIS', {'pos': [
-                (cx - SQ, ey - SQ), (cx + SQ, ey - SQ), (cx + SQ, ey + SQ),
-                (cx - SQ, ey - SQ), (cx + SQ, ey + SQ), (cx - SQ, ey + SQ),
-            ]}).draw(shader)
+            flat.bind()
+            flat.uniform_float('color', x_col)
+            sq_x = [(ex-SQ, cy-SQ), (ex+SQ, cy-SQ), (ex+SQ, cy+SQ),
+                    (ex-SQ, cy-SQ), (ex+SQ, cy+SQ), (ex-SQ, cy+SQ)]
+            batch_for_shader(flat, 'TRIS', {'pos': sq_x}).draw(flat)
+            _draw_aa_line([(p, q) for p, q in [
+                ((ex-SQ,cy-SQ),(ex+SQ,cy-SQ)), ((ex+SQ,cy-SQ),(ex+SQ,cy+SQ)),
+                ((ex+SQ,cy+SQ),(ex-SQ,cy+SQ)), ((ex-SQ,cy+SQ),(ex-SQ,cy-SQ))
+            ]], x_col, 1.5)
 
-        # Centre dot
-        DOT_SEGS = 24
+            _draw_aa_line(
+                [((cx, cy + GAP), (cx, cy + ARM - SQ))],
+                y_col, y_hw)
+            ey = cy + ARM
+            flat.bind()
+            flat.uniform_float('color', y_col)
+            sq_y = [(cx-SQ,ey-SQ),(cx+SQ,ey-SQ),(cx+SQ,ey+SQ),
+                    (cx-SQ,ey-SQ),(cx+SQ,ey+SQ),(cx-SQ,ey+SQ)]
+            batch_for_shader(flat, 'TRIS', {'pos': sq_y}).draw(flat)
+            _draw_aa_line([(p, q) for p, q in [
+                ((cx-SQ,ey-SQ),(cx+SQ,ey-SQ)), ((cx+SQ,ey-SQ),(cx+SQ,ey+SQ)),
+                ((cx+SQ,ey+SQ),(cx-SQ,ey+SQ)), ((cx-SQ,ey+SQ),(cx-SQ,ey-SQ))
+            ]], y_col, 1.5)
+
+        # Centre dot — SDF circle for perfect AA
         dot_col = COL_HL if hover == 'CENTER' else COL_WHITE
         dot_r   = DOT_R * 1.3 if hover == 'CENTER' else DOT_R
-        shader.uniform_float('color', dot_col)
-        dot_tris = []
-        for i in range(DOT_SEGS):
-            a0 = 2.0 * _math.pi * i / DOT_SEGS
-            a1 = 2.0 * _math.pi * (i + 1) / DOT_SEGS
-            dot_tris += [(cx, cy),
-                         (cx + dot_r * _math.cos(a0), cy + dot_r * _math.sin(a0)),
-                         (cx + dot_r * _math.cos(a1), cy + dot_r * _math.sin(a1))]
-        batch_for_shader(shader, 'TRIS', {'pos': dot_tris}).draw(shader)
+        if sdot is not None:
+            hw = dot_r + 2.0
+            quad = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw),
+                    (cx-hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
+            batch = batch_for_shader(sdot, 'TRIS', {'pos': quad})
+            sdot.bind()
+            sdot.uniform_float('ucolor', dot_col)
+            sdot.uniform_float('ucenter', (cx, cy))
+            sdot.uniform_float('uradius', dot_r)
+            batch.draw(sdot)
+        else:
+            DOT_SEGS = 24
+            flat.bind()
+            flat.uniform_float('color', dot_col)
+            dot_tris = []
+            for i in range(DOT_SEGS):
+                a0 = 2.0 * _math.pi * i / DOT_SEGS
+                a1 = 2.0 * _math.pi * (i + 1) / DOT_SEGS
+                dot_tris += [(cx, cy),
+                             (cx + dot_r * _math.cos(a0), cy + dot_r * _math.sin(a0)),
+                             (cx + dot_r * _math.cos(a1), cy + dot_r * _math.sin(a1))]
+            batch_for_shader(flat, 'TRIS', {'pos': dot_tris}).draw(flat)
 
-        gpu.state.line_width_set(1.0)
         gpu.state.blend_set('NONE')
     except Exception:
         pass
@@ -584,7 +816,7 @@ def _uv_boundary_draw_callback():
                 gpu.state.blend_set('NONE')
                 return
             rw = region.width; rh = region.height
-            coords = []
+            seg_pts = []
             for (u0, v0, u1, v1) in segments:
                 s0 = _uv_view_to_region_unclamped(region, u0, v0)
                 s1 = _uv_view_to_region_unclamped(region, u1, v1)
@@ -592,12 +824,21 @@ def _uv_boundary_draw_callback():
                     continue
                 clipped = _clip_segment_to_rect(s0[0], s0[1], s1[0], s1[1], 0, 0, rw, rh)
                 if clipped is not None:
-                    coords.append((clipped[0], clipped[1]))
-                    coords.append((clipped[2], clipped[3]))
-            if coords:
-                gpu.state.line_width_set(1.5)
-                batch_for_shader(shader, 'LINES', {'pos': coords}).draw(shader)
-                gpu.state.line_width_set(1.0)
+                    seg_pts.append(((clipped[0], clipped[1]), (clipped[2], clipped[3])))
+            if seg_pts:
+                aa = _get_aa_line_shader()
+                if aa is not None:
+                    hw = 1.25
+                    pos, t_vals = _aa_line_quads(seg_pts, hw)
+                    aa.bind()
+                    aa.uniform_float('ucolor', COLOR)
+                    aa.uniform_float('uhalf_w', hw)
+                    batch_for_shader(aa, 'TRIS', {'pos': pos, 't': t_vals}).draw(aa)
+                else:
+                    coords = [p for seg in seg_pts for p in seg]
+                    gpu.state.line_width_set(1.5)
+                    batch_for_shader(shader, 'LINES', {'pos': coords}).draw(shader)
+                    gpu.state.line_width_set(1.0)
 
         gpu.state.blend_set('NONE')
     except Exception as _exc:

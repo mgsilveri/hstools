@@ -1387,6 +1387,10 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
         elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             return {'FINISHED'}
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            from . import state as _state
+            _state._preselect_hits = []
+            if context.area:
+                context.area.tag_redraw()
             return {'CANCELLED'}
         return {'RUNNING_MODAL'}
 
@@ -1405,6 +1409,11 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
         self._mouse_pos = (event.mouse_region_x, event.mouse_region_y)
         self._cache     = self._build_cache(context)
         self._paint(context, event)
+        from . import state as _state
+        if _state._preselect_hits:
+            _state._preselect_hits = []
+            if context.area:
+                context.area.tag_redraw()
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
