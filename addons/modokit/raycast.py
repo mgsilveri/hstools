@@ -123,9 +123,10 @@ def raycast_mesh(context, coord, bm=None):
             if closest_edge is not None:
                 best_dist = world_dist
                 best_hit  = {'location': location, 'normal': normal_local,
-                             'index': closest_edge.index, 'obj': obj}
+                             'index': closest_edge.index, 'obj': obj,
+                             'hit_face_index': face_index}
                 if debug:
-                    print(f"  [{obj.name}] EDGE hit → index={closest_edge.index}")
+                    print(f"  [{obj.name}] EDGE hit → index={closest_edge.index} face={face_index}")
             elif debug:
                 print(f"  [{obj.name}] EDGE – no edge within {max_screen_dist}px screen threshold")
 
@@ -195,6 +196,37 @@ def collect_edge_loop(seed_edge):
                 break
             loop.add(e)
     return loop
+
+
+def collect_edge_loop_modo(seed_edge, preferred_face=None):
+    """Walk the edge loop through seed_edge using Modo-style logic.
+
+    - Regular quad topology (valence-4 vertices): behaves identically to
+      collect_edge_loop (normal edge-loop traversal).
+    - Pole topology (e.g. cube corners, valence-3): both endpoints have no
+      standard loop continuation, so the function falls back to selecting the
+      perimeter of an adjacent face — replicating Modo's double-click behaviour
+      where clicking a cube edge loops around the face.
+
+    preferred_face: BMFace that was raycasted onto when the user clicked.  When
+                    provided it is tried first so the loop wraps the face the
+                    user was looking at, matching Modo's visual expectation.
+    """
+    loop = collect_edge_loop(seed_edge)
+    if len(loop) > 1:
+        return loop
+
+    # Both endpoints are poles — no standard loop continuation found.
+    # Fall back to the perimeter of an adjacent face.
+    faces = list(seed_edge.link_faces)
+    if not faces:
+        return loop
+
+    # Honour the hit face (the one the user raycasted onto).
+    if preferred_face is not None and preferred_face in faces:
+        faces = [preferred_face] + [f for f in faces if f is not preferred_face]
+
+    return set(faces[0].edges)
 
 
 def select_connected_faces_from(bm, start_face):

@@ -861,7 +861,10 @@ def _resync_uv_editor_selection(context, obj, select_mode, bm):
                             if lp.vert == vert:
                                 lp.uv_select_vert = True
 
-    bm2.select_flush_mode()
+    # In edge mode, skip select_flush_mode() to avoid auto-promoting faces
+    # when all edges of a face are selected (matches Blender's own behaviour).
+    if not select_mode[1]:
+        bm2.select_flush_mode()
     bmesh.update_edit_mesh(obj.data)
     _uv_debug_log(
         f"[UV-RESYNC] rebuilt: sel_faces={len(sel_face_idxs)} "

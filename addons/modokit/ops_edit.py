@@ -13,7 +13,7 @@ from bpy.props import IntProperty, EnumProperty, BoolProperty
 
 from . import state
 from .utils import get_addon_preferences, _uv_debug_log
-from .raycast import raycast_with_tolerance, collect_edge_loop
+from .raycast import raycast_with_tolerance, collect_edge_loop, collect_edge_loop_modo
 from .raycast import select_connected_faces_from, select_connected_verts_from
 from .shortest_path import (
     find_shortest_path_vertices,
@@ -182,7 +182,12 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         uv_layer = bm.loops.layers.uv.active
         if uv_layer is None:
             return
-        bm.select_flush_mode()
+        # In edge mode, skip select_flush_mode() — it promotes faces when all
+        # their edges are selected (unlike Blender's own per-click selection).
+        # Vert flags are already correct because e.select = True/False cascades
+        # to verts automatically via BMesh.
+        if not sm[1]:
+            bm.select_flush_mode()
         if sm[1]:
             for face in bm.faces:
                 for loop in face.loops:
@@ -266,7 +271,7 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
                     continue
                 all_loop_edges = set()
                 for seed in seed_edges:
-                    all_loop_edges.update(collect_edge_loop(seed))
+                    all_loop_edges.update(collect_edge_loop_modo(seed))
                 for e in all_loop_edges:
                     e.select = True
                 self._flush_uv_sync(bm_obj, context)
@@ -359,8 +364,15 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
                 self._deselect_all_objects(context)
                 bm = bmesh.from_edit_mesh(obj.data)
                 bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
             clicked_edge = bm.edges[hit_index]
-            loop_edges   = collect_edge_loop(clicked_edge)
+            # Resolve the raycasted face so Modo-style pole fallback wraps the
+            # face the user was actually looking at.
+            hit_face = None
+            hf_idx = hit_result.get('hit_face_index')
+            if hf_idx is not None and hf_idx < len(bm.faces):
+                hit_face = bm.faces[hf_idx]
+            loop_edges = collect_edge_loop_modo(clicked_edge, preferred_face=hit_face)
             if self.mode == 'set':
                 for e in loop_edges: e.select = True
             elif self.mode == 'remove':
