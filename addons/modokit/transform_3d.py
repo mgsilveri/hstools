@@ -15,6 +15,7 @@ import bmesh
 from bpy.props import EnumProperty
 
 from . import state
+from .utils import get_addon_preferences
 
 
 # ── Geometry-selection helpers ────────────────────────────────────────────────
@@ -380,41 +381,32 @@ def _find_snap_target(context, mx, my):
 
 
 def _snap_highlight_draw_callback():
-    """GPU POST_PIXEL callback: draw a solid cyan dot like the knife tool."""
+    """GPU POST_PIXEL callback: draw a square vertex highlight at the snap target."""
     if state._snap_highlight is None:
         return
     try:
         import gpu
         from gpu_extras.batch import batch_for_shader
-        import math as _math
-        sx, sy        = state._snap_highlight['screen_pos']
-        SEGMENTS      = 32
-        RADIUS_FILL   = 8.0
-        RADIUS_BORDER = 10.0
-        CYAN          = (0.0, 0.85, 1.0, 1.0)
-        BLACK         = (0.0, 0.0, 0.0, 1.0)
+        sx, sy = state._snap_highlight['screen_pos']
+        r      = 8.0
 
-        def _fan_tris(cx, cy, r):
-            pts = [(cx + r * _math.cos(2 * _math.pi * i / SEGMENTS),
-                    cy + r * _math.sin(2 * _math.pi * i / SEGMENTS))
-                   for i in range(SEGMENTS)]
-            tris = []
-            for i in range(SEGMENTS):
-                tris += [(cx, cy), pts[i], pts[(i + 1) % SEGMENTS]]
-            return tris
+        try:
+            p = get_addon_preferences(bpy.context)
+            c = p.preselect_color
+            color = (c[0], c[1], c[2], 1.0)
+        except Exception:
+            color = (0.0, 0.85, 1.0, 1.0)
+
+        quad = [
+            (sx - r, sy - r), (sx + r, sy - r), (sx + r, sy + r),
+            (sx - r, sy - r), (sx + r, sy + r), (sx - r, sy + r),
+        ]
 
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         shader.bind()
-
-        shader.uniform_float('color', BLACK)
-        batch_for_shader(shader, 'TRIS',
-                         {'pos': _fan_tris(sx, sy, RADIUS_BORDER)}).draw(shader)
-
-        shader.uniform_float('color', CYAN)
-        batch_for_shader(shader, 'TRIS',
-                         {'pos': _fan_tris(sx, sy, RADIUS_FILL)}).draw(shader)
-
+        shader.uniform_float('color', color)
+        batch_for_shader(shader, 'TRIS', {'pos': quad}).draw(shader)
         gpu.state.blend_set('NONE')
     except Exception:
         pass

@@ -172,12 +172,15 @@ def _iter_image_editor_areas(context):
 
 
 def _is_transforming(context):
-    """Return True while a transform (grab/scale/rotate/slide…) modal is running.
-    Checked at every MOUSEMOVE so we suppress highlights during interactive ops."""
+    """Return True while a transform/extrude-move modal is running.
+    modal_operators uses internal RNA names (TRANSFORM_OT_translate, not transform.translate)."""
     try:
-        for op in context.window.modal_operators:
-            if op.bl_idname.startswith('transform.'):
-                return True
+        wm = bpy.context.window_manager
+        for window in wm.windows:
+            for op in window.modal_operators:
+                idname = op.bl_idname
+                if idname.startswith('TRANSFORM_OT_') or idname == 'MESH_OT_extrude_region_move':
+                    return True
     except Exception:
         pass
     return False
@@ -217,12 +220,44 @@ def _collect_edit_hits(context, mx, my):
         if not bm_obj.faces:
             continue
 
-        bvh     = _get_cached_bvh(obj, bm_obj)
         mx_w    = obj.matrix_world
         mx_inv  = mx_w.inverted()
         ro_loc  = mx_inv @ ray_origin
         rd_loc  = (mx_inv.to_3x3() @ view_vec).normalized()
 
+        # ── Vert mode — no BVH gate needed ───────────────────────────────────
+        # Requiring a BVH hit shrinks the detection zone to the face interior,
+        # so vertices at silhouette edges/corners are only highlighted when the
+        # cursor is over the face — not when it's near the projected vertex itself.
+        # Instead, scan all verts directly using screen-space proximity +
+        # front-face normal culling.
+        if vert_mode:
+            mx_w_3x3 = mx_w.to_3x3()
+            vert_candidates = []
+            for vert in bm_obj.verts:
+                if not any(
+                    (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
+                    for f in vert.link_faces
+                ):
+                    continue
+                vw  = mx_w @ vert.co
+                sc  = view3d_utils.location_3d_to_region_2d(region, rv3d, vw)
+                if sc is None:
+                    continue
+                sdist = math.hypot(sc.x - mx, sc.y - my)
+                if sdist <= _VERT_PIXEL_THRESHOLD:
+                    vert_candidates.append((sdist, {
+                        'type': 'VERT',
+                        'coords': [tuple(vw)],
+                        'selected': vert.select,
+                        'obj': obj,
+                        'vert_index': vert.index,
+                    }))
+            vert_candidates.sort(key=lambda x: x[0])
+            hits.extend(h for _, h in vert_candidates)
+            continue   # skip BVH + face/edge branches for this object
+
+        bvh     = _get_cached_bvh(obj, bm_obj)
         loc_local, _normal, face_index, _dist = bvh.ray_cast(ro_loc, rd_loc)
         if loc_local is None or face_index is None:
             continue
@@ -303,40 +338,6 @@ def _collect_edit_hits(context, mx, my):
                     }))
             edge_candidates.sort(key=lambda x: x[0])
             hits.extend(h for _, h in edge_candidates)
-
-        # ── Vert mode ────────────────────────────────────────────────────────
-        elif vert_mode:
-            # Only consider verts on the BVH hit face + 1-ring neighbours.
-            # This prevents collecting occluded verts on the back of the mesh.
-            hit_face = bm_obj.faces[face_index]
-            ring_verts = set(hit_face.verts)
-            for e in hit_face.edges:
-                for f in e.link_faces:
-                    ring_verts.update(f.verts)
-            mx_w_3x3 = mx_w.to_3x3()
-            vert_candidates = []
-            for vert in ring_verts:
-                # Only show vert if at least one adjacent face is front-facing
-                if not any(
-                    (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
-                    for f in vert.link_faces
-                ):
-                    continue
-                vw  = mx_w @ vert.co
-                sc  = view3d_utils.location_3d_to_region_2d(region, rv3d, vw)
-                if sc is None:
-                    continue
-                sdist = math.hypot(sc.x - mx, sc.y - my)
-                if sdist <= _VERT_PIXEL_THRESHOLD:
-                    vert_candidates.append((sdist, {
-                        'type': 'VERT',
-                        'coords': [tuple(vw)],
-                        'selected': vert.select,
-                        'obj': obj,
-                        'vert_index': vert.index,
-                    }))
-            vert_candidates.sort(key=lambda x: x[0])
-            hits.extend(h for _, h in vert_candidates)
 
     return hits
 
@@ -658,14 +659,27 @@ def _preselect_draw_3d():
 
 
 def _preselect_draw_3d_inner():
+    # ── DEBUG: print active modal operator names (always, even with no hits) ──
+    try:
+        for _w in bpy.context.window_manager.windows:
+            for _op in _w.modal_operators:
+                print(f"[preselect DEBUG] modal: {_op.bl_idname!r}")
+    except Exception as _e:
+        print(f"[preselect DEBUG] modal check error: {_e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     if not state._preselect_hits:
         return
+
     try:
         context = bpy.context
         area    = getattr(context, 'area', None)
         if area is None or area.type != 'VIEW_3D':
             return
     except Exception:
+        return
+
+    if _is_transforming(context):
         return
 
     rv3d   = getattr(context, 'region_data', None)
@@ -757,6 +771,9 @@ def _preselect_draw_3d_px_inner():
     except Exception:
         return
 
+    if _is_transforming(context):
+        return
+
     rv3d   = getattr(context, 'region_data', None)
     region = getattr(context, 'region', None)
     if region is None or rv3d is None:
@@ -833,6 +850,9 @@ def _preselect_draw_uv_inner():
         if area is None or area.type != 'IMAGE_EDITOR':
             return
     except Exception:
+        return
+
+    if _is_transforming(context):
         return
 
     prefs = _get_prefs(context)

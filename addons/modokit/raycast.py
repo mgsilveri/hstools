@@ -10,6 +10,46 @@ from bpy_extras import view3d_utils
 
 from .utils import get_addon_preferences
 
+# ── BVH cache ─────────────────────────────────────────────────────────────────
+# Keyed by obj.data.name → (BVHTree, signature).
+# Signature = (vert_count, edge_count, face_count, position_hash).
+# position_hash is a cheap XOR of quantised vert coords so that moving verts
+# also invalidates the cache, not just topology changes.
+# Cleared by preselect.py whenever the mode changes or the object leaves Edit Mode.
+_bvh_cache: dict = {}
+
+
+def _bm_signature(bm_obj):
+    """Cheap fingerprint: counts + XOR of quantised vert positions."""
+    nv = len(bm_obj.verts)
+    ne = len(bm_obj.edges)
+    nf = len(bm_obj.faces)
+    # Quantise to 0.0001 units then hash — fast and catches any translation/scale.
+    pos_hash = 0
+    for v in bm_obj.verts:
+        co = v.co
+        pos_hash ^= hash((round(co.x, 4), round(co.y, 4), round(co.z, 4)))
+    return (nv, ne, nf, pos_hash)
+
+
+def _get_cached_bvh(obj, bm_obj):
+    """Return a cached BVHTree for *obj*, rebuilding if the mesh has changed."""
+    key    = obj.data.name
+    sig    = _bm_signature(bm_obj)
+    cached = _bvh_cache.get(key)
+    if cached is not None:
+        bvh, cached_sig = cached
+        if cached_sig == sig:
+            return bvh
+    bvh = BVHTree.FromBMesh(bm_obj)
+    _bvh_cache[key] = (bvh, sig)
+    return bvh
+
+
+def clear_bvh_cache():
+    """Discard all cached BVH trees (call on mode change / mesh edit)."""
+    _bvh_cache.clear()
+
 
 def raycast_mesh(context, coord, bm=None):
     """Perform raycast at a specific screen coordinate using BVH trees built
@@ -55,7 +95,7 @@ def raycast_mesh(context, coord, bm=None):
                 print(f"  [{obj.name}] skipped – no faces")
             continue
 
-        bvh = BVHTree.FromBMesh(bm_obj)
+        bvh = _get_cached_bvh(obj, bm_obj)
         mx     = obj.matrix_world
         mx_inv = mx.inverted()
         ray_origin_local = mx_inv @ ray_origin
