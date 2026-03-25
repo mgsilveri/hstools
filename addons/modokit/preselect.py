@@ -49,6 +49,32 @@ _Z_BIAS               = 5e-4 # fraction of dist to nudge verts toward camera (av
 # Set True to print diagnostics to the Blender System Console (Window → Toggle System Console)
 _PRESELECT_DEBUG = False
 
+# Tool idnames that count as "selection" mode — highlights are ENABLED for these.
+# Any other active tool (Move, Rotate, Scale, Bevel, Extrude, …) suppresses highlighting.
+_SELECT_TOOL_IDNAMES = frozenset({
+    'builtin.select',
+    'builtin.select_box',
+    'builtin.select_circle',
+    'builtin.select_lasso',
+})
+
+
+def _active_tool_is_select(context):
+    """Return True when the currently active tool is a plain selection tool.
+
+    Any interactive tool (Move, Rotate, Scale, Bevel, Extrude, etc.) returns
+    False, which suppresses the pre-selection highlight — matching Modo behaviour.
+    Falls back to True on any error so highlights are not accidentally disabled.
+    """
+    try:
+        tool = context.workspace.tools.from_space_type_and_mode(
+            context.space_data.type,
+            context.mode,
+        )
+        return tool is None or tool.idname in _SELECT_TOOL_IDNAMES
+    except Exception:
+        return True
+
 # Stipple (checkerboard) shader — discards every other pixel so the face fill
 # appears as solid-colored dots (~50% coverage) rather than a semi-transparent wash.
 # Cached at module level; reset to None by Reload Scripts.
@@ -974,28 +1000,6 @@ def _stop_preselect():
         state._preselect_draw_handle_uv = None
 
 
-# ── Clear-on-transform operator ───────────────────────────────────────────────
-
-class VIEW3D_OT_modo_clear_preselect_for_transform(bpy.types.Operator):
-    """Clear pre-selection highlight when a transform/modal op key is pressed.
-    Returns PASS_THROUGH so the actual operator (G/R/S/E/…) still fires."""
-    bl_idname  = 'view3d.modo_clear_preselect_for_transform'
-    bl_label   = ''
-    bl_options = {'INTERNAL'}
-
-    @classmethod
-    def poll(cls, context):
-        return bool(state._preselect_hits)
-
-    def invoke(self, context, event):
-        state._preselect_hits = []
-        if context.area:
-            context.area.tag_redraw()
-        for area in _iter_image_editor_areas(context):
-            area.tag_redraw()
-        return {'PASS_THROUGH'}
-
-
 # ── Non-modal operator (invoked from MOUSEMOVE keymap entry) ─────────────────
 
 class VIEW3D_OT_modo_preselect_highlight(bpy.types.Operator):
@@ -1015,6 +1019,13 @@ class VIEW3D_OT_modo_preselect_highlight(bpy.types.Operator):
     def invoke(self, context, event):
         prefs = _get_prefs(context)
         if prefs is not None and not prefs.enable_preselect_highlight:
+            if state._preselect_hits:
+                state._preselect_hits = []
+                if context.area:
+                    context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+
+        if not _active_tool_is_select(context):
             if state._preselect_hits:
                 state._preselect_hits = []
                 if context.area:
@@ -1066,6 +1077,14 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
                   f"pos=({event.mouse_region_x},{event.mouse_region_y})")
         prefs = _get_prefs(context)
         if prefs is not None and not prefs.enable_preselect_highlight:
+            if state._preselect_hits:
+                state._preselect_hits = []
+                context.area.tag_redraw()
+                for a in _iter_view3d_areas(context):
+                    a.tag_redraw()
+            return {'PASS_THROUGH'}
+
+        if not _active_tool_is_select(context):
             if state._preselect_hits:
                 state._preselect_hits = []
                 context.area.tag_redraw()
