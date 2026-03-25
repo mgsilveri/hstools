@@ -20,6 +20,40 @@ from .utils import _diag, _get_prefs
 _saved_viewport_settings: dict = {}   # space_id → dict of saved values
 # NOTE: _bfv_previous_mode lives in state.py so uv_overlays.py can read it too.
 _back_edge_draw_handle = None         # handle returned by draw_handler_add (POST_VIEW)
+
+# ── Stipple (checkerboard) shader — POST_VIEW, vec3 pos ───────────────────────
+_stipple_shader_cache = None
+
+_STIPPLE_VERT_SRC = (
+    'void main() {\n'
+    '    gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);\n'
+    '}\n'
+)
+_STIPPLE_FRAG_SRC = (
+    'void main() {\n'
+    '    float px = floor(gl_FragCoord.x);\n'
+    '    float py = floor(gl_FragCoord.y);\n'
+    '    if (mod(px + py, 2.0) < 1.0) discard;\n'
+    '    fragColor = ucolor;\n'
+    '}\n'
+)
+
+
+def _get_stipple_shader():
+    global _stipple_shader_cache
+    if _stipple_shader_cache is None:
+        try:
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+            info.push_constant('VEC4', 'ucolor')
+            info.vertex_in(0, 'VEC3', 'pos')
+            info.vertex_source(_STIPPLE_VERT_SRC)
+            info.fragment_out(0, 'VEC4', 'fragColor')
+            info.fragment_source(_STIPPLE_FRAG_SRC)
+            _stipple_shader_cache = gpu.shader.create_from_info(info)
+        except Exception as e:
+            print(f'[modokit] backface stipple shader failed: {e}')
+    return _stipple_shader_cache
 _back_vert_draw_handle = None         # handle returned by draw_handler_add (POST_VIEW)
 _back_face_draw_handle = None         # handle returned by draw_handler_add (POST_VIEW)
 _back_edge_cache: list = []           # world-space edge-coord pairs for GPU draw
@@ -56,11 +90,6 @@ def _compute_back_edge_cache(context):
                 bm = bmesh.from_edit_mesh(obj.data)
                 mx = obj.matrix_world
                 if vert_mode:
-                    for edge in bm.edges:
-                        if edge.verts[0].select or edge.verts[1].select:
-                            v0 = mx @ edge.verts[0].co
-                            v1 = mx @ edge.verts[1].co
-                            new_edges.append(((v0.x, v0.y, v0.z), (v1.x, v1.y, v1.z)))
                     for vert in bm.verts:
                         if vert.select:
                             vw = mx @ vert.co
@@ -78,12 +107,18 @@ def _compute_back_edge_cache(context):
                                 v0 = mx @ edge.verts[0].co
                                 v1 = mx @ edge.verts[1].co
                                 new_edges.append(((v0.x, v0.y, v0.z), (v1.x, v1.y, v1.z)))
-                            # Fan-triangulate for fill drawing
+                            # Fan-triangulate for fill drawing.
+                            # Nudge verts slightly along world-space face normal so the
+                            # fill geometry sits just in front of the mesh surface —
+                            # this prevents z-fighting where GREATER would noise-pass
+                            # on directly visible faces (identical depth as mesh surface).
+                            n_world = (mx.to_3x3() @ face.normal).normalized()
+                            offset = n_world * 0.001
                             loops = face.loops
-                            v0w = mx @ loops[0].vert.co
+                            v0w = mx @ loops[0].vert.co + offset
                             for i in range(1, len(loops) - 1):
-                                v1w = mx @ loops[i].vert.co
-                                v2w = mx @ loops[i + 1].vert.co
+                                v1w = mx @ loops[i].vert.co + offset
+                                v2w = mx @ loops[i + 1].vert.co + offset
                                 new_faces.append((
                                     (v0w.x, v0w.y, v0w.z),
                                     (v1w.x, v1w.y, v1w.z),
@@ -143,11 +178,14 @@ def _back_edge_draw_callback_inner() -> None:
 
     try:
         theme_3d = context.preferences.themes[0].view_3d
-        sc = theme_3d.vertex_select
+        ts        = context.tool_settings
+        sm        = ts.mesh_select_mode
+        if sm[0]:    sc = theme_3d.vertex_select   # vert mode: edges on selected verts
+        elif sm[1]:  sc = theme_3d.edge_select      # edge mode: selected edges
+        else:        sc = theme_3d.face_select       # face mode: edges of selected faces
         color = (sc.r, sc.g, sc.b, alpha)
     except Exception:
         color = (1.0, 0.6, 0.0, alpha)
-
     coords = []
     for (p0, p1) in _back_edge_cache:
         coords.append(p0)
@@ -157,25 +195,34 @@ def _back_edge_draw_callback_inner() -> None:
 
     _diag("DRAW back_edge GPU start n=" + str(len(coords)))
     try:
-        ts        = context.tool_settings
-        vert_mode = ts.mesh_select_mode[0]
-        # In vertex mode, edges connected to selected verts should respect
-        # depth (occluded edges invisible) — matching native Blender behaviour.
-        # In edge/face mode the "backface viz" effect intentionally draws through.
-        depth = 'LESS_EQUAL' if vert_mode else 'NONE'
+        # vert_mode already determined above via sm
+        vert_mode = sm[0]
 
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         batch  = batch_for_shader(shader, 'LINES', {"pos": coords})
-        gpu.state.depth_test_set(depth)
         gpu.state.blend_set('ALPHA')
-        try:
-            shader.bind()
+        shader.bind()
+        if vert_mode:
+            # Vert mode: edges respect depth — only draw where visible,
+            # no occluded pass (native orange gradient already handles this).
+            gpu.state.depth_test_set('LESS_EQUAL')
             shader.uniform_float("color", color)
             batch.draw(shader)
-            _diag("DRAW back_edge GPU done")
-        finally:
-            gpu.state.depth_test_set('LESS_EQUAL')
-            gpu.state.blend_set('NONE')
+        else:
+            # Edge/face mode: only draw occluded pass.
+            # Blender's native drawing already handles visible selected edges
+            # (including the active-edge color), so we only supplement with
+            # the through-mesh "ghost" for edges behind the surface.
+            # Desaturate toward luminance so occluded edges look ghostly, not vivid.
+            lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+            t = 0.65
+            ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
+            gpu.state.depth_test_set('GREATER')
+            shader.uniform_float("color", (ghost[0], ghost[1], ghost[2], 0.5))
+            batch.draw(shader)
+        _diag("DRAW back_edge GPU done")
+        gpu.state.depth_test_set('LESS_EQUAL')
+        gpu.state.blend_set('NONE')
     except Exception:
         pass
 
@@ -262,9 +309,12 @@ def _back_vert_draw_callback_inner() -> None:
         gpu.state.depth_test_set('LESS_EQUAL')
         shader.uniform_float('color', (color[0], color[1], color[2], 1.0))
         batch.draw(shader)
-        # Pass 2: 50% opaque where occluded
+        # Pass 2: ghostly (desaturated + dimmed) where occluded
+        lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+        t = 0.65
+        ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
         gpu.state.depth_test_set('GREATER')
-        shader.uniform_float('color', (color[0], color[1], color[2], 0.5))
+        shader.uniform_float('color', (ghost[0], ghost[1], ghost[2], 0.5))
         batch.draw(shader)
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.blend_set('NONE')
@@ -323,10 +373,24 @@ def _back_face_draw_callback_inner() -> None:
         batch  = batch_for_shader(shader, 'TRIS', {'pos': tris})
         gpu.state.blend_set('ALPHA')
         shader.bind()
-        # Only draw where occluded — fully transparent when visible (no interference)
-        gpu.state.depth_test_set('GREATER')
-        shader.uniform_float('color', (color[0], color[1], color[2], color[3] * 0.25))
-        batch.draw(shader)
+        # Only draw where occluded — stipple (checkerboard discard) gives ~50%
+        # pixel coverage at full per-pixel alpha, avoiding the washed-out look
+        # of a uniform semi-transparent fill.
+        lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+        t = 0.65
+        ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
+        stipple = _get_stipple_shader()
+        if stipple is not None:
+            s_batch = batch_for_shader(stipple, 'TRIS', {'pos': tris})
+            stipple.bind()
+            gpu.state.depth_test_set('GREATER')
+            stipple.uniform_float('ucolor', (ghost[0], ghost[1], ghost[2], 0.5))
+            s_batch.draw(stipple)
+        else:
+            # Fallback: plain GREATER pass
+            gpu.state.depth_test_set('GREATER')
+            shader.uniform_float('color', (ghost[0], ghost[1], ghost[2], 0.15))
+            batch.draw(shader)
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.blend_set('NONE')
     except Exception:
