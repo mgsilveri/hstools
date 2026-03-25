@@ -348,13 +348,30 @@ def _collect_object_hits(context, mx, my):
     if not hit or obj is None or obj.type != 'MESH':
         return []
 
-    mx_w   = obj.matrix_world
-    mesh   = obj.data
-    edges  = []
-    for edge in mesh.edges:
-        v0 = mx_w @ mesh.vertices[edge.vertices[0]].co
-        v1 = mx_w @ mesh.vertices[edge.vertices[1]].co
+    mx_w     = obj.matrix_world
+    mx_w_3x3 = mx_w.to_3x3()
+    view_vec = view3d_utils.region_2d_to_vector_3d(region, rv3d, (mx, my))
+
+    # Use bmesh to access polygon normals so we can cull back-facing edges,
+    # matching the occlusion behaviour of edit-mode highlights.
+    import bmesh as _bmesh
+    bm = _bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    edges = []
+    for edge in bm.edges:
+        # Include edge only if at least one adjacent face is front-facing
+        if not any(
+            (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
+            for f in edge.link_faces
+        ):
+            continue
+        v0 = mx_w @ edge.verts[0].co
+        v1 = mx_w @ edge.verts[1].co
         edges.append((tuple(v0), tuple(v1)))
+    bm.free()
 
     return [{'type': 'OBJECT', 'obj': obj, 'edge_coords': edges,
              'selected': obj.select_get()}]
@@ -1046,22 +1063,44 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
-# ── Depsgraph handler — mode-change cache invalidation ───────────────────────
+# ── Depsgraph handler — mode-change + mesh/selection cache invalidation ──────
 
 @bpy.app.handlers.persistent
 def _preselect_depsgraph_handler(scene, depsgraph):
-    """Clear BVH cache and highlight state when the context mode changes."""
+    """Clear BVH cache and highlight state when the context mode changes or
+    when mesh/object data is modified (selection state, geometry edits,
+    transforms).  Without this the draw callback shows stale 'selected'
+    values until the next mouse move."""
     try:
         context      = bpy.context
         current_mode = getattr(context, 'mode', None)
-        if current_mode == state._preselect_mode:
+        mode_changed = current_mode != state._preselect_mode
+
+        # Mesh data updated (vertex positions, face topology, selection flags).
+        mesh_updated = depsgraph.id_type_updated('MESH')
+
+        # Object transform / selection updated (relevant in Object mode).
+        obj_updated  = (current_mode == 'OBJECT'
+                        and depsgraph.id_type_updated('OBJECT'))
+
+        if not mode_changed and not mesh_updated and not obj_updated:
             return
-        state._preselect_mode = current_mode
-        clear_bvh_cache()
-        state._preselect_hits = []
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type in ('VIEW_3D', 'IMAGE_EDITOR'):
-                    area.tag_redraw()
+
+        if mode_changed:
+            state._preselect_mode = current_mode
+
+        # Clear BVH whenever mesh data changes — vertex positions may have
+        # shifted while vert/face count stayed the same (e.g. grab transform),
+        # which would leave positionally-stale trees.
+        if mode_changed or mesh_updated:
+            clear_bvh_cache()
+
+        # Only redraw if there is something already drawn to erase.
+        if state._preselect_hits:
+            state._preselect_hits = []
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type in ('VIEW_3D', 'IMAGE_EDITOR'):
+                        area.tag_redraw()
     except Exception:
         pass
