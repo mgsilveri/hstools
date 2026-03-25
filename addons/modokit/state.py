@@ -78,6 +78,16 @@ _INST_COLLECTION = 'Instances'
 _INST_COLLECTION_TAG = 'COLOR_07'   # pink
 _instance_tag_last_run: float = 0.0
 
+# ── Pre-selection highlight ───────────────────────────────────────────────────
+# Each entry in the list is a dict:
+#   '3d':  {'type': 'FACE'|'EDGE'|'VERT'|'OBJECT', 'coords': [...], 'selected': bool, 'obj': obj}
+#   'uv':  {'type': 'FACE'|'EDGE'|'VERT', 'coords': [...], 'selected': bool}  (or absent)
+_preselect_hits: list = []          # populated on MOUSEMOVE, consumed by draw + click
+_preselect_draw_handle_3d    = None  # SpaceView3D  POST_VIEW  (faces)
+_preselect_draw_handle_3d_px = None  # SpaceView3D  POST_PIXEL (edges + verts, always on top)
+_preselect_draw_handle_uv    = None  # SpaceImageEditor draw handler
+_preselect_mode: str = ''           # last-seen context.mode, for mode-change detection
+
 # ── Keymap ────────────────────────────────────────────────────────────────────
 addon_keymaps = []
 _registered_kmi_ids = []
@@ -96,6 +106,8 @@ _OUR_IDNAMES = {
     'view3d.modo_transform',
     'view3d.modo_drop_transform',
     'view3d.modo_screen_move',
+    'view3d.modo_preselect_highlight',
+    'image.modo_preselect_highlight',
     'image.modo_uv_snap_highlight',
     'image.modo_uv_transform',
     'image.modo_uv_drop_transform',

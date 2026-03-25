@@ -199,6 +199,31 @@ def register_keymaps():
 
         km_nav = kc.keymaps.new(name='3D View', space_type='VIEW_3D')
 
+        # Pre-selection highlight — non-modal, fires on every mouse move
+        if getattr(prefs, 'enable_preselect_highlight', True):
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_preselect_highlight',
+                type='MOUSEMOVE',
+                value='ANY',
+                head=False,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
+            # Same for UV editor — register in both UV Editor and Image keymaps,
+            # matching the same pattern every other UV operator uses here.
+            for _uv_name, _uv_stype in (('UV Editor', 'EMPTY'), ('Image', 'IMAGE_EDITOR')):
+                try:
+                    km_img = kc.keymaps.new(name=_uv_name, space_type=_uv_stype)
+                    kmi_img = km_img.keymap_items.new(
+                        'image.modo_preselect_highlight',
+                        type='MOUSEMOVE',
+                        value='ANY',
+                        head=False,
+                    )
+                    state.addon_keymaps.append((km_img, kmi_img))
+                except Exception as e:
+                    print(f"[preselect] keymap '{_uv_name}' registration failed: {e}")
+
         if prefs.enable_mouse_selection:
             for shift_val, ctrl_val, sel_mode, ev_value in (
                 (False, False, 'set',    'PRESS'),

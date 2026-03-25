@@ -21,6 +21,34 @@ from .shortest_path import (
     find_shortest_path_faces,
 )
 from .utils import point_in_polygon
+from . import preselect as _preselect_mod
+
+
+# ── Pre-selection → selection bridge ─────────────────────────────────────────
+
+def _candidate_from_highlight(context):
+    """Return a raycast-compatible dict from the live pre-selection state.
+
+    Reads state._preselect_hits[0] directly — the same data that was just
+    rendered — so selection is guaranteed to match the visual highlight.
+    Falls back to None if state is empty or doesn't match the current mode.
+    """
+    if not state._preselect_hits:
+        return None
+    sm  = context.tool_settings.mesh_select_mode
+    hit = state._preselect_hits[0]  # sorted closest-first by _collect_edit_hits
+    obj = hit.get('obj')
+    if obj is None:
+        return None
+    htype = hit.get('type')
+    if sm[0] and htype == 'VERT' and 'vert_index' in hit:
+        return {'index': hit['vert_index'], 'obj': obj, 'location': None, 'normal': None}
+    if sm[1] and htype == 'EDGE' and 'edge_index' in hit:
+        return {'index': hit['edge_index'], 'obj': obj, 'location': None, 'normal': None,
+                'hit_face_index': hit.get('face_index')}
+    if sm[2] and htype == 'FACE' and 'face_index' in hit:
+        return {'index': hit['face_index'], 'obj': obj, 'location': None, 'normal': None}
+    return None
 
 
 # ============================================================================
@@ -66,6 +94,10 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         self.mouse_y = event.mouse_region_y
         self.start_mouse_x = self.mouse_x
         self.start_mouse_y = self.mouse_y
+
+        # Snapshot the pre-selection candidate on PRESS — reads the live
+        # preselect state which is exactly what was just rendered.
+        self._preselect_candidate = _candidate_from_highlight(context)
 
         if event.value == 'DOUBLE_CLICK':
             return self.execute_loop_selection(context)
@@ -250,7 +282,10 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         """
         prefs       = get_addon_preferences(context)
         coord       = (self.mouse_x, self.mouse_y)
-        hit_result  = raycast_with_tolerance(context, coord, prefs.selection_tolerance)
+        # Use element highlighted at click time; fall back to raycast if none captured
+        hit_result  = getattr(self, '_preselect_candidate', None)
+        if hit_result is None:
+            hit_result = raycast_with_tolerance(context, coord, prefs.selection_tolerance)
         select_mode = context.tool_settings.mesh_select_mode
 
         # ── Edge mode + Add: expand ALL selected edges to loops ───────────────
@@ -429,67 +464,69 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         return {'FINISHED'}
 
     def execute(self, context):
-        prefs      = get_addon_preferences(context)
-        coord      = (self.mouse_x, self.mouse_y)
-        hit_result = raycast_with_tolerance(context, coord, prefs.selection_tolerance)
+        select_mode = context.tool_settings.mesh_select_mode
 
-        if not hit_result:
+        # The preselect highlight IS the selection preview.
+        # Use ALL highlighted elements from state directly.
+        # If there are none (cursor over empty space), fall back to raycast.
+        hits = list(state._preselect_hits)
+        if not hits:
+            prefs      = get_addon_preferences(context)
+            coord      = (self.mouse_x, self.mouse_y)
+            ray_result = raycast_with_tolerance(context, coord, prefs.selection_tolerance)
+            if ray_result:
+                # Wrap single raycast result to reuse loop below
+                hits = [{'type': (['VERT','EDGE','FACE'][[select_mode[0],select_mode[1],select_mode[2]].index(True)]),
+                         'obj': ray_result.get('obj', context.edit_object),
+                         'vert_index': ray_result['index'] if select_mode[0] else None,
+                         'edge_index': ray_result['index'] if select_mode[1] else None,
+                         'face_index': ray_result['index'] if select_mode[2] else None,
+                         'hit_face_index': ray_result.get('hit_face_index')}]
+
+        if not hits:
             if self.mode == 'set':
                 self._deselect_all_objects(context)
             return {'FINISHED'}
 
-        obj = hit_result.get('obj', context.edit_object)
-        bm  = bmesh.from_edit_mesh(obj.data)
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
+        # ── Material Mode shortcut (delegates to first hit only) ──────────────
+        first = hits[0]
+        first_obj = first.get('obj', context.edit_object)
+        first_bm  = bmesh.from_edit_mesh(first_obj.data)
+        first_bm.faces.ensure_lookup_table()
+        first_idx = first.get('face_index') if select_mode[2] else (
+                    first.get('edge_index') if select_mode[1] else first.get('vert_index'))
+        first_element = None
+        if first_idx is not None:
+            if select_mode[2] and first_idx < len(first_bm.faces):
+                first_element = first_bm.faces[first_idx]
+            elif select_mode[1]:
+                first_bm.edges.ensure_lookup_table()
+                if first_idx < len(first_bm.edges):
+                    first_element = first_bm.edges[first_idx]
+            elif select_mode[0]:
+                first_bm.verts.ensure_lookup_table()
+                if first_idx < len(first_bm.verts):
+                    first_element = first_bm.verts[first_idx]
 
-        hit_index   = hit_result['index']
-        select_mode = context.tool_settings.mesh_select_mode
-
-        element = None
-        if select_mode[0]:
-            if hit_index < len(bm.verts):
-                element = bm.verts[hit_index]
-        elif select_mode[1]:
-            if hit_index < len(bm.edges):
-                element = bm.edges[hit_index]
-        elif select_mode[2]:
-            if hit_index < len(bm.faces):
-                element = bm.faces[hit_index]
-
-        if not element:
-            self.report({'WARNING'}, f"Could not find element at index {hit_index}")
-            return {'CANCELLED'}
-
-        # ── Material Mode (Modo 4 key) ─────────────────────────────────────────
-        if state._material_mode_active and select_mode[2] and isinstance(element, bmesh.types.BMFace):
-            mat_nr      = element.material_index
-            mats        = obj.data.materials
+        if (state._material_mode_active and select_mode[2]
+                and isinstance(first_element, bmesh.types.BMFace)):
+            mat_nr      = first_element.material_index
+            mats        = first_obj.data.materials
             clicked_mat = mats[mat_nr] if mat_nr < len(mats) else None
-
             if self.mode == 'set':
                 self._deselect_all_objects(context)
-
-            should_select = True
+            should_select = self.mode != 'remove'
             if self.mode == 'toggle':
-                should_select = not element.select
+                should_select = not first_element.select
 
             def _apply_material_selection(bm_obj, mesh_data):
                 bm_obj.faces.ensure_lookup_table()
-                bm_obj.verts.ensure_lookup_table()
-                bm_obj.edges.ensure_lookup_table()
                 slots = mesh_data.materials
                 for f in bm_obj.faces:
                     fi       = f.material_index
                     face_mat = slots[fi] if fi < len(slots) else None
                     if face_mat is clicked_mat:
-                        if self.mode == 'remove':
-                            f.select = False
-                        elif self.mode == 'toggle':
-                            f.select = should_select
-                        else:
-                            f.select = True
+                        f.select = (False if self.mode == 'remove' else should_select)
                 for v in bm_obj.verts:
                     v.select = any(f.select for f in v.link_faces)
                 for e in bm_obj.edges:
@@ -501,34 +538,68 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
                     continue
                 bm_cur = bmesh.from_edit_mesh(edit_obj.data)
                 _apply_material_selection(bm_cur, edit_obj.data)
-                if edit_obj is obj:
-                    bm_cur.faces.active = element
+                if edit_obj is first_obj:
+                    bm_cur.faces.active = first_element
                 self._flush_uv_sync(bm_cur, context)
                 bmesh.update_edit_mesh(edit_obj.data)
             return {'FINISHED'}
 
-        # ── Normal selection ───────────────────────────────────────────────────
+        # ── Normal selection: apply to EVERY highlighted element ──────────────
         if self.mode == 'set':
             self._deselect_all_objects(context)
-            bm = bmesh.from_edit_mesh(obj.data)
-            element.select = True
-        elif self.mode == 'add':
-            element.select = True
-        elif self.mode == 'toggle':
-            element.select = not element.select
-        elif self.mode == 'remove':
-            element.select = False
 
-        if select_mode[2] and isinstance(element, bmesh.types.BMFace):
-            bm.faces.active = element
-        elif select_mode[0] and isinstance(element, bmesh.types.BMVert):
-            bm.select_history.clear()
-            bm.select_history.add(element)
+        last_obj = None
+        last_bm  = None
+        for hit in hits:
+            h_obj = hit.get('obj')
+            if h_obj is None:
+                continue
+            bm = bmesh.from_edit_mesh(h_obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            element = None
+            htype   = hit.get('type', '')
+            if select_mode[0] and htype == 'VERT':
+                vi = hit.get('vert_index')
+                if vi is not None and vi < len(bm.verts):
+                    element = bm.verts[vi]
+            elif select_mode[1] and htype == 'EDGE':
+                ei = hit.get('edge_index')
+                if ei is not None and ei < len(bm.edges):
+                    element = bm.edges[ei]
+            elif select_mode[2] and htype == 'FACE':
+                fi = hit.get('face_index')
+                if fi is not None and fi < len(bm.faces):
+                    element = bm.faces[fi]
+            if element is None:
+                continue
 
-        self._flush_uv_sync(bm, context)
-        bmesh.update_edit_mesh(obj.data)
+            if self.mode in ('set', 'add'):
+                element.select = True
+            elif self.mode == 'remove':
+                element.select = False
+            elif self.mode == 'toggle':
+                element.select = not element.select
+
+            last_obj = h_obj
+            last_bm  = bm
+
+        if last_bm is None:
+            return {'FINISHED'}
+
+        # Active element = first hit
+        if first_element is not None:
+            if select_mode[2] and isinstance(first_element, bmesh.types.BMFace):
+                first_bm.faces.active = first_element
+            elif select_mode[0] and isinstance(first_element, bmesh.types.BMVert):
+                first_bm.select_history.clear()
+                first_bm.select_history.add(first_element)
+
+        self._flush_uv_sync(last_bm, context)
+        bmesh.update_edit_mesh(last_obj.data)
         from .uv_overlays import _resync_uv_editor_selection
-        _resync_uv_editor_selection(context, obj, select_mode, bm)
+        _resync_uv_editor_selection(context, last_obj, select_mode, last_bm)
         return {'FINISHED'}
 
 
