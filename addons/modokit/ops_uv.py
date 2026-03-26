@@ -935,7 +935,7 @@ Face: tear the outer boundary of the selected face(s)."""
                 visited.add(eid)
                 partner = loop.link_loop_radial_next
                 if partner is loop:
-                    continue  # boundary mesh edge — nothing to split
+                    continue  # boundary mesh edge â€” nothing to split
                 a_sel = loop.edge.select if sync else self._loop_edge_sel(loop, uv_layer)
                 b_sel = loop.edge.select if sync else self._loop_edge_sel(partner, uv_layer)
                 if a_sel == b_sel:
@@ -1003,7 +1003,7 @@ Face: tear the outer boundary of the selected face(s)."""
             targets = self._targets_face(bm, uv_layer, sync)
 
         if not targets:
-            self.report({'INFO'}, "Nothing to rip — select elements along a UV seam")
+            self.report({'INFO'}, "Nothing to rip â€” select elements along a UV seam")
             return {'CANCELLED'}
 
         off = self._OFFSET
