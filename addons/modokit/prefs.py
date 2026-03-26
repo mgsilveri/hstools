@@ -3,10 +3,11 @@ Addon preferences for Modo-Style Mouse Selection.
 """
 
 import bpy
-from bpy.props import IntProperty, EnumProperty, FloatProperty, BoolProperty
+from bpy.props import IntProperty, EnumProperty, FloatProperty, BoolProperty, FloatVectorProperty
 
-# bl_idname must be the package name, not __name__ (which would be the submodule).
-_ADDON_NAME = 'modo_style_selection_for_blender'
+# bl_idname must match the addon's package/module name as Blender registers it.
+# When loaded via script directory the key is the folder name: 'modokit'.
+_ADDON_NAME = 'modokit'
 
 
 class ModoSelectionPreferences(bpy.types.AddonPreferences):
@@ -123,6 +124,33 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
             "Instances collection in the Outliner"
         ),
         default=True,
+    )
+    enable_preselect_highlight: BoolProperty(
+        name="Pre-selection Highlight",
+        description=(
+            "Highlight geometry under the mouse before clicking, "
+            "mirroring Modo's pre-selection system. Always on in both "
+            "Object Mode and Edit Mode."
+        ),
+        default=True,
+        update=_refresh_keymaps,
+    )
+    preselect_color: FloatVectorProperty(
+        name="Pre-selection Color",
+        description="Color used to highlight hovered geometry (Modo default: #c4dbe5)",
+        subtype='COLOR',
+        size=3,
+        default=(0.549, 0.710, 0.780),
+        min=0.0,
+        max=1.0,
+    )
+    preselect_alpha: FloatProperty(
+        name="Pre-selection Opacity",
+        description="Opacity of the pre-selection highlight overlay",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
     )
 
     uv_scale_sensitivity: FloatProperty(
@@ -251,6 +279,8 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         col.prop(self, "enable_uv_flipped_face_viz")
         col.separator()
         col.prop(self, "enable_instance_tagging")
+        col.separator()
+        col.prop(self, "enable_preselect_highlight")
 
         # ── Settings ──────────────────────────────────────────────────────────
         layout.separator()
@@ -260,6 +290,10 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         box.prop(self, "double_click_time")
         box.prop(self, "backwire_opacity")
         box.prop(self, "uv_scale_sensitivity")
+        if self.enable_preselect_highlight:
+            row = box.row(align=True)
+            row.prop(self, "preselect_color", text="Pre-selection Color")
+            row.prop(self, "preselect_alpha", text="Opacity")
 
         # ── Hotkeys ───────────────────────────────────────────────────────────
         layout.separator()

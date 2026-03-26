@@ -49,9 +49,9 @@ from .utils import _uv_debug_log
 
 _ALL_CLASSES = (
     prefs.ModoSelectionPreferences,
-    preselect.VIEW3D_OT_modo_clear_preselect_for_transform,
     preselect.VIEW3D_OT_modo_preselect_highlight,
     preselect.IMAGE_OT_modo_preselect_highlight,
+    preselect.IMAGE_OT_modo_preselect_lmb_track,
     ops_edit.MESH_OT_modo_select_element_under_mouse,
     ops_edit.MESH_OT_modo_select_shortest_path,
     ops_edit.MESH_OT_modo_lasso_select,

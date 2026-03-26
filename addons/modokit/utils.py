@@ -81,7 +81,9 @@ def _diag(msg: str) -> None:
 
 
 # ── Addon preferences helpers ─────────────────────────────────────────────────
-_ADDON_NAME = 'modo_style_selection_for_blender'
+# Matches the folder name when loaded via script directory, and the
+# blender_manifest.toml 'id' field when installed as an Extension.
+_ADDON_NAME = 'modokit'
 
 
 def get_addon_preferences(context):
@@ -104,6 +106,9 @@ def get_addon_preferences(context):
             enable_uv_boundary_overlay = True
             enable_uv_flipped_face_viz = True
             enable_instance_tagging = True
+            enable_preselect_highlight = True
+            preselect_color = (0.549, 0.710, 0.780)
+            preselect_alpha = 0.75
             uv_scale_sensitivity = 0.5
             shortest_path_key = 'RIGHTMOUSE'
             shortest_path_shift = True
