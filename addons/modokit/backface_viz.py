@@ -108,21 +108,22 @@ def _compute_back_edge_cache(context):
                                 v1 = mx @ edge.verts[1].co
                                 new_edges.append(((v0.x, v0.y, v0.z), (v1.x, v1.y, v1.z)))
                             # Fan-triangulate for fill drawing.
-                            # Nudge verts slightly along world-space face normal so the
-                            # fill geometry sits just in front of the mesh surface —
-                            # this prevents z-fighting where GREATER would noise-pass
-                            # on directly visible faces (identical depth as mesh surface).
+                            # Store unbiased positions + face normal so the draw
+                            # callback can apply a view-distance-proportional offset
+                            # at draw time (fixed world offsets become negligible in
+                            # the depth buffer at large camera distances).
                             n_world = (mx.to_3x3() @ face.normal).normalized()
-                            offset = n_world * 0.001
+                            nw = (n_world.x, n_world.y, n_world.z)
                             loops = face.loops
-                            v0w = mx @ loops[0].vert.co + offset
+                            v0w = mx @ loops[0].vert.co
                             for i in range(1, len(loops) - 1):
-                                v1w = mx @ loops[i].vert.co + offset
-                                v2w = mx @ loops[i + 1].vert.co + offset
+                                v1w = mx @ loops[i].vert.co
+                                v2w = mx @ loops[i + 1].vert.co
                                 new_faces.append((
                                     (v0w.x, v0w.y, v0w.z),
                                     (v1w.x, v1w.y, v1w.z),
                                     (v2w.x, v2w.y, v2w.z),
+                                    nw,
                                 ))
             except Exception:
                 continue
@@ -372,9 +373,25 @@ def _back_face_draw_callback_inner() -> None:
     except Exception:
         color = (1.0, 0.6, 0.0, alpha)
 
+    # Apply a view-distance-proportional normal offset so the fill geometry
+    # sits reliably in front of the mesh surface in the depth buffer at any
+    # camera distance.  A fixed world-space nudge becomes negligible in NDC
+    # precision when the camera is far away, causing GREATER to spuriously
+    # pass on frontface pixels (z-fighting). Scaling with view_distance keeps
+    # the separation proportional to the depth-buffer granularity at that range.
+    rv3d = getattr(context, 'region_data', None)
+    view_dist = rv3d.view_distance if rv3d is not None else 10.0
+    offset_scale = max(0.001, view_dist * 0.0005)
+
     tris = []
-    for (p0, p1, p2) in _back_face_cache:
-        tris += [p0, p1, p2]
+    for entry in _back_face_cache:
+        p0, p1, p2, n = entry
+        nx, ny, nz = n[0] * offset_scale, n[1] * offset_scale, n[2] * offset_scale
+        tris += [
+            (p0[0] + nx, p0[1] + ny, p0[2] + nz),
+            (p1[0] + nx, p1[1] + ny, p1[2] + nz),
+            (p2[0] + nx, p2[1] + ny, p2[2] + nz),
+        ]
 
     if not tris:
         return

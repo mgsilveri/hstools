@@ -910,6 +910,7 @@ def _uv_boundary_draw_callback():
             pass
 
 
+@bpy.app.handlers.persistent
 def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
     """Force-redraw IMAGE_EDITOR after edit-mesh updates; schedule UV cache timer."""
     try:
