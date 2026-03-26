@@ -49,6 +49,9 @@ _anchor_timer_running: bool = False
 
 # Draw handle for the pivot crosshair overlay.
 _pivot_crosshair_draw_handle = None
+# Running-average interval between crosshair draw callbacks (= viewport frame time).
+_viewport_draw_interval: float = 0.016   # starts at 60 fps, self-calibrates
+_last_crosshair_draw_time: float = 0.0   # monotonic timestamp of last draw
 
 # True when the gizmo activated with nothing selected (auto-selected all).
 _implicit_select_all: bool = False

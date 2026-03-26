@@ -147,7 +147,7 @@ def _compute_selection_median(context):
 # ── Anchor tracking timer ─────────────────────────────────────────────────────
 
 def _anchor_tracking_timer():
-    """Polling timer: runs every 50 ms while the Move tool is active.
+    """Polling timer: runs every ~16 ms (≈60 fps) while the Move tool is active.
     Tracks geometry movement and keeps the cursor/gizmo pinned to the anchor."""
     if state._active_transform_mode != 'TRANSLATE' or state._reposition_anchor is None:
         state._anchor_timer_running = False
@@ -165,16 +165,24 @@ def _anchor_tracking_timer():
                 state._last_known_median  = new_median
         elif new_median is not None and state._last_known_median is None:
             state._last_known_median = new_median
+
+        # Force viewport redraw so the crosshair updates at viewport FPS even
+        # when no other event is triggering a redraw.  The actual redraw rate
+        # is self-calibrated from the draw callback's own fire interval.
+        for window in ctx.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
     except Exception:
         pass
 
-    return 0.05  # reschedule in 50 ms
+    return state._viewport_draw_interval  # reschedule to match viewport FPS
 
 
 def _start_anchor_timer():
     """Start the anchor-tracking timer if not already running."""
     if not state._anchor_timer_running:
-        bpy.app.timers.register(_anchor_tracking_timer, first_interval=0.05)
+        bpy.app.timers.register(_anchor_tracking_timer, first_interval=0.016)
         state._anchor_timer_running = True
 
 
@@ -190,9 +198,20 @@ def _pivot_crosshair_draw_callback():
     if state._reposition_anchor is None:
         return
     try:
+        import time as _t
         import gpu
         from gpu_extras.batch import batch_for_shader
         from mathutils import Vector, Matrix
+
+        # Measure real viewport frame time so the anchor timer can match it.
+        now = _t.monotonic()
+        if state._last_crosshair_draw_time > 0.0:
+            interval = now - state._last_crosshair_draw_time
+            if 0.004 < interval < 0.25:   # sane range: 4 Hz – 250 Hz
+                state._viewport_draw_interval = (
+                    state._viewport_draw_interval * 0.85 + interval * 0.15
+                )
+        state._last_crosshair_draw_time = now
         ctx  = bpy.context
         rv3d = ctx.region_data
         if rv3d is None:
@@ -241,6 +260,7 @@ def _stop_pivot_crosshair():
         bpy.types.SpaceView3D.draw_handler_remove(
             state._pivot_crosshair_draw_handle, 'WINDOW')
         state._pivot_crosshair_draw_handle = None
+    state._last_crosshair_draw_time = 0.0
     try:
         if bpy.context.area:
             bpy.context.area.tag_redraw()
