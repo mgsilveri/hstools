@@ -309,6 +309,51 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         update=_refresh_keymaps,
     )
 
+    uv_rip_key: EnumProperty(
+        name="Key",
+        description="Keyboard key that triggers UV Rip (Unstitch) in the UV Editor",
+        items=[
+            ('A', "A", ""), ('B', "B", ""), ('C', "C", ""),
+            ('D', "D", ""), ('E', "E", ""), ('F', "F", ""),
+            ('G', "G", ""), ('H', "H", ""), ('I', "I", ""),
+            ('J', "J", ""), ('K', "K", ""), ('L', "L", ""),
+            ('M', "M", ""), ('N', "N", ""), ('O', "O", ""),
+            ('P', "P", ""), ('Q', "Q", ""), ('R', "R", ""),
+            ('S', "S", ""), ('T', "T", ""), ('U', "U", ""),
+            ('V', "V", ""), ('W', "W", ""), ('X', "X", ""),
+            ('Y', "Y", ""), ('Z', "Z", ""),
+            ('F1',  "F1",  ""), ('F2',  "F2",  ""), ('F3',  "F3",  ""),
+            ('F4',  "F4",  ""), ('F5',  "F5",  ""), ('F6',  "F6",  ""),
+            ('F7',  "F7",  ""), ('F8',  "F8",  ""), ('F9',  "F9",  ""),
+            ('F10', "F10", ""), ('F11', "F11", ""), ('F12', "F12", ""),
+            ('SEMI_COLON', ";", ""), ('COMMA', ",", ""), ('PERIOD', ".", ""),
+            ('SLASH', "/", ""), ('BACK_SLASH', "\\", ""),
+            ('LEFT_BRACKET', "[", ""), ('RIGHT_BRACKET', "]", ""),
+            ('ACCENT_GRAVE', "`", ""), ('QUOTE', "'", ""),
+            ('MINUS', "-", ""), ('EQUAL', "=", ""),
+        ],
+        default='V',
+        update=_refresh_keymaps,
+    )
+    uv_rip_shift: BoolProperty(
+        name="Shift",
+        description="Require Shift modifier for UV Rip",
+        default=False,
+        update=_refresh_keymaps,
+    )
+    uv_rip_ctrl: BoolProperty(
+        name="Ctrl",
+        description="Require Ctrl modifier for UV Rip",
+        default=False,
+        update=_refresh_keymaps,
+    )
+    uv_rip_alt: BoolProperty(
+        name="Alt",
+        description="Require Alt modifier for UV Rip",
+        default=False,
+        update=_refresh_keymaps,
+    )
+
     def draw(self, context):
         layout = self.layout
 
@@ -403,6 +448,14 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         row.prop(self, "move_and_sew_shift", toggle=True, text="Shift")
         row.prop(self, "move_and_sew_ctrl",  toggle=True, text="Ctrl")
         row.prop(self, "move_and_sew_alt",   toggle=True, text="Alt")
+
+        col.separator()
+        col.label(text="Rip / Unstitch (UV Editor):")
+        row = col.row(align=True)
+        row.prop(self, "uv_rip_key", text="")
+        row.prop(self, "uv_rip_shift", toggle=True, text="Shift")
+        row.prop(self, "uv_rip_ctrl",  toggle=True, text="Ctrl")
+        row.prop(self, "uv_rip_alt",   toggle=True, text="Alt")
 
         # ── Developer / Debug ─────────────────────────────────────────────────
         layout.separator(factor=0.5)

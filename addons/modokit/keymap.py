@@ -297,6 +297,19 @@ def register_keymaps():
             )
             state.addon_keymaps.append((km_uv, kmi))
 
+        # UV Rip — key configurable via prefs (default V)
+        for km_uv in _uv_km_targets:
+            kmi = km_uv.keymap_items.new(
+                'image.modo_uv_rip',
+                type=prefs.uv_rip_key,
+                value='PRESS',
+                shift=prefs.uv_rip_shift,
+                ctrl=prefs.uv_rip_ctrl,
+                alt=prefs.uv_rip_alt,
+                head=True,
+            )
+            state.addon_keymaps.append((km_uv, kmi))
+
         # Explicitly disable mesh.select_mode / uv.select_mode on 1/2/3
         _UV_CONFLICT_IDNAMES = {'mesh.select_mode', 'uv.select_mode'}
         _UV_MODE_KEYS = {'ONE', 'TWO', 'THREE'}
