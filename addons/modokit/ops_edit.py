@@ -51,6 +51,28 @@ def _candidate_from_highlight(context):
     return None
 
 
+def _all_edge_candidates_from_highlight(context):
+    """Return all highlighted EDGE hits as raycast-compatible dicts.
+    Used for double-click so hovering near a vertex selects loops for all
+    adjacent highlighted edges, not just the closest one.
+    """
+    if not state._preselect_hits:
+        return []
+    sm = context.tool_settings.mesh_select_mode
+    if not sm[1]:
+        return []
+    results = []
+    for hit in state._preselect_hits:
+        if hit.get('type') != 'EDGE' or 'edge_index' not in hit:
+            continue
+        obj = hit.get('obj')
+        if obj is None:
+            continue
+        results.append({'index': hit['edge_index'], 'obj': obj, 'location': None, 'normal': None,
+                        'hit_face_index': hit.get('face_index')})
+    return results
+
+
 # ============================================================================
 # Main Selection Operator
 # ============================================================================
@@ -98,6 +120,7 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         # Snapshot the pre-selection candidate on PRESS — reads the live
         # preselect state which is exactly what was just rendered.
         self._preselect_candidate = _candidate_from_highlight(context)
+        self._preselect_all_edges = _all_edge_candidates_from_highlight(context)
 
         if event.value == 'DOUBLE_CLICK':
             return self.execute_loop_selection(context)
@@ -393,28 +416,42 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
 
         # ── Edge mode → edge loop ─────────────────────────────────────────────
         elif select_mode[1]:
-            if hit_index >= len(bm.edges):
+            # Collect all highlighted edges (may be >1 when near a vertex)
+            all_hits = getattr(self, '_preselect_all_edges', [])
+            if not all_hits:
+                all_hits = [hit_result] if hit_result else []
+            if not all_hits:
                 return {'FINISHED'}
             if self.mode == 'set':
                 self._deselect_all_objects(context)
                 bm = bmesh.from_edit_mesh(obj.data)
                 bm.edges.ensure_lookup_table()
                 bm.faces.ensure_lookup_table()
-            clicked_edge = bm.edges[hit_index]
-            # Resolve the raycasted face so Modo-style pole fallback wraps the
-            # face the user was actually looking at.
-            hit_face = None
-            hf_idx = hit_result.get('hit_face_index')
-            if hf_idx is not None and hf_idx < len(bm.faces):
-                hit_face = bm.faces[hf_idx]
-            loop_edges = collect_edge_loop_modo(clicked_edge, preferred_face=hit_face)
-            if self.mode == 'set':
-                for e in loop_edges: e.select = True
+            all_loop_edges = set()
+            for hr in all_hits:
+                hr_obj = hr.get('obj', obj)
+                bm_hr = bmesh.from_edit_mesh(hr_obj.data)
+                bm_hr.edges.ensure_lookup_table()
+                bm_hr.faces.ensure_lookup_table()
+                hi = hr['index']
+                if hi >= len(bm_hr.edges):
+                    continue
+                clicked_edge = bm_hr.edges[hi]
+                hit_face = None
+                hf_idx = hr.get('hit_face_index')
+                if hf_idx is not None and hf_idx < len(bm_hr.faces):
+                    hit_face = bm_hr.faces[hf_idx]
+                all_loop_edges.update(collect_edge_loop_modo(clicked_edge, preferred_face=hit_face))
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.edges.ensure_lookup_table()
+            if self.mode in ('set', 'add'):
+                for e in all_loop_edges: e.select = True
             elif self.mode == 'remove':
-                for e in loop_edges: e.select = False
+                for e in all_loop_edges: e.select = False
             elif self.mode == 'toggle':
-                new_state = not clicked_edge.select
-                for e in loop_edges: e.select = new_state
+                first_edge = bm.edges[hit_index] if hit_index < len(bm.edges) else next(iter(all_loop_edges), None)
+                new_state = not first_edge.select if first_edge else True
+                for e in all_loop_edges: e.select = new_state
             self._flush_uv_sync(bm, context)
             bmesh.update_edit_mesh(obj.data)
             from .uv_overlays import _resync_uv_editor_selection

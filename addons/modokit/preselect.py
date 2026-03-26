@@ -110,9 +110,10 @@ def _get_stipple_shader(mode_2d=False):
         return _stipple_shader_3d_cache
 
 
-def _nudge_toward_camera(coords, rv3d):
+def _nudge_toward_camera(coords, rv3d, scale=1.0):
     """Offset world-space coords slightly toward the camera so they win LESS_EQUAL depth test.
-    Uses a fixed minimum offset + proportional term so it works at any distance."""
+    Uses a fixed minimum offset + proportional term so it works at any distance.
+    scale can be increased for coplanar geometry at steep angles (e.g. object wireframe)."""
     if rv3d is None:
         return coords
     cam_pos = rv3d.view_matrix.inverted_safe().translation
@@ -122,7 +123,7 @@ def _nudge_toward_camera(coords, rv3d):
         to_cam = cam_pos - v
         dist = to_cam.length
         if dist > 1e-6:
-            nudge = max(0.005, dist * _Z_BIAS)
+            nudge = max(0.005 * scale, dist * _Z_BIAS * scale)
             v = v + to_cam.normalized() * nudge
         result.append(tuple(v))
     return result
@@ -488,12 +489,9 @@ def _collect_object_hits(context, mx, my):
     if not hit or obj is None or obj.type != 'MESH':
         return []
 
-    mx_w     = obj.matrix_world
-    mx_w_3x3 = mx_w.to_3x3()
-    view_vec = view3d_utils.region_2d_to_vector_3d(region, rv3d, (mx, my))
+    mx_w = obj.matrix_world
 
-    # Use bmesh to access polygon normals so we can cull back-facing edges,
-    # matching the occlusion behaviour of edit-mode highlights.
+    # Use bmesh to collect all edges of the object.
     import bmesh as _bmesh
     bm = _bmesh.new()
     bm.from_mesh(obj.data)
@@ -502,12 +500,6 @@ def _collect_object_hits(context, mx, my):
 
     edges = []
     for edge in bm.edges:
-        # Include edge only if at least one adjacent face is front-facing
-        if not any(
-            (mx_w_3x3 @ f.normal).normalized().dot(view_vec) < 0
-            for f in edge.link_faces
-        ):
-            continue
         v0 = mx_w @ edge.verts[0].co
         v1 = mx_w @ edge.verts[1].co
         edges.append((tuple(v0), tuple(v1)))
@@ -803,15 +795,6 @@ def _preselect_draw_3d():
 
 
 def _preselect_draw_3d_inner():
-    # ── DEBUG: print active modal operator names (always, even with no hits) ──
-    try:
-        for _w in bpy.context.window_manager.windows:
-            for _op in _w.modal_operators:
-                print(f"[preselect DEBUG] modal: {_op.bl_idname!r}")
-    except Exception as _e:
-        print(f"[preselect DEBUG] modal check error: {_e}")
-    # ─────────────────────────────────────────────────────────────────────────
-
     if not state._preselect_hits:
         return
 
@@ -856,7 +839,10 @@ def _preselect_draw_3d_inner():
                 segs = list(hit['edge_coords'])
                 if not segs:
                     continue
-                gpu.state.depth_test_set('ALWAYS')
+                # Nudge all verts toward camera to beat wireframe z-fight
+                all_pts = _nudge_toward_camera([p for seg in segs for p in seg], rv3d, scale=10.0)
+                segs = [(all_pts[i*2], all_pts[i*2+1]) for i in range(len(segs))]
+                gpu.state.depth_test_set('LESS_EQUAL')
                 from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
                 aa3d = _get_aa_line_3d_shader()
                 hw = 1.0
@@ -987,7 +973,7 @@ def _preselect_draw_3d_px_inner():
                     continue
                 from .uv_overlays import _get_aa_line_shader, _aa_line_quads
                 aa = _get_aa_line_shader()
-                hw = 1.0
+                hw = 1.25
                 if aa is not None:
                     pos, t_vals = _aa_line_quads([(pts[0], pts[1])], hw)
                     aa.bind()
@@ -1138,7 +1124,7 @@ def _preselect_draw_uv_inner():
                         continue
                     from .uv_overlays import _get_aa_line_shader, _aa_line_quads
                     aa = _get_aa_line_shader()
-                    hw = 1.0
+                    hw = 1.25
                     if aa is not None:
                         pos, t_vals = _aa_line_quads(seg_pts, hw)
                         aa.bind()
@@ -1148,7 +1134,7 @@ def _preselect_draw_uv_inner():
                     else:
                         line_pts = [p for seg in seg_pts for p in seg]
                         batch = batch_for_shader(shader, 'LINES', {'pos': line_pts})
-                        gpu.state.line_width_set(1.0)
+                        gpu.state.line_width_set(1.25)
                         shader.bind()
                         shader.uniform_float('color', color)
                         batch.draw(shader)
