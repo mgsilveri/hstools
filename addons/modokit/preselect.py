@@ -1028,7 +1028,7 @@ def _preselect_draw_uv_inner():
     except Exception:
         return
 
-    if _is_transforming(context) or state._uv_lmb_down:
+    if _is_transforming(context) or state._uv_lmb_down or state._uv_active_transform_mode is not None:
         if state._preselect_hits:
             state._preselect_hits = []
         return
@@ -1294,7 +1294,7 @@ class IMAGE_OT_modo_preselect_highlight(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         navigating = _is_transforming(context)
-        if navigating or state._uv_lmb_down:
+        if navigating or state._uv_lmb_down or state._uv_active_transform_mode is not None:
             if state._preselect_hits:
                 state._preselect_hits = []
                 context.area.tag_redraw()

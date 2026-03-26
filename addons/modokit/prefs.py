@@ -210,6 +210,12 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         default=False,
     )
 
+    show_debug: BoolProperty(
+        name="Show Debug Options",
+        description="Expand the developer / debug section",
+        default=False,
+    )
+
     # ── Hotkeys ───────────────────────────────────────────────────────────────
     shortest_path_key: EnumProperty(
         name="Key",
@@ -258,45 +264,128 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         update=_refresh_keymaps,
     )
 
+    move_and_sew_key: EnumProperty(
+        name="Key",
+        description="Keyboard key that triggers Move and Sew in the UV Editor",
+        items=[
+            ('A', "A", ""), ('B', "B", ""), ('C', "C", ""),
+            ('D', "D", ""), ('E', "E", ""), ('F', "F", ""),
+            ('G', "G", ""), ('H', "H", ""), ('I', "I", ""),
+            ('J', "J", ""), ('K', "K", ""), ('L', "L", ""),
+            ('M', "M", ""), ('N', "N", ""), ('O', "O", ""),
+            ('P', "P", ""), ('Q', "Q", ""), ('R', "R", ""),
+            ('S', "S", ""), ('T', "T", ""), ('U', "U", ""),
+            ('V', "V", ""), ('W', "W", ""), ('X', "X", ""),
+            ('Y', "Y", ""), ('Z', "Z", ""),
+            ('F1',  "F1",  ""), ('F2',  "F2",  ""), ('F3',  "F3",  ""),
+            ('F4',  "F4",  ""), ('F5',  "F5",  ""), ('F6',  "F6",  ""),
+            ('F7',  "F7",  ""), ('F8',  "F8",  ""), ('F9',  "F9",  ""),
+            ('F10', "F10", ""), ('F11', "F11", ""), ('F12', "F12", ""),
+            ('SEMI_COLON', ";", ""), ('COMMA', ",", ""), ('PERIOD', ".", ""),
+            ('SLASH', "/", ""), ('BACK_SLASH', "\\", ""),
+            ('LEFT_BRACKET', "[", ""), ('RIGHT_BRACKET', "]", ""),
+            ('ACCENT_GRAVE', "`", ""), ('QUOTE', "'", ""),
+            ('MINUS', "-", ""), ('EQUAL', "=", ""),
+        ],
+        default='S',
+        update=_refresh_keymaps,
+    )
+    move_and_sew_shift: BoolProperty(
+        name="Shift",
+        description="Require Shift modifier for Move and Sew",
+        default=True,
+        update=_refresh_keymaps,
+    )
+    move_and_sew_ctrl: BoolProperty(
+        name="Ctrl",
+        description="Require Ctrl modifier for Move and Sew",
+        default=False,
+        update=_refresh_keymaps,
+    )
+    move_and_sew_alt: BoolProperty(
+        name="Alt",
+        description="Require Alt modifier for Move and Sew",
+        default=False,
+        update=_refresh_keymaps,
+    )
+
     def draw(self, context):
         layout = self.layout
 
-        # ── Modules ───────────────────────────────────────────────────────────
+        # ── Edit Mode ─────────────────────────────────────────────────────────
         box = layout.box()
-        box.label(text="Modules", icon='MODIFIER')
+        box.label(text="Edit Mode", icon='EDITMODE_HLT')
         col = box.column(align=True)
+
         col.prop(self, "enable_mouse_selection")
+        if self.enable_mouse_selection:
+            sub = col.column(align=True)
+            sub.use_property_split = True
+            sub.separator(factor=0.5)
+            sub.prop(self, "selection_tolerance")
+            sub.prop(self, "paint_selection_size")
+            sub.prop(self, "double_click_time")
+
         col.separator()
         col.prop(self, "enable_lasso_selection")
+
+        col.separator()
         col.prop(self, "enable_backface_viz")
+        if self.enable_backface_viz:
+            sub = col.column(align=True)
+            sub.use_property_split = True
+            sub.separator(factor=0.5)
+            sub.prop(self, "backwire_opacity")
+
         col.separator()
         col.prop(self, "enable_component_mode")
-        col.separator()
-        col.prop(self, "enable_object_mode_selection")
-        col.separator()
-        col.prop(self, "enable_uv_handle_snap")
-        col.prop(self, "enable_uv_boundary_overlay")
-        col.prop(self, "enable_uv_flipped_face_viz")
-        col.separator()
-        col.prop(self, "enable_instance_tagging")
-        col.separator()
-        col.prop(self, "enable_preselect_highlight")
 
-        # ── Settings ──────────────────────────────────────────────────────────
-        layout.separator()
+        # ── Viewport ───────────────────────────────────────────────────────────
+        layout.separator(factor=0.5)
         box = layout.box()
-        box.label(text="Settings", icon='PREFERENCES')
-        box.prop(self, "selection_tolerance")
-        box.prop(self, "double_click_time")
-        box.prop(self, "backwire_opacity")
-        box.prop(self, "uv_scale_sensitivity")
+        box.label(text="Viewport", icon='VIEW3D')
+        col = box.column(align=True)
+        col.prop(self, "enable_preselect_highlight")
         if self.enable_preselect_highlight:
-            row = box.row(align=True)
-            row.prop(self, "preselect_color", text="Pre-selection Color")
+            sub = col.column(align=True)
+            sub.use_property_split = True
+            sub.separator(factor=0.5)
+            row = sub.row(align=True)
+            row.prop(self, "preselect_color", text="Color")
             row.prop(self, "preselect_alpha", text="Opacity")
 
+        # ── Object Mode ───────────────────────────────────────────────────────
+        layout.separator(factor=0.5)
+        box = layout.box()
+        box.label(text="Object Mode", icon='OBJECT_DATA')
+        col = box.column(align=True)
+        col.prop(self, "enable_object_mode_selection")
+
+        # ── UV Editor ─────────────────────────────────────────────────────────
+        layout.separator(factor=0.5)
+        box = layout.box()
+        box.label(text="UV Editor", icon='UV')
+        col = box.column(align=True)
+
+        col.prop(self, "enable_uv_handle_snap")
+        if self.enable_uv_handle_snap:
+            sub = col.column(align=True)
+            sub.use_property_split = True
+            sub.separator(factor=0.5)
+            sub.prop(self, "uv_scale_sensitivity")
+
+        col.separator()
+        col.prop(self, "enable_uv_boundary_overlay")
+        col.prop(self, "enable_uv_flipped_face_viz")
+
+        # ── Miscellaneous ─────────────────────────────────────────────────────
+        layout.separator(factor=0.5)
+        box = layout.box()
+        box.label(text="Miscellaneous", icon='SETTINGS')
+        box.prop(self, "enable_instance_tagging")
+
         # ── Hotkeys ───────────────────────────────────────────────────────────
-        layout.separator()
+        layout.separator(factor=0.5)
         box = layout.box()
         box.label(text="Hotkeys", icon='KEYINGSET')
         col = box.column(align=True)
@@ -306,25 +395,30 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         row.prop(self, "shortest_path_shift", toggle=True, text="Shift")
         row.prop(self, "shortest_path_ctrl",  toggle=True, text="Ctrl")
         row.prop(self, "shortest_path_alt",   toggle=True, text="Alt")
-        _mouse_keys = {'RIGHTMOUSE', 'MIDDLEMOUSE'}
-        if self.shortest_path_key not in _mouse_keys:
-            col.label(
-                text="Keyboard keys are registered as direct bindings in Edit Mode.",
-                icon='INFO',
-            )
-        else:
-            col.label(
-                text="Mouse buttons: click = Shortest Path, drag = Lasso.",
-                icon='INFO',
-            )
 
-        # ── Debugging ─────────────────────────────────────────────────────────
-        layout.separator()
+        col.separator()
+        col.label(text="Move and Sew (UV Editor):")
+        row = col.row(align=True)
+        row.prop(self, "move_and_sew_key", text="")
+        row.prop(self, "move_and_sew_shift", toggle=True, text="Shift")
+        row.prop(self, "move_and_sew_ctrl",  toggle=True, text="Ctrl")
+        row.prop(self, "move_and_sew_alt",   toggle=True, text="Alt")
+
+        # ── Developer / Debug ─────────────────────────────────────────────────
+        layout.separator(factor=0.5)
         box = layout.box()
-        box.label(text="Debugging", icon='INFO')
-        box.prop(self, "debug_raycast")
-        box.prop(self, "debug_selection")
-        box.prop(self, "debug_uv_seam")
-        box.prop(self, "debug_uv_handle")
-        if self.debug_raycast or self.debug_selection or self.debug_uv_seam or self.debug_uv_handle:
-            box.label(text="Open: Window > Toggle System Console", icon='CONSOLE')
+        row = box.row()
+        row.prop(
+            self, "show_debug",
+            icon='TRIA_DOWN' if self.show_debug else 'TRIA_RIGHT',
+            icon_only=True, emboss=False,
+        )
+        row.label(text="Developer / Debug")
+        if self.show_debug:
+            col = box.column(align=True)
+            col.prop(self, "debug_raycast")
+            col.prop(self, "debug_selection")
+            col.prop(self, "debug_uv_seam")
+            col.prop(self, "debug_uv_handle")
+            if self.debug_raycast or self.debug_selection or self.debug_uv_seam or self.debug_uv_handle:
+                col.label(text="Open: Window > Toggle System Console", icon='CONSOLE')

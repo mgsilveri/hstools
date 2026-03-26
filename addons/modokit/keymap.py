@@ -284,13 +284,15 @@ def register_keymaps():
                     )
                     state.addon_keymaps.append((km_uv, kmi))
 
-        # Shift+S — Move and Sew (always registered)
+        # Move and Sew — key configurable via prefs (default Shift+S)
         for km_uv in _uv_km_targets:
             kmi = km_uv.keymap_items.new(
                 'image.modo_uv_stitch',
-                type='S',
+                type=prefs.move_and_sew_key,
                 value='PRESS',
-                shift=True,
+                shift=prefs.move_and_sew_shift,
+                ctrl=prefs.move_and_sew_ctrl,
+                alt=prefs.move_and_sew_alt,
                 head=True,
             )
             state.addon_keymaps.append((km_uv, kmi))
