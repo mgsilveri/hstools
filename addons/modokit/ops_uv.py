@@ -909,22 +909,54 @@ Face: tear the outer boundary of the selected face(s)."""
 
     # -- per-mode target collection -------------------------------------------
 
+    def _fan_group_of(self, seed_loop, sel_eids):
+        """Return all loops at seed_loop.vert reachable via face-fan traversal
+        without crossing any edge whose index is in sel_eids."""
+        v = seed_loop.vert
+        visited_id = set()
+        queue = [seed_loop]
+        group = []
+        while queue:
+            l = queue.pop()
+            if id(l) in visited_id:
+                continue
+            if l.vert != v:
+                continue
+            visited_id.add(id(l))
+            group.append(l)
+            # Try to cross to adjacent faces via the two edges incident to V
+            for e_loop in (l, l.link_loop_prev):
+                if e_loop.edge.index in sel_eids:
+                    continue  # selected edge — stop traversal here
+                rad = e_loop.link_loop_radial_next
+                if rad is e_loop:
+                    continue  # boundary edge
+                for candidate in rad.face.loops:
+                    if candidate.vert == v and id(candidate) not in visited_id:
+                        queue.append(candidate)
+                        break
+        return group
+
     def _targets_vertex(self, bm, uv_layer, sync):
-        """Loops co-located with a selected UV vert that are themselves unselected."""
-        groups = defaultdict(lambda: {'sel': [], 'unsel': []})
+        # Collect all loops at each selected UV vertex position.
+        # If more than one loop shares that position, offset all but the first
+        # — this performs a full fan-split at the selected UV vertex.
+        groups = defaultdict(list)
         for face in bm.faces:
             for loop in face.loops:
-                k = (loop.vert.index, self._uv_key(loop[uv_layer].uv))
                 is_sel = loop.vert.select if sync else loop.uv_select_vert
-                groups[k]['sel' if is_sel else 'unsel'].append(loop)
+                if not is_sel:
+                    continue
+                k = (loop.vert.index, self._uv_key(loop[uv_layer].uv))
+                groups[k].append(loop)
         targets = set()
-        for sides in groups.values():
-            if sides['sel'] and sides['unsel']:
-                targets.update(sides['unsel'])
+        for loops in groups.values():
+            if len(loops) > 1:
+                targets.update(loops[1:])
         return targets
 
     def _targets_edge(self, bm, uv_layer, sync):
-        """The two endpoint UV loops on the unselected side of each torn UV edge."""
+        # ── Phase 1: collect the immediate partner loops for each torn edge ──
         targets = set()
         visited = set()
         for face in bm.faces:
@@ -936,16 +968,46 @@ Face: tear the outer boundary of the selected face(s)."""
                 partner = loop.link_loop_radial_next
                 if partner is loop:
                     continue  # boundary mesh edge — nothing to split
-                a_sel = loop.edge.select if sync else self._loop_edge_sel(loop, uv_layer)
-                b_sel = loop.edge.select if sync else self._loop_edge_sel(partner, uv_layer)
-                if a_sel == b_sel:
-                    continue
-                # Due to radial reversal:
-                #   unsel_l.vert         == sel_l.link_loop_next.vert
-                #   unsel_l.link_loop_next.vert == sel_l.vert
-                unsel = partner if a_sel else loop
-                targets.add(unsel)
-                targets.add(unsel.link_loop_next)
+                if sync:
+                    if not loop.edge.select:
+                        continue
+                    targets.add(partner)
+                    targets.add(partner.link_loop_next)
+                else:
+                    a_sel = self._loop_edge_sel(loop, uv_layer)
+                    b_sel = self._loop_edge_sel(partner, uv_layer)
+                    if a_sel == b_sel:
+                        continue
+                    unsel = partner if a_sel else loop
+                    targets.add(unsel)
+                    targets.add(unsel.link_loop_next)
+
+        # ── Phase 2: fan-expand at each torn vertex ───────────────────────────
+        # At each endpoint vertex of a torn edge, find all loops that are
+        # UV-co-located with the initial target AND reachable via the same
+        # face-fan arc (not crossing any selected edge).  This ensures that
+        # faces that wrap around the corner vertex — part of the same island as
+        # the partner side — are also offset, giving truly separate islands.
+        if sync:
+            sel_eids = frozenset(
+                l.edge.index for f in bm.faces for l in f.loops if l.edge.select)
+        else:
+            sel_eids = frozenset(
+                l.edge.index for f in bm.faces for l in f.loops
+                if self._loop_edge_sel(l, uv_layer))
+
+        extra = set()
+        seen_keys = set()
+        for init in list(targets):
+            uv_k = self._uv_key(init[uv_layer].uv)
+            k = (init.vert.index, uv_k)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            for loop in self._fan_group_of(init, sel_eids):
+                if loop not in targets and self._uv_key(loop[uv_layer].uv) == uv_k:
+                    extra.add(loop)
+        targets.update(extra)
         return targets
 
     def _targets_face(self, bm, uv_layer, sync):

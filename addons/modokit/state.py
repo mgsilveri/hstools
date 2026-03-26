@@ -121,6 +121,8 @@ _OUR_IDNAMES = {
     'image.modo_uv_click_select',
     'image.modo_uv_lasso_select',
     'image.modo_uv_double_click_select',
+    'image.modo_uv_rip',
+    'image.modo_preselect_lmb_track',
 }
 
 _NAV_IDNAMES = {
