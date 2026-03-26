@@ -126,9 +126,6 @@ def register():
                 uv_overlays._start_uv_flipped_face_viz()
                 uv_overlays._compute_flipped_face_uv_cache(ctx)
                 uv_overlays._compute_uv_boundary_cache(ctx)
-                if not bpy.app.timers.is_registered(uv_overlays._refresh_uv_caches_timer):
-                    bpy.app.timers.register(uv_overlays._refresh_uv_caches_timer,
-                                            first_interval=0.0)
                 screen = getattr(ctx, 'screen', None)
                 if screen:
                     for area in screen.areas:

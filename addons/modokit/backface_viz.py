@@ -515,7 +515,6 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
                 _start_uv_boundary_overlay, _stop_uv_boundary_overlay,
                 _start_uv_flipped_face_viz, _stop_uv_flipped_face_viz,
                 _compute_flipped_face_uv_cache, _compute_uv_boundary_cache,
-                _refresh_uv_caches_timer,
             )
             _start_uv_boundary_overlay()
             _start_uv_flipped_face_viz()
@@ -526,9 +525,6 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
                     if getattr(ctx, 'mode', None) == 'EDIT_MESH':
                         _compute_flipped_face_uv_cache(ctx)
                         _compute_uv_boundary_cache(ctx)
-                        if not bpy.app.timers.is_registered(_refresh_uv_caches_timer):
-                            bpy.app.timers.register(_refresh_uv_caches_timer,
-                                                    first_interval=0.0)
                         screen = getattr(ctx, 'screen', None)
                         if screen:
                             for area in screen.areas:
@@ -581,15 +577,11 @@ def _uv_cache_clear_load_post_handler(dummy):
                 from .uv_overlays import (
                     _start_uv_boundary_overlay, _start_uv_flipped_face_viz,
                     _compute_flipped_face_uv_cache, _compute_uv_boundary_cache,
-                    _refresh_uv_caches_timer,
                 )
                 _start_uv_boundary_overlay()
                 _start_uv_flipped_face_viz()
                 _compute_flipped_face_uv_cache(ctx)
                 _compute_uv_boundary_cache(ctx)
-                if not bpy.app.timers.is_registered(_refresh_uv_caches_timer):
-                    bpy.app.timers.register(_refresh_uv_caches_timer,
-                                            first_interval=0.0)
                 screen = getattr(ctx, 'screen', None)
                 if screen:
                     for area in screen.areas:

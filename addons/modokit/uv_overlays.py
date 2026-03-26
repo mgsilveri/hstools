@@ -923,15 +923,18 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         if not depsgraph.id_type_updated('MESH'):
             return
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
-        # 3D geometry cache — safe here (no UV layer access)
-        from .backface_viz import _compute_back_edge_cache
-        _compute_back_edge_cache(context)
-        # Schedule UV cache refresh
+        # Inc generation counter. The timer closure captures this value and bails
+        # out completely if a newer MESH update has arrived by the time it fires —
+        # guaranteeing BMesh access only happens in a confirmed stable window.
         import time as _d_time
         state._uv_cache_dirty_time = _d_time.monotonic()
-        if not bpy.app.timers.is_registered(_refresh_uv_caches_timer):
-            bpy.app.timers.register(_refresh_uv_caches_timer,
-                                    first_interval=state._UV_STABLE_DELAY)
+        state._uv_cache_dirty_gen += 1
+        _gen = state._uv_cache_dirty_gen
+
+        def _deferred(_captured_gen=_gen):
+            return _refresh_uv_caches_timer(_captured_gen)
+
+        bpy.app.timers.register(_deferred, first_interval=state._UV_STABLE_DELAY)
         prefs = get_addon_preferences(context)
         if not getattr(prefs, 'enable_uv_boundary_overlay', True):
             return
@@ -944,14 +947,28 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         _uv_debug_log(f"[UV-DEPSGRAPH] EXCEPTION: {_exc}")
 
 
-def _refresh_uv_caches_timer():
-    """Timer: recompute UV draw caches; runs between event processings (BMesh safe)."""
+def _refresh_uv_caches_timer(scheduled_gen=None):
+    """Recompute UV draw caches — safe Python context only (timer or operator).
+
+    *scheduled_gen* is the generation counter value at the time the depsgraph
+    handler registered this timer.  If the counter has advanced since then,
+    a newer MESH update is in flight and we bail completely — the newer timer
+    will do the work.  This guarantees bmesh.from_edit_mesh() is never called
+    while a modal operator (e.g. Loop Cut & Slide) is still modifying the mesh.
+    """
     try:
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
-            _uv_debug_log(f"[UV-TIMER] not in EDIT_MESH, unregistering timer")
+            _uv_debug_log("[UV-TIMER] not in EDIT_MESH, skipping")
+            return None
+        # If a newer MESH update arrived since we were scheduled, bail — the
+        # newer timer will run instead.
+        if scheduled_gen is not None and scheduled_gen != state._uv_cache_dirty_gen:
+            _uv_debug_log(f"[UV-TIMER] stale gen {scheduled_gen} vs {state._uv_cache_dirty_gen}, skipping")
             return None
         _uv_debug_log("[UV-TIMER] _refresh_uv_caches_timer firing")
+        from .backface_viz import _compute_back_edge_cache
+        _compute_back_edge_cache(context)
         _compute_flipped_face_uv_cache(context)
         _compute_uv_boundary_cache(context)
         prefs = get_addon_preferences(context)
@@ -963,7 +980,7 @@ def _refresh_uv_caches_timer():
                         area.tag_redraw()
     except Exception as _exc:
         _uv_debug_log(f"[UV-TIMER] EXCEPTION: {_exc}")
-    return 0.0  # reschedule immediately
+    return None  # self-terminate; a new closure is registered on the next MESH update
 
 
 def _start_uv_boundary_overlay():

@@ -36,7 +36,6 @@ from .uv_overlays import (
     _start_uv_boundary_overlay,
     _start_uv_flipped_face_viz,
     _compute_flipped_face_uv_cache,
-    _refresh_uv_caches_timer,
     _stop_uv_boundary_overlay,
     _stop_uv_flipped_face_viz,
     _uv_undo_redo_handler,
