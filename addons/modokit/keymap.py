@@ -503,6 +503,7 @@ def register_keymaps():
                     type=key, value='PRESS', head=True,
                 )
                 kmi.properties.component = comp
+                kmi.properties.convert = False
                 state.addon_keymaps.append((km_obj, kmi))
 
             for key, comp in (('ONE', 'VERT'), ('TWO', 'EDGE'),
@@ -510,6 +511,7 @@ def register_keymaps():
                 kmi = km.keymap_items.new('view3d.modo_component_mode',
                                           type=key, value='PRESS', head=True)
                 kmi.properties.component = comp
+                kmi.properties.convert = False
                 state.addon_keymaps.append((km, kmi))
 
             for km_ctx in (km, km_obj):

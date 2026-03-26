@@ -83,6 +83,7 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                 tgt = self.component
 
                 if cur[2] and tgt == 'EDGE':
+                    src_sel = {f.index for f in bm.faces if f.select}
                     sel = {e.index for f in bm.faces if f.select for e in f.edges}
                     bpy.ops.mesh.select_all(action='DESELECT')
                     context.tool_settings.mesh_select_mode = _COMPONENT_MODE_MAP['EDGE']
@@ -94,9 +95,16 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                     for v in bm.verts:
                         v.select = any(e.select for e in v.link_edges)
                     bmesh.update_edit_mesh(obj.data)
+                    # Save source-mode memory (we're leaving it) but leave target
+                    # memory untouched — convert is a preview, not a memory commit.
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['FACE'] = src_sel
+                    state._last_switch_was_convert = True
                     return {'FINISHED'}
 
                 elif cur[2] and tgt == 'VERT':
+                    src_sel = {f.index for f in bm.faces if f.select}
                     sel = {v.index for f in bm.faces if f.select for v in f.verts}
                     bpy.ops.mesh.select_all(action='DESELECT')
                     context.tool_settings.mesh_select_mode = _COMPONENT_MODE_MAP['VERT']
@@ -105,9 +113,14 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                     for v in bm.verts:
                         v.select = v.index in sel
                     bmesh.update_edit_mesh(obj.data)
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['FACE'] = src_sel
+                    mem['VERT'] = sel
                     return {'FINISHED'}
 
                 elif cur[1] and tgt == 'VERT':
+                    src_sel = {e.index for e in bm.edges if e.select}
                     sel = {v.index for e in bm.edges if e.select for v in e.verts}
                     bpy.ops.mesh.select_all(action='DESELECT')
                     context.tool_settings.mesh_select_mode = _COMPONENT_MODE_MAP['VERT']
@@ -116,9 +129,14 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                     for v in bm.verts:
                         v.select = v.index in sel
                     bmesh.update_edit_mesh(obj.data)
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['EDGE'] = src_sel
+                    mem['VERT'] = sel
                     return {'FINISHED'}
 
                 elif cur[1] and tgt == 'FACE':
+                    src_sel = {e.index for e in bm.edges if e.select}
                     sel = {f.index for f in bm.faces
                            if sum(1 for e in f.edges if e.select) >= 2}
                     if not sel:
@@ -136,9 +154,14 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                             for v in f.verts: v.select = True
                             for e in f.edges: e.select = True
                     bmesh.update_edit_mesh(obj.data)
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['EDGE'] = src_sel
+                    mem['FACE'] = sel
                     return {'FINISHED'}
 
                 elif cur[0] and tgt == 'EDGE':
+                    src_sel = {v.index for v in bm.verts if v.select}
                     sel = {e.index for e in bm.edges if all(v.select for v in e.verts)}
                     bpy.ops.mesh.select_all(action='DESELECT')
                     context.tool_settings.mesh_select_mode = _COMPONENT_MODE_MAP['EDGE']
@@ -150,9 +173,14 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                     for v in bm.verts:
                         v.select = any(e.select for e in v.link_edges)
                     bmesh.update_edit_mesh(obj.data)
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['VERT'] = src_sel
+                    mem['EDGE'] = sel
                     return {'FINISHED'}
 
                 elif cur[0] and tgt == 'FACE':
+                    src_sel = {v.index for v in bm.verts if v.select}
                     sel = {f.index for f in bm.faces if all(v.select for v in f.verts)}
                     bpy.ops.mesh.select_all(action='DESELECT')
                     context.tool_settings.mesh_select_mode = _COMPONENT_MODE_MAP['FACE']
@@ -167,6 +195,10 @@ class VIEW3D_OT_modo_component_mode(bpy.types.Operator):
                             for e in f.edges: e.select = True
                             for v in f.verts: v.select = True
                     bmesh.update_edit_mesh(obj.data)
+                    mem = state._selection_memory.setdefault(
+                        obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()})
+                    mem['VERT'] = src_sel
+                    mem['FACE'] = sel
                     return {'FINISHED'}
 
                 else:

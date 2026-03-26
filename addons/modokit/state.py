@@ -26,6 +26,13 @@ _material_mode_active: bool = False
 # Structure: {mesh_data_name: {'VERT': {indices}, 'EDGE': {indices}, 'FACE': {indices}}}
 _selection_memory: dict = {}
 
+# Set by ALT+mode (convert) operations so the non-convert path knows:
+#   - skip_save: don't overwrite this mode's independent memory with the
+#     temporary converted selection
+#   - if pressing the SAME mode key as the convert target, bail early —
+#     the converted selection is already displayed, nothing to restore
+_last_convert_target: str = ''   # sub-mode the last convert went TO ('VERT'/'EDGE'/'FACE')
+
 # Per-mesh independent UV selection memory (sync OFF only).
 _uv_selection_memory: dict = {}
 
