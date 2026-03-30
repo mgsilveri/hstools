@@ -196,25 +196,40 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                         perf_record("bec: mesh elements iterated", nf)
                         if topo_only:
                             with perf_time("bec: topo scan"):
-                                for (fi, edge_pairs, tris) in _bec_face_topo.get(obj.name, []):
-                                    face = bm.faces[fi]
-                                    nw_v = (mx3_mm @ face.normal).normalized()
-                                    nw = (nw_v.x, nw_v.y, nw_v.z)
-                                    for (v0i, v1i) in edge_pairs:
-                                        v0 = wcos[v0i]
-                                        v1 = wcos[v1i]
-                                        new_edges.append(((v0[0], v0[1], v0[2]),
-                                                          (v1[0], v1[1], v1[2])))
-                                    for (v0i, v1i, v2i) in tris:
-                                        v0w = wcos[v0i]
-                                        v1w = wcos[v1i]
-                                        v2w = wcos[v2i]
-                                        new_faces.append((
-                                            (v0w[0], v0w[1], v0w[2]),
-                                            (v1w[0], v1w[1], v1w[2]),
-                                            (v2w[0], v2w[1], v2w[2]),
-                                            (nw[0],  nw[1],  nw[2]),
-                                        ))
+                                face_topo = _bec_face_topo.get(obj.name, [])
+                                nsel = len(face_topo)
+                                if nsel:
+                                    # Collect live normals for selected faces only,
+                                    # then transform in one numpy call — replaces
+                                    # N per-face mathutils Matrix3 @ Vector calls.
+                                    bm.faces.ensure_lookup_table()
+                                    nor_loc = np.empty(nsel * 3, dtype='f')
+                                    for i, (fi, _, _) in enumerate(face_topo):
+                                        n = bm.faces[fi].normal
+                                        nor_loc[i*3]   = n.x
+                                        nor_loc[i*3+1] = n.y
+                                        nor_loc[i*3+2] = n.z
+                                    nors = nor_loc.reshape(-1, 3) @ mx3.T
+                                    lens = np.sqrt((nors * nors).sum(axis=1, keepdims=True))
+                                    nors /= np.where(lens > 0, lens, 1.0)
+                                    nors_py = nors.tolist()
+                                    for i, (fi, edge_pairs, tris) in enumerate(face_topo):
+                                        nw = nors_py[i]
+                                        for (v0i, v1i) in edge_pairs:
+                                            v0 = wcos[v0i]
+                                            v1 = wcos[v1i]
+                                            new_edges.append(((v0[0], v0[1], v0[2]),
+                                                              (v1[0], v1[1], v1[2])))
+                                        for (v0i, v1i, v2i) in tris:
+                                            v0w = wcos[v0i]
+                                            v1w = wcos[v1i]
+                                            v2w = wcos[v2i]
+                                            new_faces.append((
+                                                (v0w[0], v0w[1], v0w[2]),
+                                                (v1w[0], v1w[1], v1w[2]),
+                                                (v2w[0], v2w[1], v2w[2]),
+                                                (nw[0],  nw[1],  nw[2]),
+                                            ))
                         else:
                             obj_face_topo = []
                             with perf_time("bec: select scan"):
@@ -270,11 +285,12 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                 from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
                 aa3d = _get_aa_line_3d_shader()
                 if aa3d is not None:
-                    pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, 1.0)
-                    _gpu_batch_edge = batch_for_shader(
-                        aa3d, 'TRIS',
-                        {'pos0': pos0_l, 'pos1': pos1_l, 'which': which_l, 'side': side_l},
-                    )
+                    with perf_time("bec: batch build / edge quads"):
+                        pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, 1.0)
+                        _gpu_batch_edge = batch_for_shader(
+                            aa3d, 'TRIS',
+                            {'pos0': pos0_l, 'pos1': pos1_l, 'which': which_l, 'side': side_l},
+                        )
                 else:
                     coords = []
                     for (p0, p1) in _back_edge_cache:
@@ -284,20 +300,17 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                     fallback = gpu.shader.from_builtin('UNIFORM_COLOR')
                     _gpu_batch_edge = batch_for_shader(fallback, 'LINES', {'pos': coords})
             if _back_face_cache:
-                # Build the face batch with per-vertex normals.  The vertex
-                # shader applies the view-distance offset (uoffset uniform) on
-                # the GPU, so this batch is valid for all camera distances and
-                # only needs rebuilding when the mesh changes — not every frame.
                 stipple = _get_stipple_shader()
                 if stipple is not None:
-                    pos_l = []
-                    nor_l = []
-                    for (p0, p1, p2, nw) in _back_face_cache:
-                        pos_l += [p0, p1, p2]
-                        nor_l += [nw, nw, nw]
-                    _gpu_batch_face = batch_for_shader(
-                        stipple, 'TRIS', {'pos': pos_l, 'normal': nor_l}
-                    )
+                    with perf_time("bec: batch build / face tris"):
+                        pos_l = []
+                        nor_l = []
+                        for (p0, p1, p2, nw) in _back_face_cache:
+                            pos_l += [p0, p1, p2]
+                            nor_l += [nw, nw, nw]
+                        _gpu_batch_face = batch_for_shader(
+                            stipple, 'TRIS', {'pos': pos_l, 'normal': nor_l}
+                        )
     except Exception:
         pass
 
