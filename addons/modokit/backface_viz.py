@@ -76,8 +76,17 @@ _gpu_batch_face: object = None        # GPUBatch for face fill triangles (UNIFOR
 _gpu_batch_face_stipple: object = None  # GPUBatch for face fill triangles (stipple shader)
 _gpu_batch_edge_coords: list = []     # flat coord list cached alongside the edge batch
 
+# ── Selection topology cache — stable during transforms, only rebuilt on dirty ─
+# Stores selected element structure (indices only, no positions) per object name.
+# During G/R/S transforms positions change but topology/selection don't, so we
+# skip the full bm.faces/edges/verts iteration and just recompute positions.
+_bec_face_topo: dict = {}   # obj.name → [(fi, [(v0i,v1i),...edges], [(v0i,v1i,v2i),...tris])]
+_bec_edge_topo: dict = {}   # obj.name → [(v0i, v1i) per selected edge]
+_bec_vert_topo: dict = {}   # obj.name → [vi per selected vert]
+_bec_topo_valid: bool = False  # True after a full rebuild; False on dirty/mode-change
 
-def _compute_back_edge_cache(context):
+
+def _compute_back_edge_cache(context, topo_only: bool = False):
     """Populate _back_edge_cache and _back_vert_cache from the live BMesh.
 
     Vertex positions read directly from bm.verts[i].co.  This is safe and
@@ -93,6 +102,7 @@ def _compute_back_edge_cache(context):
     """
     global _back_edge_cache, _back_vert_cache, _back_face_cache
     global _gpu_batch_edge, _gpu_batch_face, _gpu_batch_face_stipple, _gpu_batch_edge_coords
+    global _bec_face_topo, _bec_edge_topo, _bec_vert_topo, _bec_topo_valid
     _back_edge_cache = []
     _back_vert_cache = []
     _back_face_cache = []
@@ -100,6 +110,8 @@ def _compute_back_edge_cache(context):
     _gpu_batch_face = None
     _gpu_batch_face_stipple = None
     _gpu_batch_edge_coords = []
+    if not topo_only:
+        _bec_topo_valid = False
     try:
         if getattr(context, 'mode', None) != 'EDIT_MESH':
             return
@@ -117,6 +129,7 @@ def _compute_back_edge_cache(context):
                 try:
                     mesh = obj.data
                     mx   = obj.matrix_world
+                    mx3_mm = mx.to_3x3()  # mathutils Matrix3 — reused for positions (numpy) and per-face normal inline
 
                     with perf_time("bec: from_edit_mesh"):
                         bm = bmesh.from_edit_mesh(mesh)
@@ -135,69 +148,115 @@ def _compute_back_edge_cache(context):
 
                     with perf_time("bec: numpy transform"):
                         cos  = co_flat.reshape(-1, 3)
-                        mx3  = np.array(mx.to_3x3(), dtype='f')
+                        mx3  = np.array(mx3_mm, dtype='f')
                         t    = np.array(mx.translation, dtype='f')
                         wcos = (cos @ mx3.T + t).tolist()
 
                     if vert_mode:
                         perf_record("bec: mesh elements iterated", nv)
-                        with perf_time("bec: select scan"):
-                            for v in bm.verts:
-                                if v.select:
-                                    w = wcos[v.index]
+                        if topo_only:
+                            with perf_time("bec: topo scan"):
+                                for vi in _bec_vert_topo.get(obj.name, []):
+                                    w = wcos[vi]
                                     new_verts.append((w[0], w[1], w[2]))
+                        else:
+                            obj_vert_topo = []
+                            with perf_time("bec: select scan"):
+                                for v in bm.verts:
+                                    if v.select:
+                                        obj_vert_topo.append(v.index)
+                                        w = wcos[v.index]
+                                        new_verts.append((w[0], w[1], w[2]))
+                            _bec_vert_topo[obj.name] = obj_vert_topo
                     elif edge_mode:
                         ne = len(bm.edges)
                         perf_record("bec: mesh elements iterated", ne)
-                        with perf_time("bec: select scan"):
-                            for edge in bm.edges:
-                                if edge.select:
-                                    v0 = wcos[edge.verts[0].index]
-                                    v1 = wcos[edge.verts[1].index]
+                        if topo_only:
+                            with perf_time("bec: topo scan"):
+                                for (v0i, v1i) in _bec_edge_topo.get(obj.name, []):
+                                    v0 = wcos[v0i]
+                                    v1 = wcos[v1i]
                                     new_edges.append(((v0[0], v0[1], v0[2]),
                                                       (v1[0], v1[1], v1[2])))
+                        else:
+                            obj_edge_topo = []
+                            with perf_time("bec: select scan"):
+                                for edge in bm.edges:
+                                    if edge.select:
+                                        v0i = edge.verts[0].index
+                                        v1i = edge.verts[1].index
+                                        obj_edge_topo.append((v0i, v1i))
+                                        v0 = wcos[v0i]
+                                        v1 = wcos[v1i]
+                                        new_edges.append(((v0[0], v0[1], v0[2]),
+                                                          (v1[0], v1[1], v1[2])))
+                            _bec_edge_topo[obj.name] = obj_edge_topo
                     elif face_mode:
                         nf = len(bm.faces)
                         perf_record("bec: mesh elements iterated", nf)
-                        with perf_time("bec: nor fill"):
-                            nor_flat = np.empty(nf * 3, dtype='f')
-                            ni = 0
-                            for f in bm.faces:
-                                n = f.normal
-                                nor_flat[ni]   = n.x
-                                nor_flat[ni+1] = n.y
-                                nor_flat[ni+2] = n.z
-                                ni += 3
-                        with perf_time("bec: nor transform"):
-                            nors = nor_flat.reshape(-1, 3) @ mx3.T
-                            lens = np.sqrt((nors * nors).sum(axis=1, keepdims=True))
-                            nors /= np.where(lens > 0, lens, 1.0)
-                            nors_py = nors.tolist()
-                        with perf_time("bec: select scan"):
-                            for face in bm.faces:
-                                if face.select:
-                                    nw = nors_py[face.index]
-                                    for edge in face.edges:
-                                        v0 = wcos[edge.verts[0].index]
-                                        v1 = wcos[edge.verts[1].index]
+                        if topo_only:
+                            with perf_time("bec: topo scan"):
+                                for (fi, edge_pairs, tris) in _bec_face_topo.get(obj.name, []):
+                                    face = bm.faces[fi]
+                                    nw_v = (mx3_mm @ face.normal).normalized()
+                                    nw = (nw_v.x, nw_v.y, nw_v.z)
+                                    for (v0i, v1i) in edge_pairs:
+                                        v0 = wcos[v0i]
+                                        v1 = wcos[v1i]
                                         new_edges.append(((v0[0], v0[1], v0[2]),
                                                           (v1[0], v1[1], v1[2])))
-                                    loops = face.loops
-                                    v0w = wcos[loops[0].vert.index]
-                                    for i in range(1, len(loops) - 1):
-                                        v1w = wcos[loops[i].vert.index]
-                                        v2w = wcos[loops[i + 1].vert.index]
+                                    for (v0i, v1i, v2i) in tris:
+                                        v0w = wcos[v0i]
+                                        v1w = wcos[v1i]
+                                        v2w = wcos[v2i]
                                         new_faces.append((
                                             (v0w[0], v0w[1], v0w[2]),
                                             (v1w[0], v1w[1], v1w[2]),
                                             (v2w[0], v2w[1], v2w[2]),
                                             (nw[0],  nw[1],  nw[2]),
                                         ))
+                        else:
+                            obj_face_topo = []
+                            with perf_time("bec: select scan"):
+                                for face in bm.faces:
+                                    if face.select:
+                                        fi = face.index
+                                        nw_v = (mx3_mm @ face.normal).normalized()
+                                        nw = (nw_v.x, nw_v.y, nw_v.z)
+                                        edge_pairs = []
+                                        for edge in face.edges:
+                                            v0i = edge.verts[0].index
+                                            v1i = edge.verts[1].index
+                                            edge_pairs.append((v0i, v1i))
+                                            v0 = wcos[v0i]
+                                            v1 = wcos[v1i]
+                                            new_edges.append(((v0[0], v0[1], v0[2]),
+                                                              (v1[0], v1[1], v1[2])))
+                                        loops = face.loops
+                                        fan_root_i = loops[0].vert.index
+                                        v0w = wcos[fan_root_i]
+                                        tris = []
+                                        for i in range(1, len(loops) - 1):
+                                            v1i = loops[i].vert.index
+                                            v2i = loops[i + 1].vert.index
+                                            tris.append((fan_root_i, v1i, v2i))
+                                            v1w = wcos[v1i]
+                                            v2w = wcos[v2i]
+                                            new_faces.append((
+                                                (v0w[0], v0w[1], v0w[2]),
+                                                (v1w[0], v1w[1], v1w[2]),
+                                                (v2w[0], v2w[1], v2w[2]),
+                                                (nw[0],  nw[1],  nw[2]),
+                                            ))
+                                        obj_face_topo.append((fi, edge_pairs, tris))
+                            _bec_face_topo[obj.name] = obj_face_topo
                 except Exception:
                     continue
         _back_edge_cache = new_edges
         _back_vert_cache = new_verts
         _back_face_cache = new_faces
+        if not topo_only:
+            _bec_topo_valid = True
     except Exception:
         _back_edge_cache = []
         _back_vert_cache = []

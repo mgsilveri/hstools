@@ -38,17 +38,21 @@ from .utils import get_addon_preferences, _uv_debug_log, _diag, perf_record
 # discrete edits (select, extrude, etc.) when the viewport isn't fully active.
 _back_edge_min_interval: float = 0.016    # adapts after first rebuild
 _back_edge_last_rebuild_time: float = 0.0
+_back_edge_last_callback_time: float = 0.0  # time of last _bfv_rebuild_callback fire
 _back_edge_trailing_timer_pending: bool = False
 _back_edge_dirty: bool = False            # bypass throttle on next rebuild
 
 
-def _do_back_edge_rebuild(context) -> None:
+def _do_back_edge_rebuild(context, topo_only: bool = False) -> None:
     """Execute a back-edge cache rebuild and update adaptive interval."""
     global _back_edge_last_rebuild_time, _back_edge_min_interval, _back_edge_dirty
     _back_edge_dirty = False
     t0 = time.monotonic()
-    from .backface_viz import _compute_back_edge_cache
-    _compute_back_edge_cache(context)
+    from .backface_viz import _compute_back_edge_cache, _bec_topo_valid
+    # Fall back to full rebuild if topo cache isn't populated yet.
+    if topo_only and not _bec_topo_valid:
+        topo_only = False
+    _compute_back_edge_cache(context, topo_only=topo_only)
     dur = time.monotonic() - t0
     if _back_edge_last_rebuild_time > 0:
         perf_record("bec: inter-rebuild interval",
@@ -59,19 +63,49 @@ def _do_back_edge_rebuild(context) -> None:
     _back_edge_min_interval = max(0.004, min(0.016, dur * 3))
 
 
+def _has_active_mesh_transform(context) -> bool:
+    """Return True if a live mesh-deforming modal operator is running (G/R/S etc.)."""
+    op = getattr(context, 'active_operator', None)
+    if op is None:
+        return False
+    return getattr(op, 'bl_idname', '').startswith('TRANSFORM_OT_')
+
+
 def maybe_rebuild_back_edge(context) -> None:
     """Inline rebuild check — called from the GPU draw callback each frame.
 
-    If the adaptive throttle interval has elapsed (or a depsgraph dirty flag
-    is set), rebuilds the back-edge cache from the live BMesh right before
-    the frame is drawn, giving zero-lag updates.
+    Three paths:
+      1. _back_edge_dirty set (depsgraph confirmed change) → rebuild immediately.
+      2. Live TRANSFORM_OT_* modal active → throttled per-frame rebuild to track
+         vertex positions in real time (depsgraph fires too slowly during drags).
+      3. No transform, not dirty → mesh unchanged, skip rebuild entirely.
     """
+    global _back_edge_last_callback_time
     now = time.monotonic()
-    elapsed = now - _back_edge_last_rebuild_time
-    if not _back_edge_dirty and elapsed < _back_edge_min_interval:
-        perf_record("bec: throttle skip (s remaining)", _back_edge_min_interval - elapsed)
+    if _back_edge_last_callback_time > 0:
+        perf_record("bec: callback interval", now - _back_edge_last_callback_time, is_interval=True)
+    _back_edge_last_callback_time = now
+
+    # Path 1: depsgraph confirmed a mesh change — rebuild unconditionally.
+    if _back_edge_dirty:
+        perf_record("bec: rebuild reason", 2)  # 2=dirty flag
+        _do_back_edge_rebuild(context)
         return
-    _do_back_edge_rebuild(context)
+
+    # Path 2: live mesh transform (G/R/S etc.) — throttled per-frame rebuild.
+    # Selection is stable during a transform, so reuse the topology cache and
+    # only recompute vertex positions (skips the costly full-mesh select scan).
+    if _has_active_mesh_transform(context):
+        elapsed = now - _back_edge_last_rebuild_time
+        if elapsed < _back_edge_min_interval:
+            perf_record("bec: throttle skip (ms remaining)", (_back_edge_min_interval - elapsed) * 1000)
+            return
+        perf_record("bec: rebuild reason", 1)  # 1=transform active
+        _do_back_edge_rebuild(context, topo_only=True)
+        return
+
+    # Path 3: orbiting/idle — mesh unchanged, no work needed.
+    perf_record("bec: skip (no change)", 1)
 
 
 def _back_edge_trailing_timer():
@@ -84,6 +118,10 @@ def _back_edge_trailing_timer():
     try:
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return None
+        # If the draw callback has fired since this timer was scheduled, it
+        # already rebuilt — skip to avoid a redundant double rebuild.
+        if _back_edge_last_callback_time > _back_edge_last_rebuild_time:
             return None
         _do_back_edge_rebuild(context)
     except Exception:
@@ -1041,7 +1079,13 @@ def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
             # Adaptive throttle for back-edge cache rebuilds.
             _now = time.monotonic()
             _elapsed = _now - _back_edge_last_rebuild_time
-            if _elapsed >= _back_edge_min_interval:
+            # If the draw callback is actively firing, it owns all back-edge
+            # rebuilds every frame — skip both the immediate rebuild and the
+            # trailing timer to avoid redundant work.
+            _draw_callback_active = (_now - _back_edge_last_callback_time) < 0.1
+            if _draw_callback_active:
+                pass  # draw callback will handle it
+            elif _elapsed >= _back_edge_min_interval:
                 _do_back_edge_rebuild(context)
             elif not _back_edge_trailing_timer_pending:
                 # Too soon: schedule one trailing rebuild for the remaining interval.
