@@ -49,6 +49,7 @@ from .utils import _uv_debug_log
 
 _ALL_CLASSES = (
     prefs.ModoSelectionPreferences,
+    prefs.MODOKIT_OT_perf_report,
     preselect.VIEW3D_OT_modo_preselect_highlight,
     preselect.IMAGE_OT_modo_preselect_highlight,
     preselect.IMAGE_OT_modo_preselect_lmb_track,
@@ -152,6 +153,19 @@ def register():
 
     # Defer keymap registration
     keymap._schedule_deferred_keymap_setup()
+
+    # Sync perf timing flag from saved prefs — the update callback only fires
+    # on user interaction, not on addon load, so we must read it explicitly here.
+    def _sync_perf_flag():
+        try:
+            import modokit.utils as _u
+            p = bpy.context.preferences.addons.get('modokit')
+            if p is not None:
+                _u._perf_enabled = bool(p.preferences.debug_perf)
+        except Exception:
+            pass
+        return None
+    bpy.app.timers.register(_sync_perf_flag, first_interval=0.0)
 
     # Start UV tool guardian
     if not state._uv_tool_guardian_running:

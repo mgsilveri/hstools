@@ -10,13 +10,86 @@ UV editor overlay systems:
 """
 
 import math
+import time
 import bpy
 import bmesh
 import gpu
 from gpu_extras.batch import batch_for_shader
 
 from . import state
-from .utils import get_addon_preferences, _uv_debug_log, _diag
+from .utils import get_addon_preferences, _uv_debug_log, _diag, perf_record
+
+# ── Back-edge cache rebuild throttle ─────────────────────────────────────────
+# Rebuilds are driven INLINE from the GPU draw callback (which fires at display
+# fps), so the cache is always current by the time each frame is drawn.
+# GPU draw callbacks fire after the active operator's modal/execute has returned,
+# so the BMesh is always in a consistent state when we read it here.
+#
+# Adaptive interval: 3× measured rebuild time, clamped [4 ms, 16 ms].
+# Hard max is ONE display frame (16ms / 60fps) so a single GPU-sync spike
+# can never lock out rebuilds for more than one frame.
+#
+# _back_edge_dirty: set by the depsgraph handler when a confirmed mesh edit
+# lands (select, extrude, confirm transform).  Causes the NEXT draw-callback
+# rebuild to bypass the throttle entirely, ensuring the final committed
+# position is always captured immediately.
+#
+# The depsgraph path is kept to handle UV cache updates and as a fallback for
+# discrete edits (select, extrude, etc.) when the viewport isn't fully active.
+_back_edge_min_interval: float = 0.016    # adapts after first rebuild
+_back_edge_last_rebuild_time: float = 0.0
+_back_edge_trailing_timer_pending: bool = False
+_back_edge_dirty: bool = False            # bypass throttle on next rebuild
+
+
+def _do_back_edge_rebuild(context) -> None:
+    """Execute a back-edge cache rebuild and update adaptive interval."""
+    global _back_edge_last_rebuild_time, _back_edge_min_interval, _back_edge_dirty
+    _back_edge_dirty = False
+    t0 = time.monotonic()
+    from .backface_viz import _compute_back_edge_cache
+    _compute_back_edge_cache(context)
+    dur = time.monotonic() - t0
+    if _back_edge_last_rebuild_time > 0:
+        perf_record("bec: inter-rebuild interval",
+                    time.monotonic() - _back_edge_last_rebuild_time, is_interval=True)
+    _back_edge_last_rebuild_time = t0
+    # Cap at 16ms (one 60fps frame) — prevents a single GPU-sync spike from
+    # locking out all subsequent rebuilds for up to 50ms.
+    _back_edge_min_interval = max(0.004, min(0.016, dur * 3))
+
+
+def maybe_rebuild_back_edge(context) -> None:
+    """Inline rebuild check — called from the GPU draw callback each frame.
+
+    If the adaptive throttle interval has elapsed (or a depsgraph dirty flag
+    is set), rebuilds the back-edge cache from the live BMesh right before
+    the frame is drawn, giving zero-lag updates.
+    """
+    now = time.monotonic()
+    elapsed = now - _back_edge_last_rebuild_time
+    if not _back_edge_dirty and elapsed < _back_edge_min_interval:
+        perf_record("bec: throttle skip (s remaining)", _back_edge_min_interval - elapsed)
+        return
+    _do_back_edge_rebuild(context)
+
+
+def _back_edge_trailing_timer():
+    """Trailing-edge timer: catches the final position after a transform ends.
+    Fallback for cases where the draw callback doesn't fire (e.g. lost focus).
+    No gen-counter check — always runs if still in EDIT_MESH.
+    """
+    global _back_edge_trailing_timer_pending
+    _back_edge_trailing_timer_pending = False
+    try:
+        context = bpy.context
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return None
+        _do_back_edge_rebuild(context)
+    except Exception:
+        pass
+    return None  # self-terminate
+
 
 # _get_snap_elements is used by uv_snap.py — imported lazily there.
 
@@ -923,14 +996,13 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         if not depsgraph.id_type_updated('MESH'):
             return
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
-        import time as _d_time
-        state._uv_cache_dirty_time = _d_time.monotonic()
+        global _back_edge_dirty
+        _back_edge_dirty = True   # force next draw frame to rebuild regardless of throttle
+        state._uv_cache_dirty_time = time.monotonic()
         state._uv_cache_dirty_gen += 1
         _gen = state._uv_cache_dirty_gen
-
         def _deferred(_captured_gen=_gen):
             return _refresh_uv_caches_timer(_captured_gen)
-
         bpy.app.timers.register(_deferred, first_interval=state._UV_STABLE_DELAY)
         prefs = get_addon_preferences(context)
         if not getattr(prefs, 'enable_uv_boundary_overlay', True):
@@ -944,7 +1016,7 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         _uv_debug_log(f"[UV-DEPSGRAPH] EXCEPTION: {_exc}")
 
 
-def _refresh_uv_caches_timer(scheduled_gen=None):
+def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
     """Recompute UV draw caches — safe Python context only (timer or operator).
 
     *scheduled_gen* is the generation counter value at the time the depsgraph
@@ -953,6 +1025,7 @@ def _refresh_uv_caches_timer(scheduled_gen=None):
     will do the work.  This guarantees bmesh.from_edit_mesh() is never called
     while a modal operator (e.g. Loop Cut & Slide) is still modifying the mesh.
     """
+    global _back_edge_trailing_timer_pending
     try:
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
@@ -964,8 +1037,18 @@ def _refresh_uv_caches_timer(scheduled_gen=None):
             _uv_debug_log(f"[UV-TIMER] stale gen {scheduled_gen} vs {state._uv_cache_dirty_gen}, skipping")
             return None
         _uv_debug_log("[UV-TIMER] _refresh_uv_caches_timer firing")
-        from .backface_viz import _compute_back_edge_cache
-        _compute_back_edge_cache(context)
+        if not skip_back_edge:
+            # Adaptive throttle for back-edge cache rebuilds.
+            _now = time.monotonic()
+            _elapsed = _now - _back_edge_last_rebuild_time
+            if _elapsed >= _back_edge_min_interval:
+                _do_back_edge_rebuild(context)
+            elif not _back_edge_trailing_timer_pending:
+                # Too soon: schedule one trailing rebuild for the remaining interval.
+                _back_edge_trailing_timer_pending = True
+                _remaining = _back_edge_min_interval - _elapsed
+                _uv_debug_log(f"[UV-TIMER] back-edge throttle: trailing in {_remaining:.3f}s")
+                bpy.app.timers.register(_back_edge_trailing_timer, first_interval=_remaining)
         _compute_flipped_face_uv_cache(context)
         _compute_uv_boundary_cache(context)
         prefs = get_addon_preferences(context)

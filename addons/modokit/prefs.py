@@ -210,6 +210,25 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         default=False,
     )
 
+    def _toggle_perf(self, context):
+        from .utils import _perf_enabled, perf_reset
+        import modokit.utils as _u
+        _u._perf_enabled = self.debug_perf
+        if not self.debug_perf:
+            perf_reset()   # discard partial data when turning off
+
+    debug_perf: BoolProperty(
+        name="Performance Timing",
+        description=(
+            "Record per-call timing for the hot paths: back-edge cache rebuild, "
+            "edge/vert/face draw callbacks.  Use 'Print & Reset' to dump a report "
+            "to the system console showing call counts, average, max, and total "
+            "time per label.  Zero overhead when disabled."
+        ),
+        default=False,
+        update=_toggle_perf,
+    )
+
     show_debug: BoolProperty(
         name="Show Debug Options",
         description="Expand the developer / debug section",
@@ -473,5 +492,22 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
             col.prop(self, "debug_selection")
             col.prop(self, "debug_uv_seam")
             col.prop(self, "debug_uv_handle")
-            if self.debug_raycast or self.debug_selection or self.debug_uv_seam or self.debug_uv_handle:
+            col.separator(factor=0.5)
+            col.prop(self, "debug_perf")
+            if self.debug_perf:
+                col.operator("modokit.perf_report", icon='CONSOLE')
+            if self.debug_raycast or self.debug_selection or self.debug_uv_seam or self.debug_uv_handle or self.debug_perf:
                 col.label(text="Open: Window > Toggle System Console", icon='CONSOLE')
+
+
+class MODOKIT_OT_perf_report(bpy.types.Operator):
+    """Print the modokit performance timing report to the system console and reset counters"""
+    bl_idname = "modokit.perf_report"
+    bl_label  = "Print & Reset Perf Report"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        from .utils import perf_report, _PERF_LOG_PATH
+        perf_report()
+        self.report({'INFO'}, f"modokit: perf report written to {_PERF_LOG_PATH}")
+        return {'FINISHED'}

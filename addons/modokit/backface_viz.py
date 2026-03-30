@@ -8,25 +8,32 @@ topology is always visible, and restores the original setting on exit.
 
 import bpy
 import bmesh
+import numpy as np
 import gpu
 from gpu_extras.batch import batch_for_shader
 
 from bpy_extras import view3d_utils
 
 from . import state
-from .utils import _diag, _get_prefs
+from .utils import _diag, _get_prefs, perf_time, perf_record
 
 # ── Module-local state (only accessed within this module) ─────────────────────
 _saved_viewport_settings: dict = {}   # space_id → dict of saved values
 # NOTE: _bfv_previous_mode lives in state.py so uv_overlays.py can read it too.
 _back_edge_draw_handle = None         # handle returned by draw_handler_add (POST_VIEW)
+_bfv_rebuild_handle   = None          # rebuild-only callback, fires before all draw callbacks
 
-# ── Stipple (checkerboard) shader — POST_VIEW, vec3 pos ───────────────────────
+# ── Stipple (checkerboard) shader — POST_VIEW, accepts (pos, normal) ──────────
+# The vertex shader offsets vertices along their world-space normal by a
+# view-distance-proportional amount (uniform uoffset) before projecting.
+# This avoids z-fighting without rebuilding the GPU batch per frame — only
+# the scalar uniform needs updating each draw.
 _stipple_shader_cache = None
 
 _STIPPLE_VERT_SRC = (
     'void main() {\n'
-    '    gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);\n'
+    '    vec3 displaced = pos + normal * uoffset;\n'
+    '    gl_Position = ModelViewProjectionMatrix * vec4(displaced, 1.0);\n'
     '}\n'
 )
 _STIPPLE_FRAG_SRC = (
@@ -46,7 +53,9 @@ def _get_stipple_shader():
             info = gpu.types.GPUShaderCreateInfo()
             info.push_constant('MAT4', 'ModelViewProjectionMatrix')
             info.push_constant('VEC4', 'ucolor')
+            info.push_constant('FLOAT', 'uoffset')
             info.vertex_in(0, 'VEC3', 'pos')
+            info.vertex_in(1, 'VEC3', 'normal')
             info.vertex_source(_STIPPLE_VERT_SRC)
             info.fragment_out(0, 'VEC4', 'fragColor')
             info.fragment_source(_STIPPLE_FRAG_SRC)
@@ -60,18 +69,37 @@ _back_edge_cache: list = []           # world-space edge-coord pairs for GPU dra
 _back_vert_cache: list = []           # world-space positions of selected verts (vert mode)
 _back_face_cache: list = []           # world-space triangle coords for selected faces (face mode)
 
+# ── Cached GPU batches — rebuilt only when the CPU caches change, not per frame ─
+# Keyed by the id() of the shader so they're invalidated if the shader is recreated.
+_gpu_batch_edge: object = None        # GPUBatch for AA edge quads
+_gpu_batch_face: object = None        # GPUBatch for face fill triangles (UNIFORM_COLOR)
+_gpu_batch_face_stipple: object = None  # GPUBatch for face fill triangles (stipple shader)
+_gpu_batch_edge_coords: list = []     # flat coord list cached alongside the edge batch
+
 
 def _compute_back_edge_cache(context):
     """Populate _back_edge_cache and _back_vert_cache from the live BMesh.
 
-    Must only be called from a safe Python execution context (e.g. a
-    depsgraph handler), never from a GPU draw callback.
+    Vertex positions read directly from bm.verts[i].co.  This is safe and
+    accurate when called from the POST_VIEW draw callback: at that point all
+    mouse/keyboard events for the frame have already been processed and the
+    transform operator has committed the current delta to the BMesh, so .co
+    matches exactly what the viewport just drew.
+
+    Reading .co from a *timer* was what caused trailing — timers can fire
+    between mouse events and see a stale intermediate state.  Moving the read
+    to the draw callback fixes the timing without needing the more expensive
+    evaluated-depsgraph path.
     """
     global _back_edge_cache, _back_vert_cache, _back_face_cache
+    global _gpu_batch_edge, _gpu_batch_face, _gpu_batch_face_stipple, _gpu_batch_edge_coords
     _back_edge_cache = []
     _back_vert_cache = []
     _back_face_cache = []
-    _diag("BEC enter")
+    _gpu_batch_edge = None
+    _gpu_batch_face = None
+    _gpu_batch_face_stipple = None
+    _gpu_batch_edge_coords = []
     try:
         if getattr(context, 'mode', None) != 'EDIT_MESH':
             return
@@ -80,53 +108,93 @@ def _compute_back_edge_cache(context):
         new_edges = []
         new_verts = []
         new_faces = []
-        for obj in context.objects_in_mode_unique_data:
-            if obj.type != 'MESH':
-                continue
-            if not obj.data.is_editmode:
-                continue
-            try:
-                _diag("BEC from_edit_mesh " + obj.name)
-                bm = bmesh.from_edit_mesh(obj.data)
-                mx = obj.matrix_world
-                if vert_mode:
-                    for vert in bm.verts:
-                        if vert.select:
-                            vw = mx @ vert.co
-                            new_verts.append((vw.x, vw.y, vw.z))
-                elif edge_mode:
-                    for edge in bm.edges:
-                        if edge.select:
-                            v0 = mx @ edge.verts[0].co
-                            v1 = mx @ edge.verts[1].co
-                            new_edges.append(((v0.x, v0.y, v0.z), (v1.x, v1.y, v1.z)))
-                elif face_mode:
-                    for face in bm.faces:
-                        if face.select:
-                            for edge in face.edges:
-                                v0 = mx @ edge.verts[0].co
-                                v1 = mx @ edge.verts[1].co
-                                new_edges.append(((v0.x, v0.y, v0.z), (v1.x, v1.y, v1.z)))
-                            # Fan-triangulate for fill drawing.
-                            # Store unbiased positions + face normal so the draw
-                            # callback can apply a view-distance-proportional offset
-                            # at draw time (fixed world offsets become negligible in
-                            # the depth buffer at large camera distances).
-                            n_world = (mx.to_3x3() @ face.normal).normalized()
-                            nw = (n_world.x, n_world.y, n_world.z)
-                            loops = face.loops
-                            v0w = mx @ loops[0].vert.co
-                            for i in range(1, len(loops) - 1):
-                                v1w = mx @ loops[i].vert.co
-                                v2w = mx @ loops[i + 1].vert.co
-                                new_faces.append((
-                                    (v0w.x, v0w.y, v0w.z),
-                                    (v1w.x, v1w.y, v1w.z),
-                                    (v2w.x, v2w.y, v2w.z),
-                                    nw,
-                                ))
-            except Exception:
-                continue
+        with perf_time("bec: bmesh traversal"):
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                if not obj.data.is_editmode:
+                    continue
+                try:
+                    mesh = obj.data
+                    mx   = obj.matrix_world
+
+                    with perf_time("bec: from_edit_mesh"):
+                        bm = bmesh.from_edit_mesh(mesh)
+                    nv = len(bm.verts)
+                    perf_record("bec: mesh verts", nv)
+
+                    with perf_time("bec: co_flat fill"):
+                        co_flat = np.empty(nv * 3, dtype='f')
+                        idx = 0
+                        for v in bm.verts:
+                            co = v.co
+                            co_flat[idx]   = co.x
+                            co_flat[idx+1] = co.y
+                            co_flat[idx+2] = co.z
+                            idx += 3
+
+                    with perf_time("bec: numpy transform"):
+                        cos  = co_flat.reshape(-1, 3)
+                        mx3  = np.array(mx.to_3x3(), dtype='f')
+                        t    = np.array(mx.translation, dtype='f')
+                        wcos = (cos @ mx3.T + t).tolist()
+
+                    if vert_mode:
+                        perf_record("bec: mesh elements iterated", nv)
+                        with perf_time("bec: select scan"):
+                            for v in bm.verts:
+                                if v.select:
+                                    w = wcos[v.index]
+                                    new_verts.append((w[0], w[1], w[2]))
+                    elif edge_mode:
+                        ne = len(bm.edges)
+                        perf_record("bec: mesh elements iterated", ne)
+                        with perf_time("bec: select scan"):
+                            for edge in bm.edges:
+                                if edge.select:
+                                    v0 = wcos[edge.verts[0].index]
+                                    v1 = wcos[edge.verts[1].index]
+                                    new_edges.append(((v0[0], v0[1], v0[2]),
+                                                      (v1[0], v1[1], v1[2])))
+                    elif face_mode:
+                        nf = len(bm.faces)
+                        perf_record("bec: mesh elements iterated", nf)
+                        with perf_time("bec: nor fill"):
+                            nor_flat = np.empty(nf * 3, dtype='f')
+                            ni = 0
+                            for f in bm.faces:
+                                n = f.normal
+                                nor_flat[ni]   = n.x
+                                nor_flat[ni+1] = n.y
+                                nor_flat[ni+2] = n.z
+                                ni += 3
+                        with perf_time("bec: nor transform"):
+                            nors = nor_flat.reshape(-1, 3) @ mx3.T
+                            lens = np.sqrt((nors * nors).sum(axis=1, keepdims=True))
+                            nors /= np.where(lens > 0, lens, 1.0)
+                            nors_py = nors.tolist()
+                        with perf_time("bec: select scan"):
+                            for face in bm.faces:
+                                if face.select:
+                                    nw = nors_py[face.index]
+                                    for edge in face.edges:
+                                        v0 = wcos[edge.verts[0].index]
+                                        v1 = wcos[edge.verts[1].index]
+                                        new_edges.append(((v0[0], v0[1], v0[2]),
+                                                          (v1[0], v1[1], v1[2])))
+                                    loops = face.loops
+                                    v0w = wcos[loops[0].vert.index]
+                                    for i in range(1, len(loops) - 1):
+                                        v1w = wcos[loops[i].vert.index]
+                                        v2w = wcos[loops[i + 1].vert.index]
+                                        new_faces.append((
+                                            (v0w[0], v0w[1], v0w[2]),
+                                            (v1w[0], v1w[1], v1w[2]),
+                                            (v2w[0], v2w[1], v2w[2]),
+                                            (nw[0],  nw[1],  nw[2]),
+                                        ))
+                except Exception:
+                    continue
         _back_edge_cache = new_edges
         _back_vert_cache = new_verts
         _back_face_cache = new_faces
@@ -134,18 +202,71 @@ def _compute_back_edge_cache(context):
         _back_edge_cache = []
         _back_vert_cache = []
         _back_face_cache = []
-    _diag("BEC done n=" + str(len(_back_edge_cache)))
+
+    # ── Build GPU batches now, while we're in a safe non-draw context ──────────
+    # This avoids re-uploading geometry to the GPU on every single draw frame.
+    try:
+        with perf_time("bec: batch build"):
+            if _back_edge_cache:
+                from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
+                aa3d = _get_aa_line_3d_shader()
+                if aa3d is not None:
+                    pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, 1.0)
+                    _gpu_batch_edge = batch_for_shader(
+                        aa3d, 'TRIS',
+                        {'pos0': pos0_l, 'pos1': pos1_l, 'which': which_l, 'side': side_l},
+                    )
+                else:
+                    coords = []
+                    for (p0, p1) in _back_edge_cache:
+                        coords.append(p0)
+                        coords.append(p1)
+                    _gpu_batch_edge_coords = coords
+                    fallback = gpu.shader.from_builtin('UNIFORM_COLOR')
+                    _gpu_batch_edge = batch_for_shader(fallback, 'LINES', {'pos': coords})
+            if _back_face_cache:
+                # Build the face batch with per-vertex normals.  The vertex
+                # shader applies the view-distance offset (uoffset uniform) on
+                # the GPU, so this batch is valid for all camera distances and
+                # only needs rebuilding when the mesh changes — not every frame.
+                stipple = _get_stipple_shader()
+                if stipple is not None:
+                    pos_l = []
+                    nor_l = []
+                    for (p0, p1, p2, nw) in _back_face_cache:
+                        pos_l += [p0, p1, p2]
+                        nor_l += [nw, nw, nw]
+                    _gpu_batch_face = batch_for_shader(
+                        stipple, 'TRIS', {'pos': pos_l, 'normal': nor_l}
+                    )
+    except Exception:
+        pass
+
+
+def _bfv_rebuild_callback() -> None:
+    """POST_VIEW callback registered FIRST — rebuilds caches before any drawing.
+
+    All three draw callbacks (face, vert, edge) fire after this one in the same
+    frame, so they always draw from a fresh cache.  Registering the rebuild
+    here (rather than inside the edge callback) fixes the face/vert "one frame
+    behind" bug caused by the face callback firing before the edge callback.
+    """
+    with perf_time("bfv: rebuild_callback"):
+        try:
+            context = bpy.context
+            if getattr(context, 'mode', None) == 'EDIT_MESH':
+                from .uv_overlays import maybe_rebuild_back_edge
+                maybe_rebuild_back_edge(context)
+        except Exception:
+            pass
 
 
 def _back_edge_draw_callback() -> None:
-    """GPU draw callback — draws only SELECTED edges without depth testing.
-
-    Unselected back geometry is not drawn (invisible, like default Blender).
-    """
-    try:
-        _back_edge_draw_callback_inner()
-    except Exception:
-        pass
+    with perf_time("draw: back_edge"):
+        try:
+            _back_edge_draw_callback_inner()
+        except Exception:
+            pass
 
 
 def _back_edge_draw_callback_inner() -> None:
@@ -156,7 +277,6 @@ def _back_edge_draw_callback_inner() -> None:
     the early-exit mode check to avoid EXCEPTION_ACCESS_VIOLATION when
     Blender mutates the scene at the same time as the draw fires.
     """
-    _diag("DRAW back_edge enter")
     if state._bfv_previous_mode != 'EDIT_MESH':
         return
     if not _back_edge_cache:
@@ -179,60 +299,50 @@ def _back_edge_draw_callback_inner() -> None:
         return
 
     try:
-        theme_3d = context.preferences.themes[0].view_3d
-        ts        = context.tool_settings
-        sm        = ts.mesh_select_mode
-        if sm[0]:    sc = theme_3d.vertex_select   # vert mode: edges on selected verts
-        elif sm[1]:  sc = theme_3d.edge_select      # edge mode: selected edges
-        else:        sc = theme_3d.face_select       # face mode: edges of selected faces
-        color = (sc.r, sc.g, sc.b, alpha)
+        with perf_time("draw: back_edge / rna color"):
+            theme_3d = context.preferences.themes[0].view_3d
+            ts        = context.tool_settings
+            sm        = ts.mesh_select_mode
+            if sm[0]:    sc = theme_3d.vertex_select
+            elif sm[1]:  sc = theme_3d.edge_select
+            else:        sc = theme_3d.face_select
+            color = (sc.r, sc.g, sc.b, alpha)
     except Exception:
         color = (1.0, 0.6, 0.0, alpha)
-    coords = []
-    for (p0, p1) in _back_edge_cache:
-        coords.append(p0)
-        coords.append(p1)
-    if not coords:
+
+    if _gpu_batch_edge is None:
         return
 
-    _diag("DRAW back_edge GPU start n=" + str(len(coords)))
     try:
         vert_mode = sm[0]
         viewport = (float(region.width), float(region.height)) if region else (1920.0, 1080.0)
 
-        from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
+        from .uv_overlays import _get_aa_line_3d_shader
         aa3d = _get_aa_line_3d_shader()
-        hw = 1.0
+        _fallback_shader = None if aa3d is not None else gpu.shader.from_builtin('UNIFORM_COLOR')
+        _active_shader = aa3d if aa3d is not None else _fallback_shader
 
-        def _draw_aa3d(color_arg, depth_test):
+        def _draw_cached(color_arg, depth_test):
+            gpu.state.depth_test_set(depth_test)
             if aa3d is not None:
-                pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, hw)
-                batch = batch_for_shader(aa3d, 'TRIS',
-                                         {'pos0': pos0_l, 'pos1': pos1_l,
-                                          'which': which_l, 'side': side_l})
-                gpu.state.depth_test_set(depth_test)
                 aa3d.bind()
                 aa3d.uniform_float('ucolor', color_arg)
-                aa3d.uniform_float('uhalf_w', hw)
+                aa3d.uniform_float('uhalf_w', 1.0)
                 aa3d.uniform_float('uviewport', viewport)
-                batch.draw(aa3d)
             else:
-                shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-                batch  = batch_for_shader(shader, 'LINES', {"pos": coords})
-                gpu.state.depth_test_set(depth_test)
-                shader.bind()
-                shader.uniform_float("color", color_arg)
-                batch.draw(shader)
+                _fallback_shader.bind()
+                _fallback_shader.uniform_float('color', color_arg)
+            with perf_time("draw: back_edge / gpu draw"):
+                _gpu_batch_edge.draw(_active_shader)
 
         gpu.state.blend_set('ALPHA')
         if vert_mode:
-            _draw_aa3d(color, 'LESS_EQUAL')
+            _draw_cached(color, 'LESS_EQUAL')
         else:
             lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
             t = 0.65
             ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
-            _draw_aa3d((ghost[0], ghost[1], ghost[2], 0.5), 'GREATER')
-        _diag("DRAW back_edge GPU done")
+            _draw_cached((ghost[0], ghost[1], ghost[2], 0.5), 'GREATER')
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.blend_set('NONE')
     except Exception:
@@ -242,10 +352,11 @@ def _back_edge_draw_callback_inner() -> None:
 def _back_vert_draw_callback() -> None:
     """GPU POST_VIEW callback — draws selected vertex billboards with proper depth
     testing (full opacity when visible, 50% when occluded)."""
-    try:
-        _back_vert_draw_callback_inner()
-    except Exception:
-        pass
+    with perf_time("draw: back_vert"):
+        try:
+            _back_vert_draw_callback_inner()
+        except Exception:
+            pass
 
 
 def _back_vert_draw_callback_inner() -> None:
@@ -284,16 +395,16 @@ def _back_vert_draw_callback_inner() -> None:
 
     from mathutils import Vector as _Vec
 
-    # Camera right/up vectors in world space (from view matrix rows)
+    # Camera right/up vectors in world space (from view matrix rows).
+    # Vertex billboards are view-dependent so their geometry must be rebuilt
+    # every frame — but the batch_for_shader upload cost is unavoidable here.
+    # Vert selections are typically small so the impact is minor.
     vm    = rv3d.view_matrix
     right = _Vec((vm[0][0], vm[0][1], vm[0][2])).normalized()
     up    = _Vec((vm[1][0], vm[1][1], vm[1][2])).normalized()
     cam_pos = vm.inverted_safe().translation.copy()
 
-    # Scale factor: maps pixel radius to world size at a given depth
-    # POST_VIEW uses perspective_matrix for projection, so:
-    # world_size = px * 2 / (window_matrix[1][1] * region.height) * depth
-    win_y  = abs(rv3d.window_matrix[1][1])
+    win_y    = abs(rv3d.window_matrix[1][1])
     px_scale = (2.0 / (win_y * region.height)) if (win_y > 0 and region.height > 0) else 0.001
     PIXEL_RADIUS = 4.0
 
@@ -302,7 +413,6 @@ def _back_vert_draw_callback_inner() -> None:
         p    = _Vec((wx, wy, wz))
         dist = (p - cam_pos).length if rv3d.is_perspective else 1.0
         s    = PIXEL_RADIUS * px_scale * dist
-        # Build camera-facing (billboard) quad as 2 triangles
         c0 = tuple(p + (-right - up) * s)
         c1 = tuple(p + ( right - up) * s)
         c2 = tuple(p + ( right + up) * s)
@@ -317,11 +427,9 @@ def _back_vert_draw_callback_inner() -> None:
         batch  = batch_for_shader(shader, 'TRIS', {'pos': tris})
         gpu.state.blend_set('ALPHA')
         shader.bind()
-        # Pass 1: fully opaque where not occluded
         gpu.state.depth_test_set('LESS_EQUAL')
         shader.uniform_float('color', (color[0], color[1], color[2], 1.0))
         batch.draw(shader)
-        # Pass 2: ghostly (desaturated + dimmed) where occluded
         lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
         t = 0.65
         ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
@@ -337,16 +445,17 @@ def _back_vert_draw_callback_inner() -> None:
 def _back_face_draw_callback() -> None:
     """GPU POST_VIEW callback — draws selected face fills with proper depth:
     fully opaque when visible, 50% alpha when occluded."""
-    try:
-        _back_face_draw_callback_inner()
-    except Exception:
-        pass
+    with perf_time("draw: back_face"):
+        try:
+            _back_face_draw_callback_inner()
+        except Exception:
+            pass
 
 
 def _back_face_draw_callback_inner() -> None:
     if state._bfv_previous_mode != 'EDIT_MESH':
         return
-    if not _back_face_cache:
+    if _gpu_batch_face is None:
         return
     try:
         context = bpy.context
@@ -373,52 +482,39 @@ def _back_face_draw_callback_inner() -> None:
     except Exception:
         color = (1.0, 0.6, 0.0, alpha)
 
-    # Apply a view-distance-proportional normal offset so the fill geometry
-    # sits reliably in front of the mesh surface in the depth buffer at any
-    # camera distance.  A fixed world-space nudge becomes negligible in NDC
-    # precision when the camera is far away, causing GREATER to spuriously
-    # pass on frontface pixels (z-fighting). Scaling with view_distance keeps
-    # the separation proportional to the depth-buffer granularity at that range.
+    lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
+    t = 0.65
+    ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
+
     rv3d = getattr(context, 'region_data', None)
     view_dist = rv3d.view_distance if rv3d is not None else 10.0
     offset_scale = max(0.001, view_dist * 0.0005)
 
-    tris = []
-    for entry in _back_face_cache:
-        p0, p1, p2, n = entry
-        nx, ny, nz = n[0] * offset_scale, n[1] * offset_scale, n[2] * offset_scale
-        tris += [
-            (p0[0] + nx, p0[1] + ny, p0[2] + nz),
-            (p1[0] + nx, p1[1] + ny, p1[2] + nz),
-            (p2[0] + nx, p2[1] + ny, p2[2] + nz),
-        ]
-
-    if not tris:
-        return
-
     try:
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-        batch  = batch_for_shader(shader, 'TRIS', {'pos': tris})
         gpu.state.blend_set('ALPHA')
-        shader.bind()
-        # Only draw where occluded — stipple (checkerboard discard) gives ~50%
-        # pixel coverage at full per-pixel alpha, avoiding the washed-out look
-        # of a uniform semi-transparent fill.
-        lum = color[0] * 0.299 + color[1] * 0.587 + color[2] * 0.114
-        t = 0.65
-        ghost = (color[0]*(1-t)+lum*t, color[1]*(1-t)+lum*t, color[2]*(1-t)+lum*t)
+        gpu.state.depth_test_set('GREATER')
         stipple = _get_stipple_shader()
         if stipple is not None:
-            s_batch = batch_for_shader(stipple, 'TRIS', {'pos': tris})
-            stipple.bind()
-            gpu.state.depth_test_set('GREATER')
-            stipple.uniform_float('ucolor', (ghost[0], ghost[1], ghost[2], 0.5))
-            s_batch.draw(stipple)
+            with perf_time("draw: back_face / gpu draw"):
+                stipple.bind()
+                stipple.uniform_float('uoffset', offset_scale)
+                stipple.uniform_float('ucolor', (ghost[0], ghost[1], ghost[2], 0.5))
+                _gpu_batch_face.draw(stipple)
         else:
-            # Fallback: plain GREATER pass
-            gpu.state.depth_test_set('GREATER')
-            shader.uniform_float('color', (ghost[0], ghost[1], ghost[2], 0.15))
-            batch.draw(shader)
+            # Stipple shader unavailable — fall back to a per-frame CPU tris build
+            # with UNIFORM_COLOR.  This path should be rare.
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            tris = []
+            for (p0, p1, p2, n) in _back_face_cache:
+                nx = n[0] * offset_scale; ny = n[1] * offset_scale; nz = n[2] * offset_scale
+                tris += [(p0[0]+nx, p0[1]+ny, p0[2]+nz),
+                         (p1[0]+nx, p1[1]+ny, p1[2]+nz),
+                         (p2[0]+nx, p2[1]+ny, p2[2]+nz)]
+            if tris:
+                batch = batch_for_shader(shader, 'TRIS', {'pos': tris})
+                shader.bind()
+                shader.uniform_float('color', (ghost[0], ghost[1], ghost[2], 0.15))
+                batch.draw(shader)
         gpu.state.depth_test_set('LESS_EQUAL')
         gpu.state.blend_set('NONE')
     except Exception:
@@ -459,11 +555,15 @@ def _iter_view3d_spaces(context):
 
 
 def _apply_bfv_to_all(context) -> None:
-    global _back_edge_draw_handle, _back_vert_draw_handle, _back_face_draw_handle
+    global _back_edge_draw_handle, _back_vert_draw_handle, _back_face_draw_handle, _bfv_rebuild_handle
     for space in _iter_view3d_spaces(context):
         _save_and_apply_bfv(space)
-    # Register face fill FIRST so it draws before edges — this ensures edges
-    # always composite on top of the stipple face pattern with no fighting.
+    # FIRST: register the rebuild callback so the cache is fresh before any draw.
+    if _bfv_rebuild_handle is None:
+        _bfv_rebuild_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _bfv_rebuild_callback, (), 'WINDOW', 'POST_VIEW'
+        )
+    # Then face, vert, edge — all draw from the already-refreshed cache.
     if _back_face_draw_handle is None:
         _back_face_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             _back_face_draw_callback, (), 'WINDOW', 'POST_VIEW'
@@ -479,9 +579,12 @@ def _apply_bfv_to_all(context) -> None:
 
 
 def _restore_bfv_from_all(context) -> None:
-    global _back_edge_draw_handle, _back_vert_draw_handle, _back_face_draw_handle
+    global _back_edge_draw_handle, _back_vert_draw_handle, _back_face_draw_handle, _bfv_rebuild_handle
     for space in _iter_view3d_spaces(context):
         _restore_bfv(space)
+    if _bfv_rebuild_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_bfv_rebuild_handle, 'WINDOW')
+        _bfv_rebuild_handle = None
     if _back_edge_draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_back_edge_draw_handle, 'WINDOW')
         _back_edge_draw_handle = None
