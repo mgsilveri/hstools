@@ -11,8 +11,10 @@ bl_info = {
 import bpy
 import bmesh
 import gpu
+import math
 import mathutils
-import time  # For debug timing
+import time
+from collections import deque
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
 from bpy_extras.view3d_utils import region_2d_to_location_3d, region_2d_to_vector_3d, location_3d_to_region_2d
@@ -44,27 +46,22 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
     snap_edge_center: bpy.props.BoolProperty(name="Snap Edge Center", default=False)
     
     def modal(self, context, event):
-        t_modal_start = time.perf_counter()
-        
         # Safety check: ensure we're still in edit mode with valid object
         if not context.edit_object or context.mode != 'EDIT_MESH':
             self.cleanup(context)
             return {'CANCELLED'}
         
-        # Track if we need redraw (only redraw when something visual changes)
-        needs_redraw = False
-        
         # Update header text
         edge_int = "ON" if self.snap_edge_intersection else "OFF"
         edge_center = "ON" if self.snap_edge_center else "OFF"
+        effective_snap = context.scene.tool_settings.use_snap != event.ctrl  # XOR
+        snap_status = "ON" if effective_snap else "OFF"
         if self.stage == 0:
             header = f"SLICE: Click 1st point | Edge Intersection:{edge_int} (X) | Edge Center:{edge_center} (C)"
         elif self.stage == 1:
-            snap_status = "ON" if context.scene.tool_settings.use_snap else "OFF"
             header = f"SLICE: Click 2nd point | [{self.axis}] Z to change axis | Snap:{snap_status} (Ctrl) | Edge Intersection:{edge_int} (X) | Edge Center:{edge_center} (C)"
         else:
             inf = "ON" if self.infinite else "OFF"
-            snap_status = "ON" if context.scene.tool_settings.use_snap else "OFF"
             header = f"SLICE: [{self.axis}] Z to change axis | Infinite:{inf} (I) | Snap:{snap_status} (Ctrl) | Edge Intersection:{edge_int} (X) | Edge Center:{edge_center} (C) | SPACE=Cut | ESC=Cancel"
         context.area.header_text_set(header)
         
@@ -111,19 +108,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         # Left mouse for slice points (allow Ctrl for snapping, but block Alt and Shift)
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS' and not event.alt and not event.shift:
             if self.stage == 0:
-                # Diagnostic: Check for hidden geometry
-                obj = context.edit_object
-                if obj:
-                    bm = bmesh.from_edit_mesh(obj.data)
-                    hidden_verts = sum(1 for v in bm.verts if hasattr(v, 'hide') and v.hide)
-                    hidden_edges = sum(1 for e in bm.edges if hasattr(e, 'hide') and e.hide)
-                    hidden_faces = sum(1 for f in bm.faces if hasattr(f, 'hide') and f.hide)
-                    print(f"DEBUG: Hidden geometry - verts:{hidden_verts}, edges:{hidden_edges}, faces:{hidden_faces}")
-                    
-                    # Check if any faces are hidden
-                    if hidden_faces > 0:
-                        print(f"DEBUG: WARNING - {hidden_faces} hidden faces detected!")
-                    
                 self.stage = 1
                 # Reset start point intersection flag when confirmed (keep visual as sphere)
                 self._start_snapped_to_intersection = False
@@ -247,14 +231,9 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         # Mouse move for positioning (allow Ctrl for snapping, but block Alt and Shift)
         if event.type == 'MOUSEMOVE' and not event.alt and not event.shift:
             if self.stage == 0 or self.stage == 1:
-                t0 = time.perf_counter()
-                
                 # Check if snapping should be enabled BEFORE restoring mesh
                 scene_snap = context.scene.tool_settings.use_snap
-                ctrl_pressed = event.ctrl
-                should_snap = scene_snap != ctrl_pressed  # XOR logic
-                
-                t_restore = 0
+                should_snap = scene_snap != event.ctrl  # XOR logic
                 
                 # Check throttle FIRST to avoid expensive restore when we won't update preview anyway
                 now = time.perf_counter()
@@ -263,16 +242,10 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 
                 # Only restore original mesh if we're going to snap AND preview will update
                 if self.stage == 1 and should_snap and hasattr(self, 'original_mesh_data') and time_passed:
-                    # Temporarily restore original mesh for accurate snapping
-                    t_r0 = time.perf_counter()
                     self.restore_original_mesh(context)
-                    t_restore = (time.perf_counter() - t_r0) * 1000
 
-                t1 = time.perf_counter()
                 pos = self.get_3d_pos(context, event)
-                t2 = time.perf_counter()
 
-                t_preview = 0
                 if self.stage == 0:
                     self.start_pos = pos
                     self.end_pos = pos
@@ -283,24 +256,15 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                     self.end_pos = pos
                     # Track intersection snap state for end point
                     self._end_snapped_to_intersection = getattr(self, '_current_snap_is_intersection', False)
-                    # Use time_passed computed earlier for throttle
                     last_preview_pos = getattr(self, '_last_preview_pos', None)
                     
                     # Update preview if: 200ms passed AND position changed by at least 0.05 units
                     pos_changed = last_preview_pos is None or (pos - last_preview_pos).length > 0.05
                     
                     if pos_changed and time_passed:
-                        t_p0 = time.perf_counter()
                         self.update_preview(context)
-                        t_preview = (time.perf_counter() - t_p0) * 1000
                         self._last_preview_time = now
                         self._last_preview_pos = pos.copy()
-
-                t3 = time.perf_counter()
-                total_ms = (t3 - t0) * 1000
-                get3d_ms = (t2 - t1) * 1000
-                if total_ms > 5:  # Only log if > 5ms
-                    print(f"DEBUG MODAL: total={total_ms:.1f}ms, restore={t_restore:.1f}ms, get3d={get3d_ms:.1f}ms, preview={t_preview:.1f}ms, stage={self.stage}, snap={should_snap}")
                 
                 context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
@@ -340,13 +304,8 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         should_snap = scene_snap != ctrl_pressed  # XOR logic
         
         if should_snap:
-            t_total = time.perf_counter()
-            
-            t0 = time.perf_counter()
             snap_pos = self.try_snap_to_vertex(context, coord)
-            t1 = time.perf_counter()
             if snap_pos:
-                print(f"DEBUG SNAP: vertex took {(t1-t0)*1000:.1f}ms, TOTAL {(t1-t_total)*1000:.1f}ms")
                 self._current_snap_is_intersection = True  # Draw as crosshair
                 return snap_pos
             
@@ -354,23 +313,15 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
             if self.snap_edge_center:
                 snap_pos = self.try_snap_to_edge_center(context, coord)
                 if snap_pos:
-                    t_edge_center = time.perf_counter()
-                    print(f"DEBUG SNAP: edge_center took {(t_edge_center-t1)*1000:.1f}ms, TOTAL {(t_edge_center-t_total)*1000:.1f}ms")
                     self._current_snap_is_intersection = True  # Draw as crosshair like intersections
                     return snap_pos
             
-            t2 = time.perf_counter()
-            t3 = t2  # Default if skipped
             # Edge-polygon intersection (only if enabled - can be slow)
             if self.snap_edge_intersection:
                 snap_pos = self.try_snap_to_edge_closest_point(context, coord, ray_origin, view_vec)
-                t3 = time.perf_counter()
                 if snap_pos:
-                    print(f"DEBUG SNAP: vertex={(t1-t0)*1000:.1f}ms, edge_isect={(t3-t2)*1000:.1f}ms, TOTAL {(t3-t_total)*1000:.1f}ms")
                     self._current_snap_is_intersection = True  # Mark as intersection snap
                     return snap_pos
-            
-            print(f"DEBUG SNAP (no hit): vertex={(t1-t0)*1000:.1f}ms, edge_isect={(t3-t2)*1000:.1f}ms, TOTAL {(t3-t_total)*1000:.1f}ms")
         
         # No snap - reset flag
         self._current_snap_is_intersection = False
@@ -491,21 +442,9 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
             cached_edge_center = self._snap_cache.get('edge_center', False)
             if dist < 150 and cached_edge_int == self.snap_edge_intersection and cached_edge_center == self.snap_edge_center:
                 return self._snap_cache
-            if dist >= 150:
-                print(f"DEBUG CACHE: Rebuilding cache, cursor moved {dist:.0f}px")
-            else:
-                print(f"DEBUG CACHE: Rebuilding cache, edge settings changed")
-        else:
-            print("DEBUG CACHE: Building initial cache")
         
         # Build new cache
-        t0 = time.perf_counter()
         self._snap_cache = self._build_snap_cache(context, coord)
-        t1 = time.perf_counter()
-        v_count = len(self._snap_cache.get('vertices', []))
-        e_count = len(self._snap_cache.get('edges', []))
-        f_count = len(self._snap_cache.get('faces', []))
-        print(f"DEBUG CACHE: Built in {(t1-t0)*1000:.1f}ms - {v_count} verts, {e_count} edges, {f_count} faces")
         return self._snap_cache
 
     def try_snap_to_edge_center(self, context, coord):
@@ -864,61 +803,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         return (dot0 >= epsilon and dot1 >= epsilon and dot2 >= epsilon) or \
                (dot0 <= -epsilon and dot1 <= -epsilon and dot2 <= -epsilon)
     
-    def try_snap_to_edge(self, context, coord, ray_origin, view_vec):
-        """Snap to nearest point on edges using cached geometry."""
-        # Safety check
-        if not context.edit_object:
-            return None
-
-        region = context.region
-        rv3d = context.region_data
-
-        snap_distance = 20
-        best_candidate = None
-        closest_dist = snap_distance
-        
-        cursor_vec = Vector((coord[0], coord[1]))
-        ray_end = ray_origin + view_vec * 1000
-
-        # Use cached geometry
-        cache = self._get_snap_cache(context, coord)
-        if not cache or not cache['edges']:
-            return None
-
-        # Check edge intersections using cached edges
-        for v1_world, v2_world, edge_obj, edge_idx, edge_vert_indices in cache['edges']:
-            # Only snap to edit object's edges for this function
-            if edge_obj != context.edit_object:
-                continue
-
-            # Ray-line intersection
-            point = mathutils.geometry.intersect_line_line(
-                ray_origin, ray_end,
-                v1_world, v2_world
-            )
-
-            if point:
-                edge_point = point[1]
-                # Check if point is on edge segment
-                edge_vec = v2_world - v1_world
-                edge_len_sq = edge_vec.length_squared
-                if edge_len_sq > 0.0001:
-                    t = (edge_point - v1_world).dot(edge_vec) / edge_len_sq
-                    if 0 <= t <= 1:
-                        screen_co = location_3d_to_region_2d(region, rv3d, edge_point)
-                        if screen_co:
-                            dist = (cursor_vec - Vector(screen_co)).length
-                            if dist < closest_dist:
-                                closest_dist = dist
-                                best_candidate = edge_point
-
-        # Only do expensive occlusion check on the single best candidate
-        if best_candidate is not None:
-            if not self.is_point_occluded(context, best_candidate):
-                return best_candidate
-
-        return None
-    
     def has_face_selection(self, context):
         """Check if any faces are selected"""
         if not context.edit_object or context.mode != 'EDIT_MESH':
@@ -1092,22 +976,39 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         self.end_pos = cursor.copy()
         self.stage = 0
         self.tweaking = None
-        self._snap_cache = None  # Unified snap cache
-        self._cached_depsgraph = None  # Cache for occlusion ray casting
-        self._start_snapped_to_intersection = False  # Track if start point is snapped to intersection
-        self._end_snapped_to_intersection = False  # Track if end point is snapped to intersection
-        self._rv3d = context.region_data  # Store region_3d for draw callback
+        self._snap_cache = None
+        self._cached_depsgraph = None
+        self._start_snapped_to_intersection = False
+        self._end_snapped_to_intersection = False
+        self._rv3d = context.region_data
 
-        args = (self, context)
+        # Pre-compute unit sphere triangle offsets (used by draw_point_sphere every frame)
+        segments, rings = 24, 12
+        unit_verts = []
+        for ring in range(rings + 1):
+            theta = (ring / rings) * math.pi
+            sin_t, cos_t = math.sin(theta), math.cos(theta)
+            for seg in range(segments):
+                phi = (seg / segments) * 2 * math.pi
+                unit_verts.append((sin_t * math.cos(phi), sin_t * math.sin(phi), cos_t))
+        indices = []
+        for ring in range(rings):
+            for seg in range(segments):
+                cur = ring * segments + seg
+                nxt = ring * segments + ((seg + 1) % segments)
+                cur_r = (ring + 1) * segments + seg
+                nxt_r = (ring + 1) * segments + ((seg + 1) % segments)
+                indices.append((cur, cur_r, nxt))
+                indices.append((nxt, cur_r, nxt_r))
+        self._sphere_tri_offsets = [unit_verts[i] for tri in indices for i in tri]
+
         self.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
-            self.draw_callback_3d, args, 'WINDOW', 'POST_VIEW')
+            self.draw_callback_3d, (context,), 'WINDOW', 'POST_VIEW')
 
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
     
-    def draw_callback_3d(self, context, *args):
-        t_draw_start = time.perf_counter()
-        
+    def draw_callback_3d(self, context):
         if not hasattr(self, 'start_pos') or not hasattr(self, 'end_pos'):
             return
         
@@ -1222,58 +1123,15 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         batch.draw(shader)
         
         gpu.state.blend_set('NONE')
-        
-        t_draw_end = time.perf_counter()
-        draw_ms = (t_draw_end - t_draw_start) * 1000
-        if draw_ms > 5:  # Only log if > 5ms
-            print(f"DEBUG DRAW: {draw_ms:.1f}ms")
 
     def draw_point_sphere(self, shader, center, radius, color):
-        """Draw a point as a UV sphere that works with both OpenGL and Vulkan"""
-        import math
-        
-        segments = 24  # Horizontal segments
-        rings = 12     # Vertical rings
-        
-        # Generate sphere vertices
-        vertices = []
-        for ring in range(rings + 1):
-            theta = (ring / rings) * math.pi  # 0 to pi
-            sin_theta = math.sin(theta)
-            cos_theta = math.cos(theta)
-            
-            for seg in range(segments):
-                phi = (seg / segments) * 2 * math.pi  # 0 to 2pi
-                sin_phi = math.sin(phi)
-                cos_phi = math.cos(phi)
-                
-                x = center.x + radius * sin_theta * cos_phi
-                y = center.y + radius * sin_theta * sin_phi
-                z = center.z + radius * cos_theta
-                
-                vertices.append((x, y, z))
-        
-        # Generate triangle indices
-        indices = []
-        for ring in range(rings):
-            for seg in range(segments):
-                # Current quad indices
-                current = ring * segments + seg
-                next_seg = ring * segments + ((seg + 1) % segments)
-                next_ring = (ring + 1) * segments + seg
-                next_both = (ring + 1) * segments + ((seg + 1) % segments)
-                
-                # Two triangles per quad
-                indices.append((current, next_ring, next_seg))
-                indices.append((next_seg, next_ring, next_both))
-        
-        # Build triangle vertices for batch rendering
-        tri_verts = [vertices[i] for tri in indices for i in tri]
-        
-        # Disable depth test to ensure proper drawing order
+        """Draw a point as a UV sphere using pre-computed unit offsets."""
+        tri_verts = [
+            (center.x + dx * radius, center.y + dy * radius, center.z + dz * radius)
+            for dx, dy, dz in self._sphere_tri_offsets
+        ]
         gpu.state.depth_test_set('NONE')
         gpu.state.depth_mask_set(False)
-        
         batch = batch_for_shader(shader, 'TRIS', {"pos": tri_verts})
         shader.uniform_float("color", color)
         batch.draw(shader)
@@ -1379,8 +1237,8 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         
         mx_inv = obj.matrix_world.inverted()
         plane_co_local = mx_inv @ plane_co
-        plane_no_local = mx_inv.to_3x3() @ plane_no
-        
+        plane_no_local = (mx_inv.to_3x3() @ plane_no).normalized()
+
         # Get geometry
         if self.use_selection:
             geom = [v for v in bm.verts if v.select and not v.hide] + \
@@ -1392,9 +1250,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                    [f for f in bm.faces if not f.hide]
         
         if geom:
-            # Ensure UV layer access
-            uv_layer = bm.loops.layers.uv.active
-            
             # In selection mode, store which faces were originally selected
             if self.use_selection:
                 original_selected_faces = {f for f in bm.faces if f.select and not f.hide}
@@ -1578,8 +1433,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         bmesh.update_edit_mesh(obj.data)
     
     def execute_slice(self, context):
-        t_start = time.perf_counter()
-        
         # Safety check
         if not context.edit_object or context.mode != 'EDIT_MESH':
             self.report({'WARNING'}, "Must be in Edit Mode with valid object")
@@ -1613,15 +1466,12 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
             if vert_crease_layer is None:
                 vert_crease_layer = bm.verts.layers.float.new("crease_vert")
 
-        t_setup = time.perf_counter()
-        print(f"DEBUG SLICE: Setup took {(t_setup-t_start)*1000:.1f}ms")
-
         plane_co = (self.start_pos + self.end_pos) / 2
         plane_no = self.get_plane_normal(context)
 
         mx_inv = obj.matrix_world.inverted()
         plane_co_local = mx_inv @ plane_co
-        plane_no_local = mx_inv.to_3x3() @ plane_no
+        plane_no_local = (mx_inv.to_3x3() @ plane_no).normalized()
 
         # Get geometry to cut - always exclude hidden geometry
         if self.use_selection:
@@ -1636,9 +1486,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         if not geom:
             self.report({'WARNING'}, "No geometry to cut")
             return
-
-        t_geom = time.perf_counter()
-        print(f"DEBUG SLICE: Collect geom took {(t_geom-t_setup)*1000:.1f}ms ({len(geom)} elements)")
 
         # Store original attributes BEFORE bisect
         # Use the BMesh element object itself as the key (not index) because indices change after bisect
@@ -1676,9 +1523,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 'material_index': f.material_index
             }
 
-        t_store = time.perf_counter()
-        print(f"DEBUG SLICE: Store attrs took {(t_store-t_geom)*1000:.1f}ms")
-
         result = bmesh.ops.bisect_plane(
             bm, geom=geom,
             plane_co=plane_co_local,
@@ -1690,9 +1534,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         # Get new geometry created by bisect
         new_geom = result.get('geom_cut', []) + result.get('geom', [])
         new_geom_set = set(new_geom)  # Convert to set for O(1) lookups
-
-        t_bisect = time.perf_counter()
-        print(f"DEBUG SLICE: Bisect took {(t_bisect-t_store)*1000:.1f}ms ({len(new_geom)} new elements)")
 
         # Pre-categorize new geometry for faster access
         new_verts_set = set(elem for elem in new_geom if isinstance(elem, bmesh.types.BMVert))
@@ -1828,9 +1669,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
         # Note: bisect_plane can split edges, creating new edges that aren't in new_geom_set
         # but also aren't in orig_edge_data. These split edges should inherit smooth from neighbors.
 
-        t_interp = time.perf_counter()
-        print(f"DEBUG SLICE: Interpolate attrs took {(t_interp-t_bisect)*1000:.1f}ms")
-
         for v in bm.verts:
             if v not in new_geom_set and v in orig_vert_data:
                 vdata = orig_vert_data[v]
@@ -1886,9 +1724,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 f.smooth = fdata['smooth']
                 f.material_index = fdata['material_index']
 
-        t_restore = time.perf_counter()
-        print(f"DEBUG SLICE: Restore attrs took {(t_restore-t_interp)*1000:.1f}ms")
-
         # Weld vertices that are very close to each other (remove doubles)
         # Only weld within connected geometry islands and exclude hidden geometry
         # This prevents separate objects from being welded together
@@ -1918,12 +1753,12 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 
             # BFS to find all connected vertices in this island
             island = set()
-            queue = [start_vert]
+            queue = deque([start_vert])
             island.add(start_vert)
             visited.add(start_vert)
             
             while queue:
-                v = queue.pop(0)
+                v = queue.popleft()
                 for edge in v.link_edges:
                     if edge.hide:
                         continue
@@ -1941,9 +1776,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
             if len(island_verts) > 1:
                 bmesh.ops.remove_doubles(bm, verts=island_verts, dist=self.weld_threshold)
 
-        t_weld = time.perf_counter()
-        print(f"DEBUG SLICE: Weld (islands) took {(t_weld-t_restore)*1000:.1f}ms ({len(islands)} islands, {len(weld_verts)} verts)")
-
         if not self.infinite:
             line_vec_local = mx_inv.to_3x3() @ (self.end_pos - self.start_pos)
             if line_vec_local.length > 0.001:
@@ -1951,11 +1783,9 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 start_local = mx_inv @ self.start_pos
                 end_local = mx_inv @ self.end_pos
                 
-                # Get visible geometry for cutting
                 visible_geom = [v for v in bm.verts if not v.hide] + \
                                [e for e in bm.edges if not e.hide] + \
                                [f for f in bm.faces if not f.hide]
-                
                 bmesh.ops.bisect_plane(
                     bm, geom=visible_geom,
                     plane_co=start_local,
@@ -1963,7 +1793,10 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                     clear_inner=False,
                     clear_outer=False
                 )
-                
+                # Rebuild after first cut so the second cut sees the new geometry
+                visible_geom = [v for v in bm.verts if not v.hide] + \
+                               [e for e in bm.edges if not e.hide] + \
+                               [f for f in bm.faces if not f.hide]
                 bmesh.ops.bisect_plane(
                     bm, geom=visible_geom,
                     plane_co=end_local,
@@ -1973,23 +1806,25 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
                 )
         
         if self.split:
-            # Get visible geometry for splitting
-            visible_geom = [v for v in bm.verts if not v.hide] + \
-                           [e for e in bm.edges if not e.hide] + \
-                           [f for f in bm.faces if not f.hide]
-            
             if self.gap > 0:
                 offset = plane_no_local * (self.gap / 2)
+                visible_geom = [v for v in bm.verts if not v.hide] + \
+                               [e for e in bm.edges if not e.hide] + \
+                               [f for f in bm.faces if not f.hide]
                 bmesh.ops.bisect_plane(
                     bm, geom=visible_geom,
-                    plane_co=plane_co_local + offset, 
-                    plane_no=plane_no_local, 
+                    plane_co=plane_co_local + offset,
+                    plane_no=plane_no_local,
                     clear_outer=True
                 )
+                # Rebuild after first cut
+                visible_geom = [v for v in bm.verts if not v.hide] + \
+                               [e for e in bm.edges if not e.hide] + \
+                               [f for f in bm.faces if not f.hide]
                 bmesh.ops.bisect_plane(
                     bm, geom=visible_geom,
-                    plane_co=plane_co_local - offset, 
-                    plane_no=plane_no_local, 
+                    plane_co=plane_co_local - offset,
+                    plane_no=plane_no_local,
                     clear_inner=True
                 )
             
@@ -1998,8 +1833,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
             if self.cap_sections:
                 bpy.ops.mesh.select_all(action='SELECT')
                 bpy.ops.mesh.edge_face_add()
-
-        t_normals = time.perf_counter()
 
         # Deselect all geometry after operation
         for v in bm.verts:
@@ -2011,10 +1844,6 @@ class MESH_OT_modo_polygon_slice(bpy.types.Operator):
 
         bmesh.update_edit_mesh(obj.data)
         obj.data.update()
-
-        t_end = time.perf_counter()
-        print(f"DEBUG SLICE: Update mesh took {(t_end-t_normals)*1000:.1f}ms")
-        print(f"DEBUG SLICE: TOTAL {(t_end-t_start)*1000:.1f}ms")
 
         inf_msg = "infinite" if self.infinite else "bounded"
         self.report({'INFO'}, f"Slice complete ({inf_msg}, axis: {self.axis})")
