@@ -44,7 +44,7 @@ from .raycast import _get_cached_bvh, clear_bvh_cache
 _EDGE_PIXEL_THRESHOLD = 7    # px — screen-space radius for edge/vert proximity
 _VERT_PIXEL_THRESHOLD = 12
 _POINT_SIZE           = 8    # px — vertex highlight quad size
-_Z_BIAS               = 5e-4 # fraction of dist to nudge verts toward camera (avoids Z-fighting)
+_Z_BIAS               = 5e-4 # kept for reference; no longer used by _nudge_toward_camera
 
 # Set True to print diagnostics to the Blender System Console (Window → Toggle System Console)
 _PRESELECT_DEBUG = False
@@ -111,20 +111,22 @@ def _get_stipple_shader(mode_2d=False):
 
 
 def _nudge_toward_camera(coords, rv3d, scale=1.0):
-    """Offset world-space coords slightly toward the camera so they win LESS_EQUAL depth test.
-    Uses a fixed minimum offset + proportional term so it works at any distance.
-    scale can be increased for coplanar geometry at steep angles (e.g. object wireframe)."""
+    """Offset world-space coords slightly toward the camera along the VIEW direction.
+
+    Offsetting along the view vector (not toward the camera point) ensures the
+    depth-buffer shift is the same regardless of the angle between the surface
+    and the camera — preventing silhouette bleed where a world-space nudge can
+    push a vertex past the surface boundary and become visible behind the mesh.
+    scale can be increased for coplanar geometry (e.g. object wireframe)."""
     if rv3d is None:
         return coords
-    cam_pos = rv3d.view_matrix.inverted_safe().translation
+    # View direction in world space (unit vector pointing from scene toward camera)
+    view_dir = rv3d.view_matrix.inverted_safe().to_3x3() @ Vector((0.0, 0.0, 1.0))
+    view_dir.normalize()
+    nudge = 0.0020 * scale
     result = []
     for co in coords:
-        v = Vector(co)
-        to_cam = cam_pos - v
-        dist = to_cam.length
-        if dist > 1e-6:
-            nudge = max(0.005 * scale, dist * _Z_BIAS * scale)
-            v = v + to_cam.normalized() * nudge
+        v = Vector(co) + view_dir * nudge
         result.append(tuple(v))
     return result
 
@@ -840,7 +842,7 @@ def _preselect_draw_3d_inner():
                 if not segs:
                     continue
                 # Nudge all verts toward camera to beat wireframe z-fight
-                all_pts = _nudge_toward_camera([p for seg in segs for p in seg], rv3d, scale=10.0)
+                all_pts = _nudge_toward_camera([p for seg in segs for p in seg], rv3d, scale=1.0)
                 segs = [(all_pts[i*2], all_pts[i*2+1]) for i in range(len(segs))]
                 gpu.state.depth_test_set('LESS_EQUAL')
                 from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
