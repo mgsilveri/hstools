@@ -923,9 +923,6 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         if not depsgraph.id_type_updated('MESH'):
             return
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
-        # Inc generation counter. The timer closure captures this value and bails
-        # out completely if a newer MESH update has arrived by the time it fires —
-        # guaranteeing BMesh access only happens in a confirmed stable window.
         import time as _d_time
         state._uv_cache_dirty_time = _d_time.monotonic()
         state._uv_cache_dirty_gen += 1
@@ -1114,6 +1111,8 @@ def _stop_uv_flipped_face_viz():
 def _resync_uv_editor_selection(context, obj, select_mode, bm):
     """Rebuild Blender's UV element map by running uv.select_all(DESELECT) in
     IMAGE_EDITOR context, then re-applying the current BMesh selection."""
+    if not context.tool_settings.use_uv_select_sync:
+        return
     screen = getattr(context, 'screen', None)
     if not screen:
         return

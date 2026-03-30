@@ -12,7 +12,7 @@ from mathutils import Vector
 from bpy.props import IntProperty, EnumProperty, BoolProperty
 
 from . import state
-from .utils import get_addon_preferences, _uv_debug_log
+from .utils import get_addon_preferences, _uv_debug_log, _UV_DEBUG
 from .raycast import raycast_with_tolerance, collect_edge_loop, collect_edge_loop_modo
 from .raycast import select_connected_faces_from, select_connected_verts_from
 from .shortest_path import (
@@ -224,14 +224,15 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         ts       = context.tool_settings
         use_sync = ts.use_uv_select_sync
         sm       = ts.mesh_select_mode
-        mode_str = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
-        n_sel_faces = sum(1 for f in bm.faces if f.select)
-        n_sel_verts = sum(1 for v in bm.verts if v.select)
-        _uv_debug_log(
-            f"[UV-SYNC] _flush_uv_sync called: use_sync={use_sync} "
-            f"mesh_mode={mode_str} sel_faces={n_sel_faces} sel_verts={n_sel_verts} "
-            f"total_faces={len(bm.faces)}"
-        )
+        if _UV_DEBUG:
+            mode_str = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
+            n_sel_faces = sum(1 for f in bm.faces if f.select)
+            n_sel_verts = sum(1 for v in bm.verts if v.select)
+            _uv_debug_log(
+                f"[UV-SYNC] _flush_uv_sync called: use_sync={use_sync} "
+                f"mesh_mode={mode_str} sel_faces={n_sel_faces} sel_verts={n_sel_verts} "
+                f"total_faces={len(bm.faces)}"
+            )
         if not use_sync:
             return
         uv_layer = bm.loops.layers.uv.active

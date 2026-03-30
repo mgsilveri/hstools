@@ -14,7 +14,10 @@ _back_edge_draw_handle = None         # handle returned by draw_handler_add
 _back_edge_cache: list = []           # world-space edge-coord pairs for GPU draw
 _uv_cache_dirty_time: float = 0.0    # timestamp of last depsgraph MESH update
 _uv_cache_dirty_gen:  int   = 0      # incremented on every MESH depsgraph update
-_UV_STABLE_DELAY: float = 0.12       # seconds to wait before accessing BMesh after a MESH update
+_UV_STABLE_DELAY: float = 0.0        # seconds to wait before accessing BMesh after a MESH update
+
+# ── Backface viz timing debug (set True to print timestamps to System Console) ─
+_BFV_TIMING_DEBUG: bool = False
 
 # ── 3D View transform tools (W / E / R) ──────────────────────────────────────
 # 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
