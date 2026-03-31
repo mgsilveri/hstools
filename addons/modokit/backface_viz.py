@@ -136,7 +136,9 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                     nv = len(bm.verts)
                     perf_record("bec: mesh verts", nv)
 
-                    with perf_time("bec: co_flat fill"):
+                    lp = "bec: topo" if topo_only else "bec"
+
+                    with perf_time(f"{lp}: co_flat fill"):
                         co_flat = np.empty(nv * 3, dtype='f')
                         idx = 0
                         for v in bm.verts:
@@ -146,7 +148,7 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                             co_flat[idx+2] = co.z
                             idx += 3
 
-                    with perf_time("bec: numpy transform"):
+                    with perf_time(f"{lp}: numpy transform"):
                         cos  = co_flat.reshape(-1, 3)
                         mx3  = np.array(mx3_mm, dtype='f')
                         t    = np.array(mx.translation, dtype='f')
@@ -202,7 +204,8 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                                     # Collect live normals for selected faces only,
                                     # then transform in one numpy call — replaces
                                     # N per-face mathutils Matrix3 @ Vector calls.
-                                    bm.faces.ensure_lookup_table()
+                                    # from_edit_mesh always returns a valid lookup table;
+                                    # ensure_lookup_table() is unnecessary and costly.
                                     nor_loc = np.empty(nsel * 3, dtype='f')
                                     for i, (fi, _, _) in enumerate(face_topo):
                                         n = bm.faces[fi].normal
@@ -280,12 +283,13 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
     # ── Build GPU batches now, while we're in a safe non-draw context ──────────
     # This avoids re-uploading geometry to the GPU on every single draw frame.
     try:
-        with perf_time("bec: batch build"):
+        bp = "bec: topo" if topo_only else "bec"
+        with perf_time(f"{bp}: batch build"):
             if _back_edge_cache:
                 from .uv_overlays import _get_aa_line_3d_shader, _aa_line_quads_3d
                 aa3d = _get_aa_line_3d_shader()
                 if aa3d is not None:
-                    with perf_time("bec: batch build / edge quads"):
+                    with perf_time(f"{bp}: batch build / edge quads"):
                         pos0_l, pos1_l, which_l, side_l = _aa_line_quads_3d(_back_edge_cache, 1.0)
                         _gpu_batch_edge = batch_for_shader(
                             aa3d, 'TRIS',
@@ -302,7 +306,7 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
             if _back_face_cache:
                 stipple = _get_stipple_shader()
                 if stipple is not None:
-                    with perf_time("bec: batch build / face tris"):
+                    with perf_time(f"{bp}: batch build / face tris"):
                         pos_l = []
                         nor_l = []
                         for (p0, p1, p2, nw) in _back_face_cache:

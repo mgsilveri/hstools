@@ -39,6 +39,7 @@ from .utils import get_addon_preferences, _uv_debug_log, _diag, perf_record
 _back_edge_min_interval: float = 0.016    # adapts after first rebuild
 _back_edge_last_rebuild_time: float = 0.0
 _back_edge_last_callback_time: float = 0.0  # time of last _bfv_rebuild_callback fire
+_back_edge_last_drag_callback_time: float = 0.0  # time of last callback while TRANSFORM active
 _back_edge_trailing_timer_pending: bool = False
 _back_edge_dirty: bool = False            # bypass throttle on next rebuild
 
@@ -48,12 +49,15 @@ def _do_back_edge_rebuild(context, topo_only: bool = False) -> None:
     global _back_edge_last_rebuild_time, _back_edge_min_interval, _back_edge_dirty
     _back_edge_dirty = False
     t0 = time.monotonic()
+    t0_perf = time.perf_counter()  # high-res timer for duration measurement (monotonic ~10ms res on Windows)
     from .backface_viz import _compute_back_edge_cache, _bec_topo_valid
     # Fall back to full rebuild if topo cache isn't populated yet.
     if topo_only and not _bec_topo_valid:
         topo_only = False
     _compute_back_edge_cache(context, topo_only=topo_only)
-    dur = time.monotonic() - t0
+    dur = time.perf_counter() - t0_perf  # sub-ms accurate
+    if topo_only:
+        perf_record("bec: topo/frame", dur, is_interval=True)
     if _back_edge_last_rebuild_time > 0:
         perf_record("bec: inter-rebuild interval",
                     time.monotonic() - _back_edge_last_rebuild_time, is_interval=True)
@@ -80,13 +84,15 @@ def maybe_rebuild_back_edge(context) -> None:
          vertex positions in real time (depsgraph fires too slowly during drags).
       3. No transform, not dirty → mesh unchanged, skip rebuild entirely.
     """
-    global _back_edge_last_callback_time
+    global _back_edge_last_callback_time, _back_edge_last_drag_callback_time
     now = time.monotonic()
     if _back_edge_last_callback_time > 0:
         perf_record("bec: callback interval", now - _back_edge_last_callback_time, is_interval=True)
     _back_edge_last_callback_time = now
 
     # Path 1: depsgraph confirmed a mesh change — rebuild unconditionally.
+    # POST_VIEW fires after all event/modal processing for the frame, so
+    # calling from_edit_mesh here is safe even during native C modal operators.
     if _back_edge_dirty:
         perf_record("bec: rebuild reason", 2)  # 2=dirty flag
         _do_back_edge_rebuild(context)
@@ -96,6 +102,11 @@ def maybe_rebuild_back_edge(context) -> None:
     # Selection is stable during a transform, so reuse the topology cache and
     # only recompute vertex positions (skips the costly full-mesh select scan).
     if _has_active_mesh_transform(context):
+        # Track drag-specific frame interval separately so perf_report shows
+        # actual viewport fps during G/R/S without idle frames diluting it.
+        if _back_edge_last_drag_callback_time > 0 and (now - _back_edge_last_drag_callback_time) < 1.0:
+            perf_record("bec: drag/frame interval", now - _back_edge_last_drag_callback_time, is_interval=True)
+        _back_edge_last_drag_callback_time = now
         elapsed = now - _back_edge_last_rebuild_time
         if elapsed < _back_edge_min_interval:
             perf_record("bec: throttle skip (ms remaining)", (_back_edge_min_interval - elapsed) * 1000)
@@ -105,6 +116,8 @@ def maybe_rebuild_back_edge(context) -> None:
         return
 
     # Path 3: orbiting/idle — mesh unchanged, no work needed.
+    # Reset drag timer so it doesn't carry a stale timestamp into the next drag.
+    _back_edge_last_drag_callback_time = 0.0
     perf_record("bec: skip (no change)", 1)
 
 
@@ -1073,6 +1086,17 @@ def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
         # newer timer will run instead.
         if scheduled_gen is not None and scheduled_gen != state._uv_cache_dirty_gen:
             _uv_debug_log(f"[UV-TIMER] stale gen {scheduled_gen} vs {state._uv_cache_dirty_gen}, skipping")
+            return None
+        # If any modal operator is running it may be modifying the mesh —
+        # reschedule until the modal exits rather than risk a crash.
+        _active_op = getattr(context, 'active_operator', None)
+        if _active_op is not None:
+            _uv_debug_log(f"[UV-TIMER] modal op active ({getattr(_active_op, 'bl_idname', '?')}), rescheduling")
+            _sg, _sb = scheduled_gen, skip_back_edge
+            bpy.app.timers.register(
+                lambda: _refresh_uv_caches_timer(_sg, _sb),
+                first_interval=state._UV_STABLE_DELAY,
+            )
             return None
         _uv_debug_log("[UV-TIMER] _refresh_uv_caches_timer firing")
         if not skip_back_edge:
