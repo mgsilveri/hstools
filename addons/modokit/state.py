@@ -87,8 +87,13 @@ _uv_lmb_down: bool = False         # True while LMB is held in the UV editor
 _uv_boundary_draw_handle = None
 _uv_flipped_face_draw_handle = None
 _uv_overlap_draw_handle = None
+_uv_distortion_draw_handle = None
+_uv_coverage_hud_draw_handle = None
 _flipped_face_uv_cache: list = []
+_distortion_uv_cache: list = []        # list of (uv_polygon, rgba) per face
 _uv_boundary_cache: dict = {'uv_mode': None, 'points': [], 'segments': []}
+_uv_coverage_pct: float = 0.0          # 0–100 % of 0–1 tile covered
+_uv_coverage_dirty: bool = True        # recompute on next draw
 
 # ── Instance tagging ─────────────────────────────────────────────────────────
 _INST_PREFIX = 'inst_'

@@ -126,6 +126,34 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         ),
         default=True,
     )
+    enable_uv_distortion: BoolProperty(
+        name="UV Distortion",
+        description=(
+            "Shade UV faces by stretch relative to the scene median: "
+            "green = median density, red = stretched (UV too small for the 3D surface), "
+            "blue = compressed (UV too large for the 3D surface). "
+            "All objects in edit mode are pooled for the median."
+        ),
+        default=True,
+    )
+    enable_uv_coverage_hud: BoolProperty(
+        name="Coverage % HUD",
+        description=(
+            "Display the percentage of the 0–1 UV tile that is covered by geometry "
+            "in the lower-right corner of the UV Editor"
+        ),
+        default=True,
+    )
+    uv_overlay_opacity: FloatProperty(
+        name="Overlay Opacity",
+        description="Opacity of the Distortion, Overlap and Flipped Face UV overlays",
+        default=0.65,
+        min=0.0,
+        max=1.0,
+        step=1,
+        precision=2,
+        subtype='FACTOR',
+    )
     enable_instance_tagging: BoolProperty(
         name="Instance Auto-Tagging",
         description=(

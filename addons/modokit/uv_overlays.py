@@ -1053,6 +1053,7 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
         global _back_edge_dirty
         _back_edge_dirty = True   # force next draw frame to rebuild regardless of throttle
+        state._uv_coverage_dirty = True
         state._uv_cache_dirty_time = time.monotonic()
         state._uv_cache_dirty_gen += 1
         _gen = state._uv_cache_dirty_gen
@@ -1201,7 +1202,8 @@ def _compute_flipped_face_uv_cache(context):
 
 
 def _uv_flipped_face_draw_callback():
-    """GPU POST_PIXEL — shade flipped UV faces with Modo's olive/gold tint."""
+    """GPU POST_VIEW — shade flipped UV faces with Modo's olive/gold tint.
+    Draws after the image but before POST_PIXEL, so modokit preselect (POST_PIXEL) is always on top."""
     try:
         if state._bfv_previous_mode != 'EDIT_MESH':
             return
@@ -1215,9 +1217,6 @@ def _uv_flipped_face_draw_callback():
         sima = context.space_data
         if sima is None or sima.type != 'IMAGE_EDITOR':
             return
-        region = context.region
-        if region is None:
-            return
         # Recompute live every draw so UV flips and moves are reflected
         # immediately — UV edits often don't trigger a MESH depsgraph update,
         # so the timer-driven cache is frequently stale.
@@ -1225,17 +1224,17 @@ def _uv_flipped_face_draw_callback():
         if not state._flipped_face_uv_cache:
             return
 
+        # PRE_VIEW: Blender's MVP maps UV (u,v) coords to screen directly.
         tris = []
         for uvs in state._flipped_face_uv_cache:
-            sc = [_uv_view_to_region_unclamped(region, u, v) for (u, v) in uvs]
-            v0 = sc[0]
-            for i in range(1, len(sc) - 1):
-                tris += [v0, sc[i], sc[i + 1]]
+            v0 = uvs[0]
+            for i in range(1, len(uvs) - 1):
+                tris += [v0, uvs[i], uvs[i + 1]]
 
         if not tris:
             return
 
-        FLIPPED_COLOR = (0.65, 0.62, 0.08, 0.45)
+        FLIPPED_COLOR = (0.65, 0.62, 0.08, getattr(get_addon_preferences(bpy.context), 'uv_overlay_opacity', 0.65))
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         shader.bind()
@@ -1252,7 +1251,7 @@ def _uv_flipped_face_draw_callback():
 def _start_uv_flipped_face_viz():
     if state._uv_flipped_face_draw_handle is None:
         state._uv_flipped_face_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
-            _uv_flipped_face_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+            _uv_flipped_face_draw_callback, (), 'WINDOW', 'POST_VIEW')
 
 
 def _stop_uv_flipped_face_viz():
@@ -1292,16 +1291,21 @@ _OVERLAP_THRESH_VERT = (
     '}\n'
 )
 _OVERLAP_THRESH_FRAG = (
-    # R channel = accumulated face count × 0.12.
-    # Threshold: discard ≤1 face (R < 0.18), show ≥2 faces (R ≥ 0.18).
-    # t drives colour from light salmon (2 faces) → vivid red (many faces).
+    # Coverage texture: each face adds R=0.20 additively.
+    # Discard single-face pixels (c < 0.28).
+    # t=0 → 2-face zone, t=1 → 5+ face zone.
+    #
+    # Pure red (1,0,0) with varying alpha — matches Modo exactly.
+    # Alpha derived from Modo's sampled ring values composited over grey:
+    #   t=0 (2 faces) → alpha ≈ 0.40   (subtle, grey bleeds through)
+    #   t=1 (5 faces) → alpha ≈ 0.95   (near-opaque vivid red)
+    # Divisor 0.72 maps 5 accumulated faces (c=1.0) to t=1.
     'void main() {\n'
     '    vec2 uv = gl_FragCoord.xy / uviewport;\n'
     '    float c = texture(image, uv).r;\n'
     '    if (c < 0.28) discard;\n'
-    # PER_FACE = 0.20. Direct linear ramp from 2-face floor to 5+ ceiling.
-    #   2 faces → 0.19   3 faces → 0.51   4 faces → 0.83   5+ → 0.97
-    '    float a = clamp((c - 0.28) * 1.6, 0.0, 0.97);\n'
+    '    float t = clamp((c - 0.28) / 0.72, 0.0, 1.0);\n'
+    '    float a = (0.40 + 0.55 * t) * uopacity;\n'
     '    fragColor = vec4(1.0, 0.0, 0.0, a);\n'
     '}\n'
 )
@@ -1315,6 +1319,7 @@ def _get_overlap_thresh_shader():
         info = gpu.types.GPUShaderCreateInfo()
         info.push_constant('MAT4', 'ModelViewProjectionMatrix')
         info.push_constant('VEC2', 'uviewport')
+        info.push_constant('FLOAT', 'uopacity')
         info.sampler(0, 'FLOAT_2D', 'image')
         info.vertex_in(0, 'VEC2', 'pos')
         info.fragment_out(0, 'VEC4', 'fragColor')
@@ -1423,15 +1428,22 @@ def _uv_overlap_draw_callback():
                 gpu.state.blend_set('NONE')
 
         # Pass 2: threshold + composite into the main (region) framebuffer.
-        # POST_PIXEL context provides the pixel-space MVP automatically.
+        # PRE_VIEW coordinate space is UV space; inject a pixel-space ortho
+        # matrix so the fullscreen quad covers the region and gl_FragCoord
+        # still gives correct pixel positions for texture sampling.
         quad = [(0.0, 0.0), (float(w), 0.0), (float(w), float(h)),
                 (0.0, 0.0), (float(w), float(h)), (0.0, float(h))]
         q_batch = batch_for_shader(thresh_sh, 'TRIS', {'pos': quad})
         gpu.state.blend_set('ALPHA')
-        thresh_sh.bind()
-        thresh_sh.uniform_sampler('image', tex)
-        thresh_sh.uniform_float('uviewport', (float(w), float(h)))
-        q_batch.draw(thresh_sh)
+        with gpu.matrix.push_pop():
+            gpu.matrix.load_identity()
+            gpu.matrix.load_projection_matrix(proj)
+            thresh_sh.bind()
+            thresh_sh.uniform_sampler('image', tex)
+            thresh_sh.uniform_float('uviewport', (float(w), float(h)))
+            opacity = getattr(get_addon_preferences(bpy.context), 'uv_overlay_opacity', 0.65)
+            thresh_sh.uniform_float('uopacity', float(opacity))
+            q_batch.draw(thresh_sh)
         gpu.state.blend_set('NONE')
 
     except Exception as _exc:
@@ -1446,7 +1458,7 @@ def _uv_overlap_draw_callback():
 def _start_uv_overlap_viz():
     if state._uv_overlap_draw_handle is None:
         state._uv_overlap_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
-            _uv_overlap_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+            _uv_overlap_draw_callback, (), 'WINDOW', 'POST_VIEW')
 
 
 def _stop_uv_overlap_viz():
@@ -1461,6 +1473,353 @@ def _stop_uv_overlap_viz():
     _overlap_coverage_tex = None
     _overlap_coverage_tex_size = (0, 0)
     _overlap_fb = None
+
+
+# ── UV Distortion visualisation ──────────────────────────────────────────────
+# Per-polygon fill colour encodes UV stretch relative to the *scene median*:
+#
+#   ratio = |UV face area| / world-space 3D face area
+#
+#   ratio == median  →  green   (balanced / average density)
+#   ratio  < median  →  red     (stretched — UV too small for the 3D surface;
+#                                texels will appear low-resolution when rendered)
+#   ratio  > median  →  blue    (compressed — UV too large for the 3D surface;
+#                                texels will appear over-detailed / blurry)
+#
+# All objects in edit-mode unique data are pooled for the median so that
+# multi-object layouts are evaluated consistently.
+#
+# The cache is recomputed at most ~10 fps (every 0.1 s) to stay responsive
+# without burning CPU on every 60-fps viewport frame.
+
+
+def _compute_distortion_uv_cache(context) -> None:
+    """Populate state._distortion_uv_cache: list of (uv_polygon, rgba) per face."""
+    state._distortion_uv_cache = []
+    try:
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return
+        objects = getattr(context, 'objects_in_mode_unique_data', None)
+        if not objects:
+            obj = context.edit_object
+            objects = [obj] if obj is not None else []
+
+        face_data: list = []   # [(uvs, ratio), ...]
+        ratios: list = []
+
+        for obj in objects:
+            if obj is None or obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                continue
+            mw = obj.matrix_world
+            for face in bm.faces:
+                if face.hide or len(face.loops) < 3:
+                    continue
+                uvs = [(lp[uv_layer].uv.x, lp[uv_layer].uv.y) for lp in face.loops]
+                uv_area = abs(_signed_area_uv(uvs))
+
+                # World-space 3D face area — triangle fan from first vertex.
+                verts3d = [mw @ lp.vert.co for lp in face.loops]
+                area3d = 0.0
+                v0 = verts3d[0]
+                for i in range(1, len(verts3d) - 1):
+                    cross = (verts3d[i] - v0).cross(verts3d[i + 1] - v0)
+                    area3d += cross.length
+                area3d *= 0.5
+
+                if area3d < 1e-12:
+                    continue
+                ratio = uv_area / area3d
+                face_data.append((uvs, ratio))
+                ratios.append(ratio)
+
+        if not ratios:
+            return
+
+        # Mean — sensitive to outliers so a single scaled-down face pulls the
+        # reference down, causing the remaining faces to shift toward blue,
+        # matching Modo's distortion overlay behaviour.
+        mean = sum(ratios) / len(ratios)
+        if mean < 1e-14:
+            return
+
+        RED   = (0.82, 0.28, 0.18)
+        GREEN = (0.44, 0.60, 0.38)
+        BLUE  = (0.30, 0.40, 0.82)
+        ALPHA = getattr(get_addon_preferences(bpy.context), 'uv_overlay_opacity', 0.65)
+
+        result = []
+        for uvs, ratio in face_data:
+            normalized = ratio / mean
+            if normalized <= 1.0:
+                # Red side: how far below mean (0 = at mean, 1 = fully stretched).
+                # sqrt ease: half the mean density already shows ~71 % red.
+                dev = 1.0 - normalized           # [0, 1]
+                t   = dev ** 0.5                 # sub-linear ease-in
+                r = GREEN[0] + (RED[0] - GREEN[0]) * t
+                g = GREEN[1] + (RED[1] - GREEN[1]) * t
+                b = GREEN[2] + (RED[2] - GREEN[2]) * t
+            else:
+                # Blue side: cap at 3× mean = full blue.
+                # sqrt ease: 2× mean → ~71 % blue, 3× → 100 %.
+                dev = min((normalized - 1.0) / 2.0, 1.0)  # [0, 1], full at 3×
+                t   = dev ** 0.5
+                r = GREEN[0] + (BLUE[0] - GREEN[0]) * t
+                g = GREEN[1] + (BLUE[1] - GREEN[1]) * t
+                b = GREEN[2] + (BLUE[2] - GREEN[2]) * t
+            result.append((uvs, (r, g, b, ALPHA)))
+
+        state._distortion_uv_cache = result
+    except Exception as _exc:
+        print(f'[UV-DISTORTION] compute EXCEPTION: {_exc}', flush=True)
+        state._distortion_uv_cache = []
+
+
+def _uv_distortion_draw_callback() -> None:
+    """GPU POST_VIEW — shade UV faces by distortion ratio (red / green / blue).
+    Draws after the image but before POST_PIXEL, so modokit preselect (POST_PIXEL) is always on top."""
+    try:
+        if state._bfv_previous_mode != 'EDIT_MESH':
+            return
+        prefs = get_addon_preferences(bpy.context)
+        if not getattr(prefs, 'enable_uv_distortion', True):
+            return
+        context = bpy.context
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return
+        sima = context.space_data
+        if sima is None or sima.type != 'IMAGE_EDITOR':
+            return
+
+        _compute_distortion_uv_cache(context)
+
+        cache = state._distortion_uv_cache
+        if not cache:
+            return
+
+        # PRE_VIEW: Blender's MVP maps UV (u,v) coords to screen directly.
+        verts = []
+        colors = []
+        for uvs, color in cache:
+            v0 = uvs[0]
+            for i in range(1, len(uvs) - 1):
+                verts += [v0, uvs[i], uvs[i + 1]]
+                colors += [color, color, color]
+
+        if not verts:
+            return
+
+        shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+        batch = batch_for_shader(shader, 'TRIS', {'pos': verts, 'color': colors})
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        batch.draw(shader)
+        gpu.state.blend_set('NONE')
+    except Exception as _exc:
+        try:
+            gpu.state.blend_set('NONE')
+        except Exception:
+            pass
+        print(f'[UV-DISTORTION] draw EXCEPTION: {_exc}', flush=True)
+
+
+def _start_uv_distortion_viz():
+    if state._uv_distortion_draw_handle is None:
+        state._uv_distortion_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            _uv_distortion_draw_callback, (), 'WINDOW', 'POST_VIEW')
+
+
+def _stop_uv_distortion_viz():
+    if state._uv_distortion_draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(
+                state._uv_distortion_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._uv_distortion_draw_handle = None
+
+
+# ── UV Coverage % HUD ─────────────────────────────────────────────────────────
+# Percentage of the 0–1 UV tile covered by at least one face of every object
+# currently in edit mode, displayed as text in the lower-right corner of the
+# UV Editor region.
+#
+# Implementation: a fixed 256×256 GPUTexture / GPUFrameBuffer is used as a
+# coverage mask.  UV coordinates are mapped so that [0,1]² spans exactly
+# [0,256]² pixels; a UNIFORM_COLOR draw with ADDITIVE blend saturates each
+# covered pixel to R=255.  The texture is read back once per dirty event and
+# the non-zero pixel count expressed as a percentage is cached in state.
+#
+# GPUTexture.read() is a GPU-sync point.  It is called only when the dirty
+# flag is set (by the mesh-update depsgraph handler) or every 0.5 s as a
+# fallback for UV transforms that bypass the depsgraph (e.g. freehand G moves).
+
+_COV_TEX_SIZE: int = 256
+_cov_tex = None
+_cov_fb = None
+_cov_last_compute_time: float = 0.0
+_COV_RECOMPUTE_INTERVAL: float = 0.5   # max 2 Hz for non-dirty recomputes
+
+
+def _ensure_cov_rendertarget():
+    global _cov_tex, _cov_fb
+    if _cov_tex is not None:
+        return _cov_tex, _cov_fb
+    try:
+        _cov_tex = gpu.types.GPUTexture((_COV_TEX_SIZE, _COV_TEX_SIZE), format='RGBA8')
+        _cov_fb = gpu.types.GPUFrameBuffer(color_slots=[_cov_tex])
+    except Exception as e:
+        print(f'[UV-COVERAGE] rendertarget create ERROR: {e}', flush=True)
+    return _cov_tex, _cov_fb
+
+
+def _compute_uv_coverage_pct(context) -> None:
+    """Render UV tris into 256×256 coverage texture, read back, count covered pixels."""
+    global _cov_last_compute_time
+    state._uv_coverage_dirty = False
+    _cov_last_compute_time = time.monotonic()
+    try:
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            state._uv_coverage_pct = 0.0
+            return
+
+        objects = getattr(context, 'objects_in_mode_unique_data', None)
+        if not objects:
+            obj = context.edit_object
+            objects = [obj] if obj is not None else []
+
+        N = float(_COV_TEX_SIZE)
+        tris = []
+        for obj in objects:
+            if obj is None or obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                continue
+            for face in bm.faces:
+                if face.hide or len(face.loops) < 3:
+                    continue
+                sc = [(lp[uv_layer].uv.x * N, lp[uv_layer].uv.y * N)
+                      for lp in face.loops]
+                v0 = sc[0]
+                for i in range(1, len(sc) - 1):
+                    tris += [v0, sc[i], sc[i + 1]]
+
+        if not tris:
+            state._uv_coverage_pct = 0.0
+            return
+
+        tex, fb = _ensure_cov_rendertarget()
+        if tex is None or fb is None:
+            return
+
+        # Ortho projection: UV [0,1] → pixel [0,N] → NDC [-1,1].
+        from mathutils import Matrix
+        proj = Matrix((
+            (2.0 / N, 0.0,     0.0, -1.0),
+            (0.0,     2.0 / N, 0.0, -1.0),
+            (0.0,     0.0,     1.0,  0.0),
+            (0.0,     0.0,     0.0,  1.0),
+        ))
+
+        flat = gpu.shader.from_builtin('UNIFORM_COLOR')
+        batch = batch_for_shader(flat, 'TRIS', {'pos': tris})
+
+        # Render all UV faces into the coverage texture.
+        # White fill with ADDITIVE blend: first face touching a pixel saturates
+        # all channels to 255, so any non-zero channel = covered.
+        with fb.bind():
+            fb.clear(color=(0.0, 0.0, 0.0, 0.0))
+            with gpu.matrix.push_pop():
+                gpu.matrix.load_identity()
+                gpu.matrix.load_projection_matrix(proj)
+                gpu.state.blend_set('ADDITIVE')
+                flat.bind()
+                flat.uniform_float('color', (1.0, 1.0, 1.0, 1.0))
+                batch.draw(flat)
+                gpu.state.blend_set('NONE')
+
+        # Read texture back (GPU sync point — only called when dirty / throttled).
+        buf = tex.read()
+        try:
+            data = bytes(buf)
+        except TypeError:
+            # Fallback for Buffer implementations that don't support bytes().
+            raw = list(buf)
+            data = bytearray(int(max(0, min(255, v))) for v in raw)
+
+        # Count pixels where any channel > 0 (handles RGBA and BGRA backends).
+        covered = sum(
+            1 for i in range(0, len(data), 4)
+            if data[i] > 0 or data[i + 1] > 0 or data[i + 2] > 0
+        )
+        state._uv_coverage_pct = covered / (_COV_TEX_SIZE * _COV_TEX_SIZE) * 100.0
+
+    except Exception as _exc:
+        print(f'[UV-COVERAGE] compute EXCEPTION: {_exc}', flush=True)
+
+
+def _uv_coverage_hud_draw_callback() -> None:
+    """GPU POST_PIXEL — draw coverage % text in lower-right corner of UV Editor."""
+    try:
+        if state._bfv_previous_mode != 'EDIT_MESH':
+            return
+        prefs = get_addon_preferences(bpy.context)
+        if not getattr(prefs, 'enable_uv_coverage_hud', True):
+            return
+        context = bpy.context
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return
+        sima = context.space_data
+        if sima is None or sima.type != 'IMAGE_EDITOR':
+            return
+        region = context.region
+        if region is None:
+            return
+
+        now = time.monotonic()
+        if state._uv_coverage_dirty or (now - _cov_last_compute_time) > _COV_RECOMPUTE_INTERVAL:
+            _compute_uv_coverage_pct(context)
+
+        import blf
+        text = f"Coverage: {state._uv_coverage_pct:.1f}%"
+        font_id = 0
+        blf.size(font_id, 13)
+        tw, _th = blf.dimensions(font_id, text)
+        x = region.width - int(tw) - 10
+        y = 10
+        blf.enable(font_id, blf.SHADOW)
+        blf.shadow(font_id, 3, 0.0, 0.0, 0.0, 0.8)
+        blf.shadow_offset(font_id, 1, -1)
+        blf.position(font_id, x, y, 0)
+        blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
+        blf.draw(font_id, text)
+        blf.disable(font_id, blf.SHADOW)
+    except Exception as _exc:
+        print(f'[UV-COVERAGE] draw EXCEPTION: {_exc}', flush=True)
+
+
+def _start_uv_coverage_hud():
+    if state._uv_coverage_hud_draw_handle is None:
+        state._uv_coverage_hud_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            _uv_coverage_hud_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+
+
+def _stop_uv_coverage_hud():
+    global _cov_tex, _cov_fb
+    if state._uv_coverage_hud_draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(
+                state._uv_coverage_hud_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._uv_coverage_hud_draw_handle = None
+    _cov_tex = None
+    _cov_fb = None
 
 
 # ── UV editor selection resync ────────────────────────────────────────────────
