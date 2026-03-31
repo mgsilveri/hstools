@@ -1211,11 +1211,18 @@ def _uv_flipped_face_draw_callback():
         prefs = get_addon_preferences(bpy.context)
         if not getattr(prefs, 'enable_uv_flipped_face_viz', True):
             return
+        # Distortion overlay already encodes flipped faces (negative ratio → red);
+        # showing both simultaneously is redundant, matching Modo's behaviour.
+        if getattr(prefs, 'enable_uv_distortion', True):
+            return
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
             return
         sima = context.space_data
         if sima is None or sima.type != 'IMAGE_EDITOR':
+            return
+        region = context.region
+        if region is None:
             return
         # Recompute live every draw so UV flips and moves are reflected
         # immediately — UV edits often don't trigger a MESH depsgraph update,
@@ -1224,12 +1231,24 @@ def _uv_flipped_face_draw_callback():
         if not state._flipped_face_uv_cache:
             return
 
-        # PRE_VIEW: Blender's MVP maps UV (u,v) coords to screen directly.
+        # Compute 1 px inset in UV space so the native wireframe shows through.
+        inset_uv = 0.0
+        try:
+            v2d = region.view2d
+            x0 = v2d.view_to_region(0.0, 0.0, clip=False)[0]
+            x1 = v2d.view_to_region(1.0, 0.0, clip=False)[0]
+            ppu = abs(x1 - x0)
+            if ppu > 0:
+                inset_uv = 3.0 / ppu
+        except Exception:
+            pass
+
         tris = []
         for uvs in state._flipped_face_uv_cache:
-            v0 = uvs[0]
-            for i in range(1, len(uvs) - 1):
-                tris += [v0, uvs[i], uvs[i + 1]]
+            poly = _inset_uv_poly(uvs, inset_uv)
+            v0 = poly[0]
+            for i in range(1, len(poly) - 1):
+                tris += [v0, poly[i], poly[i + 1]]
 
         if not tris:
             return
@@ -1387,6 +1406,7 @@ def _uv_overlap_draw_callback():
                     continue
                 sc = [_uv_view_to_region_unclamped(region, lp[uv_layer].uv.x, lp[uv_layer].uv.y)
                       for lp in face.loops]
+                sc = _inset_uv_poly(sc, 3.0)
                 v0 = sc[0]
                 for i in range(1, len(sc) - 1):
                     tris += [v0, sc[i], sc[i + 1]]
@@ -1493,6 +1513,27 @@ def _stop_uv_overlap_viz():
 # without burning CPU on every 60-fps viewport frame.
 
 
+def _inset_uv_poly(uvs, inset):
+    """Return a copy of the UV polygon with each vertex moved `inset` units
+    toward the centroid.  Used to leave a 1-pixel border so the native UV
+    wireframe remains visible underneath the fill overlays."""
+    n = len(uvs)
+    if n < 3 or inset <= 0.0:
+        return uvs
+    cx = sum(v[0] for v in uvs) / n
+    cy = sum(v[1] for v in uvs) / n
+    result = []
+    for (x, y) in uvs:
+        dx, dy = cx - x, cy - y
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist <= inset:
+            result.append((cx, cy))
+        else:
+            f = inset / dist
+            result.append((x + dx * f, y + dy * f))
+    return result
+
+
 def _compute_distortion_uv_cache(context) -> None:
     """Populate state._distortion_uv_cache: list of (uv_polygon, rgba) per face."""
     state._distortion_uv_cache = []
@@ -1593,6 +1634,9 @@ def _uv_distortion_draw_callback() -> None:
         sima = context.space_data
         if sima is None or sima.type != 'IMAGE_EDITOR':
             return
+        region = context.region
+        if region is None:
+            return
 
         _compute_distortion_uv_cache(context)
 
@@ -1600,13 +1644,25 @@ def _uv_distortion_draw_callback() -> None:
         if not cache:
             return
 
-        # PRE_VIEW: Blender's MVP maps UV (u,v) coords to screen directly.
+        # Compute 1 px inset in UV space so the native wireframe shows through.
+        inset_uv = 0.0
+        try:
+            v2d = region.view2d
+            x0 = v2d.view_to_region(0.0, 0.0, clip=False)[0]
+            x1 = v2d.view_to_region(1.0, 0.0, clip=False)[0]
+            ppu = abs(x1 - x0)
+            if ppu > 0:
+                inset_uv = 3.0 / ppu
+        except Exception:
+            pass
+
         verts = []
         colors = []
         for uvs, color in cache:
-            v0 = uvs[0]
-            for i in range(1, len(uvs) - 1):
-                verts += [v0, uvs[i], uvs[i + 1]]
+            poly = _inset_uv_poly(uvs, inset_uv)
+            v0 = poly[0]
+            for i in range(1, len(poly) - 1):
+                verts += [v0, poly[i], poly[i + 1]]
                 colors += [color, color, color]
 
         if not verts:
@@ -1661,7 +1717,29 @@ _COV_TEX_SIZE: int = 256
 _cov_tex = None
 _cov_fb = None
 _cov_last_compute_time: float = 0.0
-_COV_RECOMPUTE_INTERVAL: float = 0.5   # max 2 Hz for non-dirty recomputes
+_COV_DIRTY_INTERVAL: float  = 0.1   # seconds between dirty-triggered recomputes
+_COV_IDLE_INTERVAL:  float  = 0.5   # seconds between idle recomputes
+_cov_timer_running:  bool   = False  # True while the self-rescheduling timer is alive
+
+
+def _coverage_timer() -> object:
+    """Self-rescheduling timer: computes coverage pct outside of a draw callback
+    so the GPU readback (tex.read) never causes a pipeline stall mid-frame."""
+    global _cov_timer_running, _cov_last_compute_time
+    if not _cov_timer_running:
+        return None  # stop
+    try:
+        ctx = bpy.context
+        if getattr(ctx, 'mode', None) != 'EDIT_MESH':
+            _cov_timer_running = False
+            return None
+        prefs = get_addon_preferences(ctx)
+        if getattr(prefs, 'enable_uv_coverage_hud', True):
+            _compute_uv_coverage_pct(ctx)
+    except Exception as _exc:
+        print(f'[UV-COVERAGE] timer EXCEPTION: {_exc}', flush=True)
+    # Reschedule faster when still dirty (e.g. mid-transform)
+    return _COV_DIRTY_INTERVAL if state._uv_coverage_dirty else _COV_IDLE_INTERVAL
 
 
 def _ensure_cov_rendertarget():
@@ -1764,7 +1842,8 @@ def _compute_uv_coverage_pct(context) -> None:
 
 
 def _uv_coverage_hud_draw_callback() -> None:
-    """GPU POST_PIXEL — draw coverage % text in lower-right corner of UV Editor."""
+    """GPU POST_PIXEL — draw coverage % text in lower-right corner of UV Editor.
+    Reads pre-cached state._uv_coverage_pct; never triggers a GPU readback."""
     try:
         if state._bfv_previous_mode != 'EDIT_MESH':
             return
@@ -1778,12 +1857,8 @@ def _uv_coverage_hud_draw_callback() -> None:
         if sima is None or sima.type != 'IMAGE_EDITOR':
             return
         region = context.region
-        if region is None:
+        if region is None or region.type != 'WINDOW':
             return
-
-        now = time.monotonic()
-        if state._uv_coverage_dirty or (now - _cov_last_compute_time) > _COV_RECOMPUTE_INTERVAL:
-            _compute_uv_coverage_pct(context)
 
         import blf
         text = f"Coverage: {state._uv_coverage_pct:.1f}%"
@@ -1804,13 +1879,18 @@ def _uv_coverage_hud_draw_callback() -> None:
 
 
 def _start_uv_coverage_hud():
+    global _cov_timer_running
     if state._uv_coverage_hud_draw_handle is None:
         state._uv_coverage_hud_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
             _uv_coverage_hud_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+    if not _cov_timer_running:
+        _cov_timer_running = True
+        bpy.app.timers.register(_coverage_timer, first_interval=_COV_DIRTY_INTERVAL)
 
 
 def _stop_uv_coverage_hud():
-    global _cov_tex, _cov_fb
+    global _cov_tex, _cov_fb, _cov_timer_running
+    _cov_timer_running = False  # signals _coverage_timer to self-terminate
     if state._uv_coverage_hud_draw_handle is not None:
         try:
             bpy.types.SpaceImageEditor.draw_handler_remove(
@@ -1822,6 +1902,7 @@ def _stop_uv_coverage_hud():
     _cov_fb = None
 
 
+# ── UV Wireframe redraw ───────────────────────────────────────────────────────
 # ── UV editor selection resync ────────────────────────────────────────────────
 
 def _resync_uv_editor_selection(context, obj, select_mode, bm):
