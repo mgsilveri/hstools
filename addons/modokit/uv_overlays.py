@@ -1265,6 +1265,204 @@ def _stop_uv_flipped_face_viz():
         state._uv_flipped_face_draw_handle = None
 
 
+# ── UV overlap visualisation ──────────────────────────────────────────────────
+# Two-pass GPU approach — pixel-perfect intersection only:
+#
+#   Pass 1  All UV face triangles are drawn into a GPUFrameBuffer whose single
+#           colour attachment is a GPUTexture (RGBA8).  ADDITIVE blend: each
+#           face adds 0.12 to R at every pixel it covers.  After N faces: R≈N×0.12.
+#
+#   Pass 2  A fullscreen quad is drawn into the main framebuffer via a threshold
+#           shader.  Pixels where R < 0.18 (≤1 face) are discarded entirely —
+#           zero tint on non-overlapping areas.  Remaining pixels are red with
+#           opacity proportional to coverage depth.
+#
+# GPUOffScreen.color_texture returns an int (GL bindcode), not a GPUTexture, so
+# uniform_sampler() rejects it with TypeError.  GPUFrameBuffer + GPUTexture is
+# the correct API — both the render target and the sampler are the same object.
+
+_overlap_coverage_tex = None
+_overlap_coverage_tex_size = (0, 0)
+_overlap_fb = None
+_overlap_thresh_shader_cache = None
+
+_OVERLAP_THRESH_VERT = (
+    'void main() {\n'
+    '    gl_Position = ModelViewProjectionMatrix * vec4(pos, 0.0, 1.0);\n'
+    '}\n'
+)
+_OVERLAP_THRESH_FRAG = (
+    # R channel = accumulated face count × 0.12.
+    # Threshold: discard ≤1 face (R < 0.18), show ≥2 faces (R ≥ 0.18).
+    # t drives colour from light salmon (2 faces) → vivid red (many faces).
+    'void main() {\n'
+    '    vec2 uv = gl_FragCoord.xy / uviewport;\n'
+    '    float c = texture(image, uv).r;\n'
+    '    if (c < 0.28) discard;\n'
+    # PER_FACE = 0.20. Direct linear ramp from 2-face floor to 5+ ceiling.
+    #   2 faces → 0.19   3 faces → 0.51   4 faces → 0.83   5+ → 0.97
+    '    float a = clamp((c - 0.28) * 1.6, 0.0, 0.97);\n'
+    '    fragColor = vec4(1.0, 0.0, 0.0, a);\n'
+    '}\n'
+)
+
+
+def _get_overlap_thresh_shader():
+    global _overlap_thresh_shader_cache
+    if _overlap_thresh_shader_cache is not None:
+        return _overlap_thresh_shader_cache
+    try:
+        info = gpu.types.GPUShaderCreateInfo()
+        info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+        info.push_constant('VEC2', 'uviewport')
+        info.sampler(0, 'FLOAT_2D', 'image')
+        info.vertex_in(0, 'VEC2', 'pos')
+        info.fragment_out(0, 'VEC4', 'fragColor')
+        info.vertex_source(_OVERLAP_THRESH_VERT)
+        info.fragment_source(_OVERLAP_THRESH_FRAG)
+        _overlap_thresh_shader_cache = gpu.shader.create_from_info(info)
+    except Exception as e:
+        print(f'[UV-OVERLAP] thresh shader compile ERROR: {e}', flush=True)
+    return _overlap_thresh_shader_cache
+
+
+def _get_overlap_rendertarget(w, h):
+    global _overlap_coverage_tex, _overlap_coverage_tex_size, _overlap_fb
+    if _overlap_coverage_tex is not None and _overlap_coverage_tex_size == (w, h):
+        return _overlap_coverage_tex, _overlap_fb
+    # Drop old resources (Python GC handles GPU-side deallocation).
+    _overlap_coverage_tex = None
+    _overlap_fb = None
+    _overlap_coverage_tex_size = (0, 0)
+    try:
+        _overlap_coverage_tex = gpu.types.GPUTexture((w, h), format='RGBA8')
+        _overlap_fb = gpu.types.GPUFrameBuffer(color_slots=[_overlap_coverage_tex])
+        _overlap_coverage_tex_size = (w, h)
+    except Exception as e:
+        print(f'[UV-OVERLAP] rendertarget create ERROR: {e}', flush=True)
+    return _overlap_coverage_tex, _overlap_fb
+
+
+def _uv_overlap_draw_callback():
+    """GPU POST_PIXEL — pixel-perfect UV overlap via GPUFrameBuffer coverage pass."""
+    try:
+        if state._bfv_previous_mode != 'EDIT_MESH':
+            return
+        prefs = get_addon_preferences(bpy.context)
+        if not getattr(prefs, 'enable_uv_overlap', True):
+            return
+        context = bpy.context
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return
+        sima = context.space_data
+        if sima is None or sima.type != 'IMAGE_EDITOR':
+            return
+        region = context.region
+        if region is None:
+            return
+        w, h = region.width, region.height
+        if w < 1 or h < 1:
+            return
+
+        objects = getattr(context, 'objects_in_mode_unique_data', None)
+        if not objects:
+            obj = context.edit_object
+            objects = [obj] if obj is not None else []
+
+        tris = []
+        for obj in objects:
+            if obj is None or obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                continue
+            for face in bm.faces:
+                if face.hide or len(face.loops) < 3:
+                    continue
+                sc = [_uv_view_to_region_unclamped(region, lp[uv_layer].uv.x, lp[uv_layer].uv.y)
+                      for lp in face.loops]
+                v0 = sc[0]
+                for i in range(1, len(sc) - 1):
+                    tris += [v0, sc[i], sc[i + 1]]
+
+        if not tris:
+            return
+
+        tex, fb = _get_overlap_rendertarget(w, h)
+        if tex is None or fb is None:
+            return
+        thresh_sh = _get_overlap_thresh_shader()
+        if thresh_sh is None:
+            return
+
+        flat = gpu.shader.from_builtin('UNIFORM_COLOR')
+        batch = batch_for_shader(flat, 'TRIS', {'pos': tris})
+
+        # Ortho matrix: region pixel coords (0..w, 0..h) → clip NDC (-1..1).
+        from mathutils import Matrix
+        proj = Matrix((
+            (2.0 / w, 0.0,     0.0, -1.0),
+            (0.0,     2.0 / h, 0.0, -1.0),
+            (0.0,     0.0,     1.0,  0.0),
+            (0.0,     0.0,     0.0,  1.0),
+        ))
+
+        # Pass 1: render face coverage into the RGBA8 texture.
+        # ADDITIVE blend (sfactor=ONE, dfactor=ONE): result = src + dst.
+        # Each face at a pixel adds 0.12 to R → R≈N×0.12 after N faces.
+        with fb.bind():
+            fb.clear(color=(0.0, 0.0, 0.0, 0.0))
+            with gpu.matrix.push_pop():
+                gpu.matrix.load_identity()
+                gpu.matrix.load_projection_matrix(proj)
+                gpu.state.blend_set('ADDITIVE')
+                flat.bind()
+                flat.uniform_float('color', (0.20, 0.0, 0.0, 1.0))
+                batch.draw(flat)
+                gpu.state.blend_set('NONE')
+
+        # Pass 2: threshold + composite into the main (region) framebuffer.
+        # POST_PIXEL context provides the pixel-space MVP automatically.
+        quad = [(0.0, 0.0), (float(w), 0.0), (float(w), float(h)),
+                (0.0, 0.0), (float(w), float(h)), (0.0, float(h))]
+        q_batch = batch_for_shader(thresh_sh, 'TRIS', {'pos': quad})
+        gpu.state.blend_set('ALPHA')
+        thresh_sh.bind()
+        thresh_sh.uniform_sampler('image', tex)
+        thresh_sh.uniform_float('uviewport', (float(w), float(h)))
+        q_batch.draw(thresh_sh)
+        gpu.state.blend_set('NONE')
+
+    except Exception as _exc:
+        try:
+            gpu.state.blend_set('NONE')
+        except Exception:
+            pass
+        # Always print — _uv_debug_log is a no-op when _UV_DEBUG is False.
+        print(f'[UV-OVERLAP] draw EXCEPTION: {_exc}', flush=True)
+
+
+def _start_uv_overlap_viz():
+    if state._uv_overlap_draw_handle is None:
+        state._uv_overlap_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            _uv_overlap_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+
+
+def _stop_uv_overlap_viz():
+    global _overlap_coverage_tex, _overlap_coverage_tex_size, _overlap_fb
+    if state._uv_overlap_draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(
+                state._uv_overlap_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._uv_overlap_draw_handle = None
+    _overlap_coverage_tex = None
+    _overlap_coverage_tex_size = (0, 0)
+    _overlap_fb = None
+
+
 # ── UV editor selection resync ────────────────────────────────────────────────
 
 def _resync_uv_editor_selection(context, obj, select_mode, bm):

@@ -117,6 +117,15 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         ),
         default=True,
     )
+    enable_uv_overlap: BoolProperty(
+        name="UV Overlap Highlight",
+        description=(
+            "Shade all UV faces with a thin red layer in the UV Editor. "
+            "Overlapping UV islands stack layers — the intersection zone "
+            "saturates toward red while unique areas stay nearly invisible"
+        ),
+        default=True,
+    )
     enable_instance_tagging: BoolProperty(
         name="Instance Auto-Tagging",
         description=(

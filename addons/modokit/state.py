@@ -86,6 +86,7 @@ _uv_lmb_down: bool = False         # True while LMB is held in the UV editor
 # ── UV overlays ───────────────────────────────────────────────────────────────
 _uv_boundary_draw_handle = None
 _uv_flipped_face_draw_handle = None
+_uv_overlap_draw_handle = None
 _flipped_face_uv_cache: list = []
 _uv_boundary_cache: dict = {'uv_mode': None, 'points': [], 'segments': []}
 

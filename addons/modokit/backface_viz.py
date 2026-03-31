@@ -693,10 +693,12 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
             from .uv_overlays import (
                 _start_uv_boundary_overlay, _stop_uv_boundary_overlay,
                 _start_uv_flipped_face_viz, _stop_uv_flipped_face_viz,
+                _start_uv_overlap_viz, _stop_uv_overlap_viz,
                 _compute_flipped_face_uv_cache, _compute_uv_boundary_cache,
             )
             _start_uv_boundary_overlay()
             _start_uv_flipped_face_viz()
+            _start_uv_overlap_viz()
 
             def _edit_mode_entry_uv_seed():
                 try:
@@ -717,9 +719,11 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
             _restore_bfv_from_all(context)
             from .uv_overlays import (
                 _stop_uv_boundary_overlay, _stop_uv_flipped_face_viz,
+                _stop_uv_overlap_viz,
             )
             _stop_uv_boundary_overlay()
             _stop_uv_flipped_face_viz()
+            _stop_uv_overlap_viz()
             if state._active_transform_mode is not None:
                 try:
                     from .transform_3d import _drop_transform
@@ -755,10 +759,12 @@ def _uv_cache_clear_load_post_handler(dummy):
                 state._bfv_previous_mode = 'EDIT_MESH'
                 from .uv_overlays import (
                     _start_uv_boundary_overlay, _start_uv_flipped_face_viz,
+                    _start_uv_overlap_viz,
                     _compute_flipped_face_uv_cache, _compute_uv_boundary_cache,
                 )
                 _start_uv_boundary_overlay()
                 _start_uv_flipped_face_viz()
+                _start_uv_overlap_viz()
                 _compute_flipped_face_uv_cache(ctx)
                 _compute_uv_boundary_cache(ctx)
                 screen = getattr(ctx, 'screen', None)
