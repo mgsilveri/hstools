@@ -1203,8 +1203,6 @@ def _compute_flipped_face_uv_cache(context):
 def _uv_flipped_face_draw_callback():
     """GPU POST_PIXEL — shade flipped UV faces with Modo's olive/gold tint."""
     try:
-        if not state._flipped_face_uv_cache:
-            return
         if state._bfv_previous_mode != 'EDIT_MESH':
             return
         _diag("DRAW flipped_face enter")
@@ -1219,6 +1217,12 @@ def _uv_flipped_face_draw_callback():
             return
         region = context.region
         if region is None:
+            return
+        # Recompute live every draw so UV flips and moves are reflected
+        # immediately — UV edits often don't trigger a MESH depsgraph update,
+        # so the timer-driven cache is frequently stale.
+        _compute_flipped_face_uv_cache(context)
+        if not state._flipped_face_uv_cache:
             return
 
         tris = []

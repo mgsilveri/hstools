@@ -41,7 +41,21 @@ from . import (
     keymap,
 )
 
-from .utils import _uv_debug_log
+from .utils import _uv_debug_log, get_addon_preferences
+
+
+# ── UV Editor Overlays dropdown injection ─────────────────────────────────────
+
+def _draw_uv_overlays_panel(self, context):
+    prefs = get_addon_preferences(context)
+    if prefs is None:
+        return
+    layout = self.layout
+    layout.separator()
+    layout.label(text="ModoKit")
+    layout.prop(prefs, "enable_uv_boundary_overlay",  text="Seam Partner Highlight")
+    layout.prop(prefs, "enable_uv_flipped_face_viz",  text="Flipped Faces")
+
 
 # ============================================================================
 # All operator / panel / menu classes, in registration order
@@ -173,6 +187,9 @@ def register():
         bpy.app.timers.register(keymap._uv_tool_guardian,
                                 first_interval=state._UV_TOOL_GUARDIAN_INTERVAL)
 
+    # UV Editor Overlays dropdown
+    bpy.types.IMAGE_PT_overlay.append(_draw_uv_overlays_panel)
+
     # Patch VIEW3D_MT_editor_menus.draw_collapsible for Material Mode button
     if state._orig_editor_menus_draw_collapsible is None:
         state._orig_editor_menus_draw_collapsible = (
@@ -260,6 +277,8 @@ def unregister():
                 obj.name = obj.name[len(state._INST_PREFIX):]
     except Exception:
         pass
+
+    bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
 
     for cls in reversed(_ALL_CLASSES):
         try:
