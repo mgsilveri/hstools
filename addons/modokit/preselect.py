@@ -721,7 +721,7 @@ def _collect_uv_hits(context, mx, my):
                         continue
                     if math.hypot(sc[0] - mx, sc[1] - my) <= _VERT_PIXEL_THRESHOLD:
                         vw = tuple(mx_w @ vert.co)
-                        uv_coords = [tuple(l[uv_layer].uv) for l in vert.link_loops]
+                        uv_coords = [tuple(uv)]
                         hits.append({
                             'type':       'VERT',
                             'coords':     [vw],

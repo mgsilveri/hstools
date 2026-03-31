@@ -927,9 +927,6 @@ def _compute_uv_boundary_cache(context):
 def _uv_boundary_draw_callback():
     """GPU POST_PIXEL — highlight seam-partner UV edges/verts in Modo purple."""
     try:
-        uv_mode = state._uv_boundary_cache.get('uv_mode')
-        if uv_mode is None:
-            return
         if state._bfv_previous_mode != 'EDIT_MESH':
             return
         _diag("DRAW uv_boundary enter")
@@ -944,6 +941,13 @@ def _uv_boundary_draw_callback():
             return
         region = context.region
         if region is None:
+            return
+        # Recompute live every draw so that UV selection changes are reflected
+        # immediately — UV selection does not trigger a MESH depsgraph update,
+        # so the timer-driven cache can be stale by several frames.
+        _compute_uv_boundary_cache(context)
+        uv_mode = state._uv_boundary_cache.get('uv_mode')
+        if uv_mode is None:
             return
 
         COLOR = (0.66, 0.66, 1.0, 1.0)
