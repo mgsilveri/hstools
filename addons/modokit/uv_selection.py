@@ -890,8 +890,13 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
                 iface = bm.faces[fi]
                 if use_sync:
                     iface.select = do_select
+                    if not do_select:
+                        for lp in iface.loops:
+                            if not any(f.select for f in lp.edge.link_faces):
+                                lp.edge.select = False
+                            if not any(f.select for f in lp.vert.link_faces):
+                                lp.vert.select = False
                     for lp in iface.loops:
-                        lp.vert.select = do_select
                         try:
                             lp.uv_select_vert = do_select
                             lp.uv_select_edge = do_select
@@ -1454,12 +1459,12 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if use_sync:
                 if uv_mode == 'VERTEX':
                     if 0 <= li < len(face.loops):
-                        lp = face.loops[li]
-                        lp.vert.select = do_select
-                        try:
-                            lp.uv_select_vert = do_select
-                        except AttributeError:
-                            pass
+                        for lp in face.loops:
+                            lp.vert.select = do_select
+                            try:
+                                lp.uv_select_vert = do_select
+                            except AttributeError:
+                                pass
                         dirty = True
                 elif uv_mode == 'EDGE':
                     if 0 <= li < len(face.loops):
@@ -1478,11 +1483,17 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                         dirty = True
                 else:
                     face.select = do_select
-                    if do_select and uv_layer is not None:
+                    if not do_select:
+                        for lp in face.loops:
+                            if not any(f.select for f in lp.edge.link_faces):
+                                lp.edge.select = False
+                            if not any(f.select for f in lp.vert.link_faces):
+                                lp.vert.select = False
+                    if uv_layer is not None:
                         for lp in face.loops:
                             try:
-                                lp.uv_select_vert = True
-                                lp.uv_select_edge = True
+                                lp.uv_select_vert = do_select
+                                lp.uv_select_edge = do_select
                             except AttributeError:
                                 pass
                     dirty = True

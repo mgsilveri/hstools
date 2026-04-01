@@ -1698,6 +1698,96 @@ def _stop_uv_distortion_viz():
         state._uv_distortion_draw_handle = None
 
 
+# ── UV active-face normalisation ──────────────────────────────────────────────
+# Blender draws the "active" face (last selected) with a distinct bright tint
+# that differs from regular selected faces.  This POST_VIEW callback overpaints
+# the active face with the theme's face_select colour so it is visually
+# indistinguishable from any other selected face.
+
+def _uv_active_face_draw_callback() -> None:
+    """GPU POST_PIXEL — overpaint the active UV face with the face_select colour.
+    Must be POST_PIXEL so it draws after Blender's own active-face tint (POST_VIEW)."""
+    try:
+        if state._bfv_previous_mode != 'EDIT_MESH':
+            return
+        context = bpy.context
+        if getattr(context, 'mode', None) != 'EDIT_MESH':
+            return
+        sima = context.space_data
+        if sima is None or sima.type != 'IMAGE_EDITOR':
+            return
+        region = context.region
+        if region is None or region.type != 'WINDOW':
+            return
+
+        objects = getattr(context, 'objects_in_mode_unique_data', None)
+        if not objects:
+            obj = context.edit_object
+            objects = [obj] if obj is not None else []
+
+        tris = []
+        for obj in objects:
+            if obj is None or obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            af = bm.faces.active
+            if af is None or af.hide or not af.select:
+                continue
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                continue
+            # Convert UV coords → pixel coords (POST_PIXEL space)
+            sc = [_uv_view_to_region_unclamped(region, lp[uv_layer].uv.x, lp[uv_layer].uv.y)
+                  for lp in af.loops]
+            if any(p is None for p in sc) or len(sc) < 3:
+                continue
+            # Apply same 3px inset so fill respects the wireframe gap
+            sc = _inset_uv_poly(sc, 3.0)
+            v0 = sc[0]
+            for i in range(1, len(sc) - 1):
+                tris += [v0, sc[i], sc[i + 1]]
+
+        if not tris:
+            return
+
+        # Use the theme face_select colour so the active face matches selected ones.
+        try:
+            c = bpy.context.preferences.themes[0].image_editor.face_select
+            color = (c[0], c[1], c[2], c[3] if len(c) >= 4 else 0.4)
+        except Exception:
+            color = (1.0, 0.5, 0.0, 0.4)
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        batch = batch_for_shader(shader, 'TRIS', {'pos': tris})
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        shader.uniform_float('color', color)
+        batch.draw(shader)
+        gpu.state.blend_set('NONE')
+    except Exception as _exc:
+        try:
+            gpu.state.blend_set('NONE')
+        except Exception:
+            pass
+        print(f'[UV-ACTIVE-FACE] draw EXCEPTION: {_exc}', flush=True)
+
+
+def _start_uv_active_face_viz():
+    if state._uv_active_face_draw_handle is None:
+        state._uv_active_face_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            _uv_active_face_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+
+
+def _stop_uv_active_face_viz():
+    if state._uv_active_face_draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(
+                state._uv_active_face_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._uv_active_face_draw_handle = None
+
+
 # ── UV Coverage % HUD ─────────────────────────────────────────────────────────
 # Percentage of the 0–1 UV tile covered by at least one face of every object
 # currently in edit mode, displayed as text in the lower-right corner of the

@@ -53,11 +53,11 @@ def _draw_uv_overlays_panel(self, context):
     layout = self.layout
     layout.separator()
     layout.label(text="ModoKit")
-    layout.prop(prefs, "enable_uv_boundary_overlay",  text="Seam Partner Highlight")
-    layout.prop(prefs, "enable_uv_flipped_face_viz",  text="Flipped Faces")
-    layout.prop(prefs, "enable_uv_overlap",            text="Show Overlap")
-    layout.prop(prefs, "enable_uv_distortion",         text="Show Distortion")
-    layout.prop(prefs, "enable_uv_coverage_hud",       text="Coverage % HUD")
+    col = layout.column_flow(columns=2, align=True)
+    col.prop(prefs, "enable_uv_flipped_face_viz",  text="Show Flipped")
+    col.prop(prefs, "enable_uv_overlap",            text="Show Overlap")
+    col.prop(prefs, "enable_uv_distortion",         text="Show Distortion")
+    col.prop(prefs, "enable_uv_coverage_hud",       text="Show UV Coverage")
     layout.separator()
     layout.prop(prefs, "uv_overlay_opacity",           text="Opacity")
 
@@ -147,6 +147,7 @@ def register():
                 uv_overlays._start_uv_distortion_viz()   # must register before overlap
                 uv_overlays._start_uv_overlap_viz()      # composites on top of distortion
                 uv_overlays._start_uv_coverage_hud()
+                uv_overlays._start_uv_active_face_viz()
                 uv_overlays._compute_flipped_face_uv_cache(ctx)
                 uv_overlays._compute_uv_boundary_cache(ctx)
                 screen = getattr(ctx, 'screen', None)
@@ -246,6 +247,7 @@ def unregister():
     uv_overlays._stop_uv_overlap_viz()
     uv_overlays._stop_uv_distortion_viz()
     uv_overlays._stop_uv_coverage_hud()
+    uv_overlays._stop_uv_active_face_viz()
 
     if uv_overlays._uv_seam_redraw_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
