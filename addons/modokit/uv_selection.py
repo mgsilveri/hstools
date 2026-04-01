@@ -908,9 +908,16 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
                         if uv_mode != 'VERTEX':
                             lp.uv_select_edge = do_select
 
+        if use_sync and not do_select:
+            af = bm.faces.active
+            if af is not None and af.index in island:
+                bm.faces.active = None
         if use_sync:
             bm.select_flush_mode()
         bmesh.update_edit_mesh(obj.data)
+        if use_sync:
+            _resync_uv_editor_selection(
+                context, obj, tuple(ts.mesh_select_mode), bm)
         context.area.tag_redraw()
         return {'FINISHED'}
 
@@ -1297,6 +1304,12 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
         _uv_debug_log(f"[UV-CLICK] cache size={len(self._cache)}")
         IMAGE_OT_modo_uv_paint_selection._paint(self, context, event)
 
+        if context.tool_settings.use_uv_select_sync:
+            bm = bmesh.from_edit_mesh(obj.data)
+            _resync_uv_editor_selection(
+                context, obj,
+                tuple(context.tool_settings.mesh_select_mode), bm)
+
         if context.area:
             context.area.tag_redraw()
         return {'FINISHED'}
@@ -1389,6 +1402,13 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if context.area:
                 context.area.tag_redraw()
         elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if context.tool_settings.use_uv_select_sync:
+                obj = context.edit_object
+                if obj is not None and obj.type == 'MESH':
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    _resync_uv_editor_selection(
+                        context, obj,
+                        tuple(context.tool_settings.mesh_select_mode), bm)
             return {'FINISHED'}
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
             from . import state as _state
@@ -1416,8 +1436,8 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
         from . import state as _state
         if _state._preselect_hits:
             _state._preselect_hits = []
-            if context.area:
-                context.area.tag_redraw()
+        if context.area:
+            context.area.tag_redraw()
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1484,6 +1504,8 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                 else:
                     face.select = do_select
                     if not do_select:
+                        if bm.faces.active is face:
+                            bm.faces.active = None
                         for lp in face.loops:
                             if not any(f.select for f in lp.edge.link_faces):
                                 lp.edge.select = False
