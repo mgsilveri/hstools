@@ -117,17 +117,28 @@ def _nudge_toward_camera(coords, rv3d, scale=1.0):
     depth-buffer shift is the same regardless of the angle between the surface
     and the camera — preventing silhouette bleed where a world-space nudge can
     push a vertex past the surface boundary and become visible behind the mesh.
-    scale can be increased for coplanar geometry (e.g. object wireframe)."""
+    scale can be increased for coplanar geometry (e.g. object wireframe).
+
+    The nudge is scaled per-vertex by its view-space depth so that the resulting
+    NDC depth shift stays roughly constant at any distance.  Without this, a
+    fixed world-space offset shrinks to nothing in NDC at large distances and
+    the highlight z-fights against the wireframe overlay."""
     if rv3d is None:
         return coords
     # View direction in world space (unit vector pointing from scene toward camera)
     view_dir = rv3d.view_matrix.inverted_safe().to_3x3() @ Vector((0.0, 0.0, 1.0))
     view_dir.normalize()
-    nudge = 0.0020 * scale
+    view_mat = rv3d.view_matrix
     result = []
     for co in coords:
-        v = Vector(co) + view_dir * nudge
-        result.append(tuple(v))
+        v = Vector(co)
+        # Scale nudge linearly with view-space depth so the NDC offset is
+        # roughly distance-invariant (perspective divides by z, so world-space
+        # nudge effectiveness falls off linearly with distance).
+        z_view = abs((view_mat @ v).z)
+        dist_factor = max(1.0, z_view / 5.0)
+        nudge = 0.0020 * scale * dist_factor
+        result.append(tuple(v + view_dir * nudge))
     return result
 
 
