@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "mgbaker"
+version = "1.0.0"
+name = "mgBaker"
+tagline = "Toolbag 5 and Substance Painter bake pipeline"
+maintainer = "Hector Silveri"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+tags = ["Pipeline", "Import-Export"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+  "templates/",
+]
