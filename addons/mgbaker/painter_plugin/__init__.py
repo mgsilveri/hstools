@@ -10,6 +10,8 @@ Install via the mgBaker Blender addon: Preferences -> Install Painter Plugin.
 
 from __future__ import annotations
 
+PLUGIN_VERSION = "1.0.0"
+
 import json
 import math
 import os
@@ -72,9 +74,9 @@ def _import_texture_as_mesh_map(ts, usage, file_path):
     try:
         res = resource.import_project_resource(file_path, resource.Usage.TEXTURE)
         ts.set_mesh_map_resource(usage, res.identifier())
-        print(f"[{PLUGIN_NAME}] {ts.name()}: {usage.name} <- {os.path.basename(file_path)}")
+        print(f"[{PLUGIN_NAME}] {ts.name}: {usage.name} <- {os.path.basename(file_path)}")
     except Exception as exc:
-        print(f"[{PLUGIN_NAME}] {ts.name()}: failed to set {usage.name}: {exc}")
+        print(f"[{PLUGIN_NAME}] {ts.name}: failed to set {usage.name}: {exc}")
 
 
 def _import_existing_bakes_for_ts(ts, mat_name, bakes_dir):
@@ -100,7 +102,7 @@ def _import_existing_bakes(config):
 
     groups = config.get("groups")
     if groups:
-        ts_by_name = {ts.name(): ts for ts in all_ts}
+        ts_by_name = {ts.name: ts for ts in all_ts}
         for grp in groups:
             mat_name = grp.get("mat_name", "")
             ts = ts_by_name.get(mat_name)
@@ -120,7 +122,7 @@ def _import_existing_bakes(config):
 
 def _configure_baking_for_ts(ts, grp):
     """Configure resolution, HP mesh, cage offset and enabled bakers for ts."""
-    ts_name = ts.name()
+    ts_name = ts.name
     width = grp.get("output_width", 2048)
     height = grp.get("output_height", 2048)
     log2_w = int(math.log2(width)) if width > 0 else 11
@@ -183,7 +185,7 @@ def _configure_baking(config):
 
     groups = config.get("groups")
     if groups:
-        ts_by_name = {ts.name(): ts for ts in all_ts}
+        ts_by_name = {ts.name: ts for ts in all_ts}
         for grp in groups:
             mat_name = grp.get("mat_name", "")
             ts = ts_by_name.get(mat_name)

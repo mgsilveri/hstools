@@ -41,10 +41,62 @@ _MAP_DEFS = [
     ("bake_thickness",    "Thickness",           "_thickness"),
     ("bake_position",     "Position",            "_position"),
     ("bake_uv_islands",   "UV Island",           "_uv_islands"),
+    ("bake_opacity",      "Transparency",        "_opacity"),
+    ("bake_height",       "Height",              "_height"),
 ]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+# ── Painter plugin helpers ───────────────────────────────────────────────
+
+_PAINTER_PLUGIN_DIR = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Documents", "Adobe", "Adobe Substance 3D Painter",
+    "python", "plugins", "mgbaker",
+)
+_PAINTER_PLUGIN_SRC = os.path.join(os.path.dirname(__file__), "painter_plugin", "__init__.py")
+
+
+def _read_plugin_version(filepath: str) -> str:
+    """Read PLUGIN_VERSION = "x.y.z" from a plugin __init__.py without importing it."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("PLUGIN_VERSION"):
+                    return line.split('"')[1]
+    except Exception:
+        pass
+    return ""
+
+
+def _ensure_painter_plugin() -> str:
+    """Install or update the Painter plugin if needed.
+
+    Returns a log line describing what happened, or "" if already up to date.
+    """
+    if not os.path.isfile(_PAINTER_PLUGIN_SRC):
+        return ""
+
+    src_version = _read_plugin_version(_PAINTER_PLUGIN_SRC)
+    dest_file = os.path.join(_PAINTER_PLUGIN_DIR, "__init__.py")
+
+    if os.path.isfile(dest_file):
+        dest_version = _read_plugin_version(dest_file)
+        if dest_version == src_version:
+            return ""  # already up to date
+        action = f"updated {dest_version} → {src_version}"
+    else:
+        action = f"installed v{src_version}"
+
+    try:
+        os.makedirs(_PAINTER_PLUGIN_DIR, exist_ok=True)
+        shutil.copy2(_PAINTER_PLUGIN_SRC, dest_file)
+        return f"✓ Painter plugin {action}"
+    except Exception as exc:
+        return f"⚠ Painter plugin install failed: {exc}"
+
 
 def _bakes_dir() -> str:
     """Return the absolute bakes directory, creating it if needed."""
@@ -95,37 +147,59 @@ def _add_triangulate_modifier(obj):
     mod.ngon_method = 'BEAUTY'
 
 
-def _add_smooth_by_angle(obj):
-    """Add a Smooth by Angle modifier (Blender 4.1+).
+def _apply_smooth_by_uv(obj):
+    """Mark edges sharp at UV island boundaries; smooth all other faces.
 
-    Uses the built-in 'Smooth by Angle' geometry node group shipped with Blender.
-    If the node group isn't loaded yet, temporarily sets *obj* as active and uses
-    the operator to append it from the bundled assets.
+    Ensures tangent-space normal-map splits align exactly with UV seams,
+    preventing bake artifacts in Toolbag / Painter.  Must be called after
+    modifiers are applied so the final UV layout is used.
     """
-    ng = bpy.data.node_groups.get("Smooth by Angle")
-    if ng is None:
-        # Need to use the operator to load the bundled asset.
-        prev_active = bpy.context.view_layer.objects.active
-        try:
-            bpy.context.view_layer.objects.active = obj
-            bpy.ops.object.modifier_add(type='SMOOTH_BY_ANGLE')
-            # The operator added a modifier with the node group — we're done.
-            return
-        except Exception:
-            pass
-        finally:
-            bpy.context.view_layer.objects.active = prev_active
-        # If the operator failed, nothing we can do — skip silently.
+    import bmesh
+    mesh = obj.data
+
+    # Smooth all faces first.
+    for poly in mesh.polygons:
+        poly.use_smooth = True
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        bm.free()
         return
 
-    mod = obj.modifiers.new("__mgbaker_smooth__", 'NODES')
-    mod.node_group = ng
+    for edge in bm.edges:
+        if not edge.is_manifold or len(edge.link_loops) != 2:
+            # Boundary / non-manifold edge — keep sharp.
+            edge.smooth = False
+            continue
+
+        l0 = edge.link_loops[0]
+        l1 = edge.link_loops[1]
+        # l0 and l1 wind in opposite directions around the shared edge:
+        #   l0.vert       == l1.link_loop_next.vert  (vertex A)
+        #   l0.link_loop_next.vert == l1.vert         (vertex B)
+        uv_a0 = l0[uv_layer].uv
+        uv_a1 = l1.link_loop_next[uv_layer].uv
+        uv_b0 = l0.link_loop_next[uv_layer].uv
+        uv_b1 = l1[uv_layer].uv
+
+        seam = (
+            (uv_a0 - uv_a1).length > 1e-5
+            or (uv_b0 - uv_b1).length > 1e-5
+        )
+        edge.smooth = not seam
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
 
 
 def _prepare_collection(source_col, group):
     """Duplicate all meshes from *source_col* into a temp collection.
 
-    Applies modifiers, triangulate, smooth-by-angle, and export-at-origin
+    Applies modifiers, smooth-by-uv, triangulate, and export-at-origin
     according to group settings.  Returns the temp collection (caller must
     clean up via ``_cleanup_temp_collection``).
     """
@@ -139,11 +213,11 @@ def _prepare_collection(source_col, group):
         dup.data = obj.data.copy()
         temp_col.objects.link(dup)
 
-        if group.smooth_by_angle:
-            _add_smooth_by_angle(dup)
-
         if group.apply_modifiers:
             _apply_modifiers_depsgraph(dup)
+
+        if group.smooth_by_uv:
+            _apply_smooth_by_uv(dup)
 
         if group.triangulate:
             _add_triangulate_modifier(dup)
@@ -207,7 +281,6 @@ def _export_combined_lp_fbx(groups, bakes_dir):
     """
     blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
     filepath = os.path.join(bakes_dir, f"{blend_name}_lp.fbx")
-    p4.p4_checkout(filepath, p4.get_cl_description())
 
     temp_cols = []
     try:
@@ -251,9 +324,6 @@ def _export_group_fbx(group, suffix, collection):
     out_name = get_output_name(group)
     filepath = os.path.join(_bakes_dir(), f"{out_name}{suffix}.fbx")
 
-    # P4 checkout
-    p4.p4_checkout(filepath, p4.get_cl_description())
-
     temp_col = None
     try:
         temp_col = _prepare_collection(collection, group)
@@ -281,7 +351,6 @@ def _export_per_group_fbx(groups, bakes_dir):
     results = []
     for group in groups:
         fbx_path = os.path.join(bakes_dir, f"{group.name}.fbx")
-        p4.p4_checkout(fbx_path, p4.get_cl_description())
 
         temp_col = bpy.data.collections.new("__mgbaker_combined__")
         bpy.context.scene.collection.children.link(temp_col)
@@ -435,12 +504,28 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
 class MG_OT_ExportToToolbag(bpy.types.Operator):
     bl_idname = "mg.export_to_toolbag"
     bl_label = "Export to Toolbag"
-    bl_description = "Export checked groups as FBX and launch Marmoset Toolbag with bake configuration"
+    bl_description = (
+        "Export and launch Marmoset Toolbag | "
+        "Shift: Delete mode | "
+        "Ctrl+Shift: Open .tbscene folder"
+    )
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
         return bool(bpy.data.filepath)
+
+    def invoke(self, context, event):
+        if event.shift and event.ctrl:
+            bakes = _bakes_dir()
+            os.startfile(bakes)
+            return {'FINISHED'}
+        if event.shift:
+            context.window_manager.mg_baker_delete_mode = True
+            for area in context.screen.areas:
+                area.tag_redraw()
+            return {'FINISHED'}
+        return self.execute(context)
 
     def execute(self, context):
         if not bpy.data.filepath:
@@ -525,12 +610,30 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
 class MG_OT_ExportToPainter(bpy.types.Operator):
     bl_idname = "mg.export_to_painter"
     bl_label = "Export to Painter"
-    bl_description = "Export LP FBX, write relay config, and launch Substance Painter"
+    bl_description = (
+        "Export and launch Substance Painter | "
+        "Shift: delete mode | "
+        "Ctrl+Shift: Open .spp folder"
+    )
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
         return bool(bpy.data.filepath)
+
+    def invoke(self, context, event):
+        if event.shift and event.ctrl:
+            blend_dir = os.path.dirname(bpy.data.filepath)
+            textures_dir = os.path.join(blend_dir, "textures")
+            folder = textures_dir if os.path.isdir(textures_dir) else blend_dir
+            os.startfile(folder)
+            return {'FINISHED'}
+        if event.shift:
+            context.window_manager.mg_baker_delete_mode = True
+            for area in context.screen.areas:
+                area.tag_redraw()
+            return {'FINISHED'}
+        return self.execute(context)
 
     def execute(self, context):
         if not bpy.data.filepath:
@@ -551,6 +654,10 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
         blend_dir = os.path.dirname(bpy.data.filepath)
         blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
         log_lines = []
+
+        plugin_log = _ensure_painter_plugin()
+        if plugin_log:
+            log_lines.append(plugin_log)
 
         # Export combined LP FBX (all groups into one file so Painter sees all texture sets)
         lp_fbx = _export_combined_lp_fbx(groups, bakes)
@@ -648,6 +755,112 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ── Delete source files helpers ───────────────────────────────────────────
+
+def _collect_toolbag_files(context) -> list:
+    """Return existing Toolbag source files (per-group FBX + .tbscene)."""
+    if not bpy.data.filepath:
+        return []
+    bakes = _bakes_dir()
+    blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+    candidates = [os.path.join(bakes, f"{g.name}.fbx")
+                  for g in context.scene.mg_export_groups]
+    candidates.append(os.path.join(bakes, f"{blend_name}.tbscene"))
+    return [p for p in candidates if os.path.isfile(p)]
+
+
+def _collect_painter_files(context) -> list:
+    """Return existing Painter source files (combined LP FBX + per-group HP FBX)."""
+    if not bpy.data.filepath:
+        return []
+    bakes = _bakes_dir()
+    blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+    candidates = [os.path.join(bakes, f"{blend_name}_lp.fbx")]
+    for g in context.scene.mg_export_groups:
+        candidates.append(os.path.join(bakes, f"{get_output_name(g)}_hp.fbx"))
+    return [p for p in candidates if os.path.isfile(p)]
+
+
+def _exit_delete_mode(context) -> None:
+    context.window_manager.mg_baker_delete_mode = False
+    for area in context.screen.areas:
+        area.tag_redraw()
+
+
+# ── Delete Toolbag Source Files ───────────────────────────────────────────
+
+class MG_OT_DeleteToolbagFiles(bpy.types.Operator):
+    bl_idname = "mg.delete_toolbag_files"
+    bl_label = "Delete Toolbag Source Files"
+    bl_description = "Delete Toolbag FBX and .tbscene files from disk and revert them from Perforce. Shift+Click to cancel"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def invoke(self, context, event):
+        if event.shift:
+            _exit_delete_mode(context)
+            return {'FINISHED'}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        files = _collect_toolbag_files(context)
+        deleted = []
+        for f in files:
+            p4.p4_revert(f)
+            try:
+                os.remove(f)
+                deleted.append(os.path.basename(f))
+            except Exception as exc:
+                print(f"[mgBaker] Delete failed for {f}: {exc}")
+        p4.p4_delete_cl_if_empty(p4.get_cl_description())
+        _exit_delete_mode(context)
+        if deleted:
+            self.report({'INFO'}, f"Deleted: {', '.join(deleted)}")
+        else:
+            self.report({'WARNING'}, "No Toolbag source files found to delete.")
+        return {'FINISHED'}
+
+
+# ── Delete Painter Source Files ───────────────────────────────────────────
+
+class MG_OT_DeletePainterFiles(bpy.types.Operator):
+    bl_idname = "mg.delete_painter_files"
+    bl_label = "Delete Painter Source Files"
+    bl_description = "Delete Painter LP/HP FBX files from disk and revert them from Perforce. Shift+Click to cancel"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def invoke(self, context, event):
+        if event.shift:
+            _exit_delete_mode(context)
+            return {'FINISHED'}
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        files = _collect_painter_files(context)
+        deleted = []
+        for f in files:
+            p4.p4_revert(f)
+            try:
+                os.remove(f)
+                deleted.append(os.path.basename(f))
+            except Exception as exc:
+                print(f"[mgBaker] Delete failed for {f}: {exc}")
+        p4.p4_delete_cl_if_empty(p4.get_cl_description())
+        _exit_delete_mode(context)
+        if deleted:
+            self.report({'INFO'}, f"Deleted: {', '.join(deleted)}")
+        else:
+            self.report({'WARNING'}, "No Painter source files found to delete.")
+        return {'FINISHED'}
+
+
 # ── Export FBX Only ───────────────────────────────────────────────────────
 
 class MG_OT_ExportFBXOnly(bpy.types.Operator):
@@ -699,5 +912,23 @@ class MG_OT_OpenBakesFolder(bpy.types.Operator):
 
     def execute(self, context):
         folder = _bakes_dir()
+        os.startfile(folder)
+        return {'FINISHED'}
+
+
+class MG_OT_OpenTexturesFolder(bpy.types.Operator):
+    bl_idname = "mg.open_textures_folder"
+    bl_label = "Open Textures Folder"
+    bl_description = "Open the textures folder (.spp output) in Explorer"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        blend_dir = os.path.dirname(bpy.data.filepath)
+        folder = os.path.join(blend_dir, "textures")
+        os.makedirs(folder, exist_ok=True)
         os.startfile(folder)
         return {'FINISHED'}

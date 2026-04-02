@@ -56,14 +56,17 @@ _ALL_CLASSES = (
     baker_ops.MG_OT_AssignCollectionLP,
     baker_ops.MG_OT_ClearCollectionAssignment,
     # Install Painter plugin
-    baker_ops.MG_OT_InstallPainterPlugin,
+    # (auto-installed on first Export to Painter — no manual step needed)
     # Log
     baker_ops.MG_OT_CopyLog,
     # Export operators
     export_ops.MG_OT_ExportToToolbag,
     export_ops.MG_OT_ExportToPainter,
+    export_ops.MG_OT_DeleteToolbagFiles,
+    export_ops.MG_OT_DeletePainterFiles,
     export_ops.MG_OT_ExportFBXOnly,
     export_ops.MG_OT_OpenBakesFolder,
+    export_ops.MG_OT_OpenTexturesFolder,
     # Panels (parent first, then children)
     baker_panel.MG_PT_Baker,
     baker_panel.MG_PT_ExportGroups,
@@ -92,6 +95,11 @@ def register():
 
     baker_props.register()
 
+    bpy.types.WindowManager.mg_baker_delete_mode = bpy.props.BoolProperty(
+        name="Delete Mode",
+        default=False,
+    )
+
     # Outliner right-click menu injection
     bpy.types.OUTLINER_MT_collection.append(baker_ops._draw_outliner_collection_menu)
 
@@ -104,6 +112,9 @@ def unregister():
 
     for cls in reversed(_ALL_CLASSES):
         bpy.utils.unregister_class(cls)
+
+    if hasattr(bpy.types.WindowManager, "mg_baker_delete_mode"):
+        del bpy.types.WindowManager.mg_baker_delete_mode
 
     if _icon_previews:
         bpy.utils.previews.remove(_icon_previews)

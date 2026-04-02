@@ -72,11 +72,13 @@ class MG_ExportGroup(bpy.types.PropertyGroup):
     bake_thickness: BoolProperty(name="Thickness", default=False)
     bake_position: BoolProperty(name="Position", default=False)
     bake_uv_islands: BoolProperty(name="UV Islands", default=False)
+    bake_opacity: BoolProperty(name="Opacity", default=False)
+    bake_height: BoolProperty(name="Height", default=False)
 
     # ── export options ────────────────────────────────────────────────────
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=True)
     triangulate: BoolProperty(name="Triangulate", default=True)
-    smooth_by_angle: BoolProperty(name="Smooth by Angle", default=True)
+    smooth_by_uv: BoolProperty(name="Smooth by UV", default=True)
     export_at_origin: BoolProperty(name="Export at Origin", default=False)
 
 
@@ -93,23 +95,10 @@ class MG_LogLine(bpy.types.PropertyGroup):
 def _group_status(group):
     """Return a status string for the UIList row icon.
 
-    'OK'    – both HP and LP assigned and valid
-    'WARN'  – one of HP/LP missing
-    'ERROR' – a pointer is set but the collection was deleted
+    'OK'   – both HP and LP assigned
+    'WARN' – one or both of HP/LP missing
     """
-    hp = group.hp_collection
-    lp = group.lp_collection
-
-    # Broken pointer: Blender keeps the PointerProperty id but the data is gone
-    hp_name = getattr(hp, 'name', None) if hp else None
-    lp_name = getattr(lp, 'name', None) if lp else None
-
-    hp_broken = hp is not None and hp_name is None
-    lp_broken = lp is not None and lp_name is None
-
-    if hp_broken or lp_broken:
-        return 'ERROR'
-    if hp is None or lp is None:
+    if group.hp_collection is None or group.lp_collection is None:
         return 'WARN'
     return 'OK'
 

@@ -12,6 +12,55 @@ import bpy
 from .baker_props import _group_status
 
 
+def _get_lp_materials(group):
+    """Return ordered unique materials from all LP mesh objects in *group*.
+
+    Traverses the LP collection and all nested child collections.
+    Returns a list of ``bpy.types.Material`` (no duplicates, order of first
+    encounter preserved).
+    """
+    if group.lp_collection is None:
+        return []
+
+    seen = set()
+    materials = []
+
+    def _collect(col):
+        for obj in col.objects:
+            if obj.type != 'MESH':
+                continue
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is not None and mat.name not in seen:
+                    seen.add(mat.name)
+                    materials.append(mat)
+        for child in col.children:
+            _collect(child)
+
+    _collect(group.lp_collection)
+    return materials
+
+
+def _has_empty_material_slots(group):
+    """Return True if any LP mesh object has an empty material slot."""
+    if group.lp_collection is None:
+        return False
+
+    def _check(col):
+        for obj in col.objects:
+            if obj.type != 'MESH':
+                continue
+            for slot in obj.material_slots:
+                if slot.material is None:
+                    return True
+        for child in col.children:
+            if _check(child):
+                return True
+        return False
+
+    return _check(group.lp_collection)
+
+
 # ── Main panel (tab) ─────────────────────────────────────────────────────
 
 class MG_PT_Baker(bpy.types.Panel):
@@ -65,9 +114,6 @@ class MG_PT_ExportGroups(bpy.types.Panel):
         sub = row.row(align=True)
         sub.label(text="", icon='ERROR')
         sub.label(text="Incomplete")
-        sub = row.row(align=True)
-        sub.label(text="", icon='CANCEL')
-        sub.label(text="Broken")
 
 
 # ── Group Settings ────────────────────────────────────────────────────────
@@ -100,17 +146,44 @@ class MG_PT_GroupSettings(bpy.types.Panel):
 
         # ── Collections ──
         layout.label(text="Collections", icon='OUTLINER_COLLECTION')
-        col = layout.column(align=True)
-        col.prop_search(grp, "hp_collection", bpy.data, "collections", text="HP")
-        col.prop_search(grp, "lp_collection", bpy.data, "collections", text="LP")
+        box = layout.box()
+        col = box.column(align=True)
+        split = col.split(factor=0.12, align=True)
+        split.label(text="HP:")
+        split.prop_search(grp, "hp_collection", bpy.data, "collections", text="")
+        split = col.split(factor=0.12, align=True)
+        split.label(text="LP:")
+        split.prop_search(grp, "lp_collection", bpy.data, "collections", text="")
 
-        layout.separator()
+        layout.separator(type='LINE')
+
+        # ── Materials ──
+        mats = _get_lp_materials(grp)
+        layout.label(text="Materials", icon='MATERIAL')
+        box = layout.box()
+        if mats:
+            if _has_empty_material_slots(grp):
+                box.label(text="Empty material slot(s) detected", icon='ERROR')
+            col = box.column(align=True)
+            for i, mat in enumerate(mats, 1):
+                row = col.row(align=True)
+                has_problem = not mat.name or any(
+                    c in mat.name for c in (' ', '\t', '/', '\\', ':', '*', '?', '"', '<', '>', '|')
+                )
+                row.alert = has_problem
+                split = row.split(factor=0.08, align=True)
+                split.label(text=f"{i}:")
+                split.prop(mat, "name", text="", icon='ERROR' if has_problem else 'MATERIAL')
+        else:
+            box.label(text="No LP collection assigned", icon='INFO')
+
+        layout.separator(type='LINE')
 
         # ── Cage ──
         layout.label(text="Cage", icon='MOD_LATTICE')
         layout.prop(grp, "cage_offset", text="Offset")
 
-        layout.separator()
+        layout.separator(type='LINE')
 
         # ── Bake Resolution ──
         layout.label(text="Bake Resolution", icon='IMAGE_DATA')
@@ -122,12 +195,11 @@ class MG_PT_GroupSettings(bpy.types.Panel):
         split.label(text="Y")
         split.row(align=True).prop(grp, "res_y", expand=True)
 
-        layout.separator()
+        layout.separator(type='LINE')
 
         # ── Bake Maps ──
         layout.label(text="Bake Maps", icon='RENDERLAYERS')
-        col = layout.column(align=True)
-        flow = col.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
+        flow = layout.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
         flow.prop(grp, "bake_normal", text="Normal")
         flow.prop(grp, "bake_ao", text="AO")
         flow.prop(grp, "bake_curvature", text="Curvature")
@@ -136,15 +208,17 @@ class MG_PT_GroupSettings(bpy.types.Panel):
         flow.prop(grp, "bake_thickness", text="Thickness")
         flow.prop(grp, "bake_position", text="Position")
         flow.prop(grp, "bake_uv_islands", text="UV Islands")
+        flow.prop(grp, "bake_opacity", text="Opacity")
+        flow.prop(grp, "bake_height", text="Height")
 
-        layout.separator()
+        layout.separator(type='LINE')
 
         # ── Export Options ──
         layout.label(text="Export Options", icon='EXPORT')
         flow = layout.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=True, align=True)
         flow.prop(grp, "apply_modifiers")
         flow.prop(grp, "triangulate")
-        flow.prop(grp, "smooth_by_angle")
+        flow.prop(grp, "smooth_by_uv")
         flow.prop(grp, "export_at_origin")
 
 
@@ -165,20 +239,29 @@ class MG_PT_Export(bpy.types.Panel):
     def draw(self, context):
         from . import get_icon
         layout = self.layout
+        wm = context.window_manager
+        delete_mode = wm.mg_baker_delete_mode
 
         col = layout.column(align=True)
         col.scale_y = 1.2
-        icon_tb = get_icon("toolbag")
-        icon_pa = get_icon("painter")
-        col.operator("mg.export_to_toolbag", icon_value=icon_tb if icon_tb else 0,
-                     icon='SHADING_RENDERED' if not icon_tb else 'NONE')
-        col.operator("mg.export_to_painter", icon_value=icon_pa if icon_pa else 0,
-                     icon='BRUSH_DATA' if not icon_pa else 'NONE')
+        if delete_mode:
+            col.alert = True
+            col.operator("mg.delete_toolbag_files", icon='TRASH')
+            col.operator("mg.delete_painter_files", icon='TRASH')
+            col.alert = False
+        else:
+            icon_tb = get_icon("toolbag")
+            icon_pa = get_icon("painter")
+            col.operator("mg.export_to_toolbag", icon_value=icon_tb if icon_tb else 0,
+                         icon='SHADING_RENDERED' if not icon_tb else 'NONE')
+            col.operator("mg.export_to_painter", icon_value=icon_pa if icon_pa else 0,
+                         icon='BRUSH_DATA' if not icon_pa else 'NONE')
 
         layout.separator()
         col = layout.column(align=True)
         col.operator("mg.export_fbx_only", icon='EXPORT')
         col.operator("mg.open_bakes_folder", icon='FILE_FOLDER')
+        col.operator("mg.open_textures_folder", icon='FILE_FOLDER')
 
 
 # ── Preferences (inline) ─────────────────────────────────────────────────
@@ -209,14 +292,6 @@ class MG_PT_PanelPrefs(bpy.types.Panel):
         layout.separator()
         layout.prop(prefs, "p4_auto_checkout")
         layout.prop(prefs, "launch_app_after_export")
-
-        layout.separator()
-        layout.label(text="Painter Plugin", icon='PLUGIN')
-        box = layout.box()
-        box.scale_y = 0.8
-        box.label(text="The mgBaker Painter plugin must be")
-        box.label(text="installed once to enable bake automation.")
-        layout.operator("mg.install_painter_plugin", icon='IMPORT')
 
 
 # ── Log ───────────────────────────────────────────────────────────────────

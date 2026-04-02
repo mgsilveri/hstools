@@ -206,6 +206,52 @@ def p4_checkout(filepath: str, cl_description: str) -> None:
         print(f"[mgBaker P4] checkout failed for {filepath}: {exc}")
 
 
+def p4_revert(filepath: str) -> None:
+    """Revert *filepath* in Perforce if it is currently open for edit or add.
+
+    Silently no-ops when P4 auto-checkout is off, ``p4`` is not on PATH,
+    the file is not open, or any command fails.
+    """
+    if not _prefs_enabled() or not _p4_available():
+        return
+    try:
+        fstat = _run_p4("fstat", filepath)
+        # "... action" key is only present when the file is open in the workspace.
+        if fstat and "... action" in fstat:
+            _run_p4("revert", filepath)
+    except Exception as exc:
+        print(f"[mgBaker P4] revert failed for {filepath}: {exc}")
+
+
+def p4_delete_cl_if_empty(cl_description: str) -> None:
+    """Delete the named pending changelist if it has no open files.
+
+    Also removes it from the local cache so a fresh CL is created next time.
+    """
+    if not _prefs_enabled() or not _p4_available():
+        return
+    cl_id = _cl_id_cache.get(cl_description)
+    if cl_id is None:
+        return
+    try:
+        # p4 describe -s lists files still open in the CL.
+        out = _run_p4("describe", "-s", str(cl_id))
+        if out is None:
+            return
+        # If no "Affected files" section (or it only shows the header with no paths)
+        # the changelist is empty and safe to delete.
+        has_files = any(
+            line.strip().startswith("... //")
+            for line in out.splitlines()
+        )
+        if not has_files:
+            _run_p4("change", "-d", str(cl_id))
+            _cl_id_cache.pop(cl_description, None)
+            print(f"[mgBaker P4] Deleted empty changelist {cl_id}")
+    except Exception as exc:
+        print(f"[mgBaker P4] delete CL failed for {cl_id}: {exc}")
+
+
 def delayed_checkout_tbscene(tbscene_path: str, cl_description: str, max_wait: float = 120.0) -> None:
     """Poll for *tbscene_path* to appear on disk, then P4 checkout it.
 

@@ -14,6 +14,29 @@ from .baker_props import _group_status
 
 
 # ── UIList ────────────────────────────────────────────────────────────────
+class MG_UL_MaterialSlots(bpy.types.UIList):
+    bl_idname = "MG_UL_MaterialSlots"
+
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index):
+        mat = item.mat
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            if mat:
+                has_problem = not mat.name or any(
+                    c in mat.name
+                    for c in (' ', '\t', '/', '\\', ':', '*', '?', '"', '<', '>', '|')
+                )
+                row.alert = has_problem
+                split = row.split(factor=0.08, align=True)
+                split.label(text=f"{index + 1}:")
+                split.prop(mat, "name", text="",
+                           icon='ERROR' if has_problem else 'MATERIAL')
+            else:
+                row.label(text=f"{index + 1}: (empty slot)", icon='ERROR')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='MATERIAL')
 
 class MG_UL_ExportGroups(bpy.types.UIList):
     bl_idname = "MG_UL_ExportGroups"
@@ -29,10 +52,8 @@ class MG_UL_ExportGroups(bpy.types.UIList):
             status = _group_status(item)
             if status == 'OK':
                 row.label(text="", icon='CHECKMARK')
-            elif status == 'WARN':
-                row.label(text="", icon='ERROR')
             else:
-                row.label(text="", icon='CANCEL')
+                row.label(text="", icon='ERROR')
 
             # Name
             row.prop(item, "name", text="", emboss=False)
@@ -233,43 +254,4 @@ class MG_OT_CopyLog(bpy.types.Operator):
         lines = [item.text for item in context.scene.mg_export_log]
         context.window_manager.clipboard = "\n".join(lines)
         self.report({'INFO'}, "Log copied to clipboard")
-        return {'FINISHED'}
-
-
-# ── Install Painter Plugin ────────────────────────────────────────────────
-
-class MG_OT_InstallPainterPlugin(bpy.types.Operator):
-    bl_idname = "mg.install_painter_plugin"
-    bl_label = "Install Painter Plugin"
-    bl_description = "Copy the mgBaker plugin files to the Substance Painter plugins directory"
-
-    def execute(self, context):
-        user_profile = os.environ.get("USERPROFILE", "")
-        if not user_profile:
-            self.report({'ERROR'}, "Cannot determine USERPROFILE")
-            return {'CANCELLED'}
-
-        dest_dir = os.path.join(
-            user_profile,
-            "Documents",
-            "Adobe",
-            "Adobe Substance 3D Painter",
-            "python",
-            "plugins",
-            "mgbaker",
-        )
-
-        # Source: bundled painter plugin next to this file
-        src_dir = os.path.join(os.path.dirname(__file__), "painter_plugin")
-        src_file = os.path.join(src_dir, "__init__.py")
-
-        if not os.path.isfile(src_file):
-            self.report({'ERROR'}, f"Plugin source not found: {src_file}")
-            return {'CANCELLED'}
-
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_file = os.path.join(dest_dir, "__init__.py")
-        shutil.copy2(src_file, dest_file)
-
-        self.report({'INFO'}, f"Plugin installed to {dest_dir}")
         return {'FINISHED'}
