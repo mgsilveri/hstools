@@ -60,7 +60,24 @@ def _store_log(context, log_lines):
     """Persist log lines to scene property and print to console."""
     for line in log_lines:
         print(f"[mgBaker] {line}")
-    context.scene.mg_export_log = "\n".join(log_lines)
+    log = context.scene.mg_export_log
+    log.clear()
+    for line in log_lines:
+        if not line:
+            continue
+        item = log.add()
+        if line.startswith("\u2713"):
+            item.level = 'OK'
+            item.text = line[1:].lstrip()
+        elif line.startswith("\u2717") or line.startswith("\u26a0"):
+            item.level = 'WARN'
+            item.text = line[1:].lstrip()
+        elif line.startswith("\u25bc"):
+            item.level = 'SECTION'
+            item.text = line[1:].lstrip()
+        else:
+            item.level = 'INFO'
+            item.text = line
 
 
 def _apply_modifiers_depsgraph(obj):
@@ -477,7 +494,7 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                 log_lines.append("⚠ Toolbag open — FBX updated on disk (auto-reloads). Close Toolbag and re-export to update baker settings.")
             else:
                 os.system(f'start "" "{toolbag_exe}" "{script_path}"')
-                log_lines.append("✓ Toolbag launched with bake script")
+                log_lines.append("✓ Toolbag launched")
 
                 # Delayed P4 checkout for the .tbscene
                 p4.delayed_checkout_tbscene(tbscene_out, p4.get_cl_description())

@@ -13,6 +13,8 @@ bl_info = {
 }
 
 import bpy
+import bpy.utils.previews
+import os
 
 from . import (
     prefs,
@@ -21,6 +23,15 @@ from . import (
     export_ops,
     baker_panel,
 )
+
+_icon_previews = None
+
+
+def get_icon(name: str) -> int:
+    """Return the icon_id for a loaded custom icon, or 0 if not available."""
+    if _icon_previews and name in _icon_previews:
+        return _icon_previews[name].icon_id
+    return 0
 
 
 # ============================================================================
@@ -31,9 +42,11 @@ _ALL_CLASSES = (
     # Preferences
     prefs.MG_BakerPreferences,
     # PropertyGroup
+    baker_props.MG_LogLine,
     baker_props.MG_ExportGroup,
     # UIList
     baker_ops.MG_UL_ExportGroups,
+    baker_ops.MG_UL_LogList,
     # Group CRUD operators
     baker_ops.MG_OT_AddGroup,
     baker_ops.MG_OT_RemoveGroup,
@@ -44,6 +57,8 @@ _ALL_CLASSES = (
     baker_ops.MG_OT_ClearCollectionAssignment,
     # Install Painter plugin
     baker_ops.MG_OT_InstallPainterPlugin,
+    # Log
+    baker_ops.MG_OT_CopyLog,
     # Export operators
     export_ops.MG_OT_ExportToToolbag,
     export_ops.MG_OT_ExportToPainter,
@@ -64,6 +79,14 @@ _ALL_CLASSES = (
 # ============================================================================
 
 def register():
+    global _icon_previews
+    _icon_previews = bpy.utils.previews.new()
+    icons_dir = os.path.join(os.path.dirname(__file__), "icons")
+    for name in ("toolbag", "painter"):
+        path = os.path.join(icons_dir, f"{name}.png")
+        if os.path.isfile(path):
+            _icon_previews.load(name, path, 'IMAGE')
+
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
 
@@ -74,9 +97,14 @@ def register():
 
 
 def unregister():
+    global _icon_previews
     bpy.types.OUTLINER_MT_collection.remove(baker_ops._draw_outliner_collection_menu)
 
     baker_props.unregister()
 
     for cls in reversed(_ALL_CLASSES):
         bpy.utils.unregister_class(cls)
+
+    if _icon_previews:
+        bpy.utils.previews.remove(_icon_previews)
+        _icon_previews = None

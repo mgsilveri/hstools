@@ -80,6 +80,14 @@ class MG_ExportGroup(bpy.types.PropertyGroup):
     export_at_origin: BoolProperty(name="Export at Origin", default=False)
 
 
+class MG_LogLine(bpy.types.PropertyGroup):
+    """One log line stored in the export log collection."""
+
+    text: StringProperty(name="Text", default="")
+    # INFO | OK | WARN | SECTION
+    level: StringProperty(name="Level", default="INFO")
+
+
 # ── helpers ───────────────────────────────────────────────────────────────
 
 def _group_status(group):
@@ -124,10 +132,12 @@ def get_output_name(group):
 def register():
     bpy.types.Scene.mg_export_groups = CollectionProperty(type=MG_ExportGroup)
     bpy.types.Scene.mg_active_group_index = IntProperty()
-    bpy.types.Scene.mg_export_log = StringProperty(default="")
+    bpy.types.Scene.mg_export_log = CollectionProperty(type=MG_LogLine)
+    bpy.types.Scene.mg_export_log_index = IntProperty()
 
 
 def unregister():
+    del bpy.types.Scene.mg_export_log_index
     del bpy.types.Scene.mg_export_log
     del bpy.types.Scene.mg_active_group_index
     del bpy.types.Scene.mg_export_groups

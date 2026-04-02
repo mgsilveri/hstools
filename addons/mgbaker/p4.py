@@ -17,6 +17,11 @@ from typing import Optional
 import bpy
 
 
+# Cached changelist IDs keyed by description — avoids repeated p4 round-trips
+# and prevents a new CL being created when p4 changes output truncates descriptions.
+_cl_id_cache: dict = {}
+
+
 # ── internal helpers ──────────────────────────────────────────────────────
 
 def _prefs_enabled() -> bool:
@@ -67,22 +72,29 @@ def _p4_get_or_create_cl(description: str) -> Optional[int]:
 
     Returns the changelist number, or ``None`` on failure.
     """
+    # Return cached value — prevents creating a new CL on every file checkout.
+    if description in _cl_id_cache:
+        return _cl_id_cache[description]
+
     client = _p4_client()
     if client is None:
         return None
 
-    # Look for an existing pending CL with this description.
-    out = _run_p4("changes", "-s", "pending", "-c", client)
+    # Use -l (long) to get full untruncated descriptions.
+    out = _run_p4("changes", "-l", "-s", "pending", "-c", client)
     if out:
+        current_cl: Optional[int] = None
         for line in out.splitlines():
-            # "Change 12345 on 2026/04/01 by user@client 'desc text …'"
-            if description in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        return int(parts[1])
-                    except ValueError:
-                        pass
+            line_stripped = line.strip()
+            if line_stripped.startswith("Change "):
+                parts = line_stripped.split()
+                try:
+                    current_cl = int(parts[1])
+                except (IndexError, ValueError):
+                    current_cl = None
+            elif current_cl is not None and line_stripped == description:
+                _cl_id_cache[description] = current_cl
+                return current_cl
 
     # Create a new changelist.
     spec = (
@@ -103,7 +115,9 @@ def _p4_get_or_create_cl(description: str) -> Optional[int]:
         # Output: "Change 12345 created."
         for word in result.stdout.split():
             try:
-                return int(word)
+                cl_id = int(word)
+                _cl_id_cache[description] = cl_id
+                return cl_id
             except ValueError:
                 continue
     except Exception:
@@ -149,21 +163,28 @@ def _p4_add_or_edit(filepath: str, cl_id: int) -> None:
 def get_cl_description() -> str:
     """Build a changelist description.
 
-    Uses ``mg_project.projects.current_project.friendly_name`` when available,
-    otherwise falls back to the blend filename.
+    Reads the current project name from the mg_blender addon preferences
+    (``mg_blender`` → ``mgProject.current_project``) when available,
+    otherwise falls back to the blend filename alone.
     """
-    friendly = None
+    project_name = None
     try:
-        from mg_project import projects as _mg_projects
-        _proj = _mg_projects.current_project
-        if _proj is not None:
-            friendly = getattr(_proj, "friendly_name", None)
+        # Extension platform registers addons as "bl_ext.<repo>.mg_blender";
+        # legacy installs use just "mg_blender".  Match by suffix to cover both.
+        mg = bpy.context.preferences.addons.get("mg_blender")
+        if mg is None:
+            for key in bpy.context.preferences.addons.keys():
+                if key.endswith(".mg_blender"):
+                    mg = bpy.context.preferences.addons[key]
+                    break
+        if mg is not None:
+            project_name = mg.preferences.mgProject.current_project or None
     except Exception:
         pass
 
     blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-    if friendly:
-        return f"{friendly}: {blend_name}"
+    if project_name:
+        return f"{project_name}: {blend_name}"
     return blend_name
 
 

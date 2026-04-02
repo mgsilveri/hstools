@@ -37,13 +37,15 @@ class MG_UL_ExportGroups(bpy.types.UIList):
             # Name
             row.prop(item, "name", text="", emboss=False)
 
-            # Badges
+            # Badges — always rendered so columns stay aligned
             sub = row.row(align=True)
             sub.scale_x = 0.5
-            if item.hp_collection:
-                sub.label(text="HP")
-            if item.lp_collection:
-                sub.label(text="LP")
+            hp = sub.row(align=True)
+            hp.active = bool(item.hp_collection)
+            hp.label(text="HP")
+            lp = sub.row(align=True)
+            lp.active = bool(item.lp_collection)
+            lp.label(text="LP")
 
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
@@ -194,6 +196,44 @@ def _draw_outliner_collection_menu(self, context):
     layout.operator("mg.assign_collection_hp", icon='MESH_CUBE')
     layout.operator("mg.assign_collection_lp", icon='MESH_PLANE')
     layout.operator("mg.clear_collection_assignment", icon='X')
+
+
+# ── Install Painter Plugin ────────────────────────────────────────────────
+
+# ── Log UIList + Copy Log operator ────────────────────────────────────────
+
+class MG_UL_LogList(bpy.types.UIList):
+    bl_idname = "MG_UL_LogList"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            level = item.level
+            if level == 'OK':
+                row.label(text="", icon='CHECKMARK')
+            elif level == 'WARN':
+                row.label(text="", icon='ERROR')
+            elif level == 'SECTION':
+                row.label(text="", icon='DISCLOSURE_TRI_DOWN')
+            else:
+                row.label(text="", icon='NONE')
+            row.prop(item, "text", text="", emboss=False)
+
+    def filter_items(self, context, data, propname):
+        # No filtering – preserve insertion order
+        return [], []
+
+
+class MG_OT_CopyLog(bpy.types.Operator):
+    bl_idname = "mg.copy_log"
+    bl_label = "Copy Log"
+    bl_description = "Copy the full export log to the clipboard"
+
+    def execute(self, context):
+        lines = [item.text for item in context.scene.mg_export_log]
+        context.window_manager.clipboard = "\n".join(lines)
+        self.report({'INFO'}, "Log copied to clipboard")
+        return {'FINISHED'}
 
 
 # ── Install Painter Plugin ────────────────────────────────────────────────

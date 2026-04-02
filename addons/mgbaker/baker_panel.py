@@ -73,7 +73,7 @@ class MG_PT_ExportGroups(bpy.types.Panel):
 # ── Group Settings ────────────────────────────────────────────────────────
 
 class MG_PT_GroupSettings(bpy.types.Panel):
-    bl_label = "Group Settings"
+    bl_label = ""
     bl_idname = "MG_PT_GroupSettings"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -90,7 +90,7 @@ class MG_PT_GroupSettings(bpy.types.Panel):
 
     def draw_header(self, context):
         grp = context.scene.mg_export_groups[context.scene.mg_active_group_index]
-        self.layout.label(text=grp.name)
+        self.layout.label(text=f"Group Settings - {grp.name}")
 
     def draw(self, context):
         layout = self.layout
@@ -151,7 +151,7 @@ class MG_PT_GroupSettings(bpy.types.Panel):
 # ── Export ────────────────────────────────────────────────────────────────
 
 class MG_PT_Export(bpy.types.Panel):
-    bl_label = "Export"
+    bl_label = ""
     bl_idname = "MG_PT_Export"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -160,26 +160,25 @@ class MG_PT_Export(bpy.types.Panel):
 
     def draw_header(self, context):
         n = sum(1 for g in context.scene.mg_export_groups if g.include)
-        self.layout.label(text=f"{n} group{'s' if n != 1 else ''}")
+        self.layout.label(text=f"Export - {n} group{'s' if n != 1 else ''}")
 
     def draw(self, context):
+        from . import get_icon
         layout = self.layout
 
         col = layout.column(align=True)
         col.scale_y = 1.2
-        col.operator("mg.export_to_toolbag", icon='SHADING_RENDERED')
-        col.operator("mg.export_to_painter", icon='BRUSH_DATA')
+        icon_tb = get_icon("toolbag")
+        icon_pa = get_icon("painter")
+        col.operator("mg.export_to_toolbag", icon_value=icon_tb if icon_tb else 0,
+                     icon='SHADING_RENDERED' if not icon_tb else 'NONE')
+        col.operator("mg.export_to_painter", icon_value=icon_pa if icon_pa else 0,
+                     icon='BRUSH_DATA' if not icon_pa else 'NONE')
 
         layout.separator()
         col = layout.column(align=True)
         col.operator("mg.export_fbx_only", icon='EXPORT')
         col.operator("mg.open_bakes_folder", icon='FILE_FOLDER')
-
-        layout.separator()
-        box = layout.box()
-        box.scale_y = 0.7
-        box.label(text="Exports all ✓-checked groups.", icon='INFO')
-        box.label(text="Toggle per-row to include / exclude.")
 
 
 # ── Preferences (inline) ─────────────────────────────────────────────────
@@ -233,20 +232,14 @@ class MG_PT_Log(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        log_text = context.scene.mg_export_log
-        if not log_text:
+        log = context.scene.mg_export_log
+        if not log:
             layout.label(text="No export log yet.", icon='INFO')
             return
-        col = layout.column(align=True)
-        col.scale_y = 0.8
-        for line in log_text.split("\n"):
-            if not line:
-                continue
-            if line.startswith("\u2713"):
-                col.label(text=line, icon='CHECKMARK')
-            elif line.startswith("\u2717") or line.startswith("\u26a0"):
-                col.label(text=line, icon='ERROR')
-            elif line.startswith("\u25bc"):
-                col.label(text=line, icon='DISCLOSURE_TRI_DOWN')
-            else:
-                col.label(text=line)
+        layout.template_list(
+            "MG_UL_LogList", "",
+            context.scene, "mg_export_log",
+            context.scene, "mg_export_log_index",
+            rows=6,
+        )
+        layout.operator("mg.copy_log", icon='COPYDOWN')
