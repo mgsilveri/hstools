@@ -15,7 +15,7 @@ import bmesh
 from bpy.props import EnumProperty
 
 from . import state
-from .utils import get_addon_preferences
+from .utils import get_addon_preferences, _diag
 
 
 # ── Geometry-selection helpers ────────────────────────────────────────────────
@@ -153,8 +153,14 @@ def _anchor_tracking_timer():
         state._anchor_timer_running = False
         return None  # stop timer
 
+    # Skip bmesh access while an unsafe modal (e.g. edge_slide) is live.
+    if state._mesh_modal_unsafe:
+        _diag("anchor_tracking_timer: SKIPPED (unsafe modal)")
+        return state._viewport_draw_interval
+
     try:
         ctx = bpy.context
+        _diag("anchor_tracking_timer: calling _compute_selection_median")
         new_median = _compute_selection_median(ctx)
         if new_median is not None and state._last_known_median is not None:
             delta = new_median - state._last_known_median

@@ -254,6 +254,23 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         if not self.debug_perf:
             perf_reset()   # discard partial data when turning off
 
+    def _toggle_crash_trace(self, context):
+        import modokit.utils as _u
+        _u._diag_enabled = self.debug_crash_trace
+
+    debug_crash_trace: BoolProperty(
+        name="Crash Tracing (diag breadcrumbs)",
+        description=(
+            "Write per-frame breadcrumbs to %TEMP%\\modo_addon_diag.txt using "
+            "raw os.write + fsync so entries survive a hard Blender crash. "
+            "Enable this, reproduce the crash, then read the last lines of that "
+            "file to identify which callback was running when Blender died. "
+            "Has a small but non-zero I/O cost per frame \u2014 keep off during normal use."
+        ),
+        default=False,
+        update=_toggle_crash_trace,
+    )
+
     debug_perf: BoolProperty(
         name="Performance Timing",
         description=(
@@ -529,6 +546,8 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
             col.prop(self, "debug_selection")
             col.prop(self, "debug_uv_seam")
             col.prop(self, "debug_uv_handle")
+            col.separator(factor=0.5)
+            col.prop(self, "debug_crash_trace")
             col.separator(factor=0.5)
             col.prop(self, "debug_perf")
             if self.debug_perf:

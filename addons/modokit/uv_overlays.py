@@ -43,6 +43,29 @@ _back_edge_last_drag_callback_time: float = 0.0  # time of last callback while T
 _back_edge_trailing_timer_pending: bool = False
 _back_edge_dirty: bool = False            # bypass throttle on next rebuild
 
+# Modal operator IDs that modify UV loop data live in C (e.g. with correct_uv=True).
+# Accessing bmesh UV layers while these are running causes an access violation inside
+# tbbmalloc.dll (confirmed crash: TRANSFORM_OT_edge_slide, Blender 5.0.1).
+_UNSAFE_MODAL_IDS: frozenset = frozenset((
+    'TRANSFORM_OT_edge_slide',
+    'TRANSFORM_OT_vert_slide',
+    'MESH_OT_loopcut',
+    'MESH_OT_loopcut_slide',
+    'MESH_OT_knife_tool',
+))
+
+# Non-modal operators that appear as active_operator while modifying UV data.
+# ke_direct_loop_cut is NOT in window.modal_operators — it executes synchronously
+# and immediately invokes edge_slide.  Its MESH depsgraph event fires before
+# the edge_slide modal even registers, so we must treat it as unsafe here too.
+_UNSAFE_ACTIVE_IDS: frozenset = frozenset((
+    'MESH_OT_ke_direct_loop_cut',
+    'MESH_OT_loopcut',
+    'MESH_OT_loopcut_slide',
+    'TRANSFORM_OT_edge_slide',
+    'TRANSFORM_OT_vert_slide',
+))
+
 
 def _do_back_edge_rebuild(context, topo_only: bool = False) -> None:
     """Execute a back-edge cache rebuild and update adaptive interval."""
@@ -90,18 +113,26 @@ def maybe_rebuild_back_edge(context) -> None:
         perf_record("bec: callback interval", now - _back_edge_last_callback_time, is_interval=True)
     _back_edge_last_callback_time = now
 
-    # Path 1: depsgraph confirmed a mesh change — rebuild unconditionally.
-    # POST_VIEW fires after all event/modal processing for the frame, so
-    # calling from_edit_mesh here is safe even during native C modal operators.
+    # Path 1: depsgraph confirmed a mesh change — rebuild unconditionally,
+    # UNLESS an unsafe modal (e.g. edge_slide with correct_uv) is running.
+    # bmesh.from_edit_mesh() syncs the entire BMesh including UV layers, so
+    # it crashes even when we only intend to read vertex positions.
+    # Keep _back_edge_dirty=True so we rebuild on the next safe frame.
     if _back_edge_dirty:
+        if state._mesh_modal_unsafe:
+            _diag("bec: dirty rebuild SKIPPED (unsafe modal)")
+            return
         perf_record("bec: rebuild reason", 2)  # 2=dirty flag
         _do_back_edge_rebuild(context)
         return
 
     # Path 2: live mesh transform (G/R/S etc.) — throttled per-frame rebuild.
-    # Selection is stable during a transform, so reuse the topology cache and
-    # only recompute vertex positions (skips the costly full-mesh select scan).
+    # Also skip when unsafe: TRANSFORM_OT_edge_slide matches _has_active_mesh_transform
+    # and bmesh.from_edit_mesh() would crash for the same reason as Path 1.
     if _has_active_mesh_transform(context):
+        if state._mesh_modal_unsafe:
+            _diag("bec: transform rebuild SKIPPED (unsafe modal)")
+            return
         # Track drag-specific frame interval separately so perf_report shows
         # actual viewport fps during G/R/S without idle frames diluting it.
         if _back_edge_last_drag_callback_time > 0 and (now - _back_edge_last_drag_callback_time) < 1.0:
@@ -132,10 +163,16 @@ def _back_edge_trailing_timer():
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
             return None
+        if state._mesh_modal_unsafe:
+            _diag("bec: trailing timer SKIPPED (unsafe modal), rescheduling")
+            _back_edge_trailing_timer_pending = True
+            bpy.app.timers.register(_back_edge_trailing_timer, first_interval=0.05)
+            return None
         # If the draw callback has fired since this timer was scheduled, it
         # already rebuilt — skip to avoid a redundant double rebuild.
         if _back_edge_last_callback_time > _back_edge_last_rebuild_time:
             return None
+        _diag("bec: trailing timer rebuild")
         _do_back_edge_rebuild(context)
     except Exception:
         pass
@@ -942,10 +979,17 @@ def _uv_boundary_draw_callback():
         region = context.region
         if region is None:
             return
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live —
+        # those operators modify UV loop data in C, causing an access violation crash.
+        if state._mesh_modal_unsafe:
+            _diag("DRAW uv_boundary SKIPPED (unsafe modal)")
+            return
         # Recompute live every draw so that UV selection changes are reflected
         # immediately — UV selection does not trigger a MESH depsgraph update,
         # so the timer-driven cache can be stale by several frames.
+        _diag("uv_boundary_draw: calling _compute_uv_boundary_cache")
         _compute_uv_boundary_cache(context)
+        _diag("uv_boundary_draw: _compute_uv_boundary_cache done")
         uv_mode = state._uv_boundary_cache.get('uv_mode')
         if uv_mode is None:
             return
@@ -1038,6 +1082,41 @@ def _uv_boundary_draw_callback():
             pass
 
 
+def _unsafe_clear_timer():
+    """Deferred clear of state._mesh_modal_unsafe.
+
+    Checks modal_operators first: if an unsafe modal (e.g. edge_slide) is STILL
+    running as a modal, reschedule — the user has not yet confirmed the operation.
+    Then checks active_operator for non-modal unsafe ops (ke_direct_loop_cut).
+    Safe operators (preselect, select, etc.) are ignored.
+    """
+    state._mesh_modal_unsafe_clear_pending = False
+    try:
+        wm = bpy.context.window_manager
+        running_modals = {getattr(op, 'bl_idname', '')
+                          for w in wm.windows for op in w.modal_operators}
+        if running_modals & _UNSAFE_MODAL_IDS:
+            _diag(f"unsafe_clear_timer: modal still live={sorted(running_modals & _UNSAFE_MODAL_IDS)!r}, rescheduling")
+            state._mesh_modal_unsafe_clear_pending = True
+            bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.016)
+            return None
+        active_op = getattr(bpy.context, 'active_operator', None)
+        if active_op is not None:
+            idname = getattr(active_op, 'bl_idname', '')
+            if idname in _UNSAFE_ACTIVE_IDS:
+                _diag(f"unsafe_clear_timer: active_op={idname!r}, rescheduling")
+                state._mesh_modal_unsafe_clear_pending = True
+                bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.016)
+                return None
+            # Any other operator (preselect, select, etc.) is safe to ignore.
+            _diag(f"unsafe_clear_timer: active_op={idname!r} is safe, clearing")
+    except Exception as _e:
+        _diag(f"unsafe_clear_timer: exception checking active_op: {_e}")
+    _diag("unsafe_clear_timer: clearing unsafe flag")
+    state._mesh_modal_unsafe = False
+    return None
+
+
 @bpy.app.handlers.persistent
 def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
     """Force-redraw IMAGE_EDITOR after edit-mesh updates; schedule UV cache timer."""
@@ -1050,6 +1129,48 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
             return
         if not depsgraph.id_type_updated('MESH'):
             return
+        # Detect unsafe modal operators before any draw callbacks fire this frame.
+        # Depsgraph handlers always execute before the draw pass, so this flag is
+        # guaranteed to be current when the UV overlay callbacks check it.
+        # When transitioning from unsafe→safe, we do NOT clear immediately: a
+        # non-modal operator (e.g. ke_direct_loop_cut) may still be executing its
+        # Python-side cleanup and its finalisation writes UV data.  Deferring the
+        # clear to a timer lets us check active_operator (reliable in timer context,
+        # unreliable from draw callbacks) before allowing any bmesh access.
+        try:
+            _running = {getattr(op, 'bl_idname', '')
+                        for w in context.window_manager.windows
+                        for op in w.modal_operators}
+            _active_op_id = getattr(getattr(context, 'active_operator', None), 'bl_idname', '')
+            _was_unsafe = state._mesh_modal_unsafe
+            if _running & _UNSAFE_MODAL_IDS:
+                # Unsafe modal is LIVE (edge_slide dragging) — cancel any pending
+                # clear so it doesn't fire while UV data is being written in C.
+                state._mesh_modal_unsafe = True
+                state._mesh_modal_unsafe_clear_pending = False
+            elif _active_op_id in _UNSAFE_ACTIVE_IDS:
+                # Non-modal unsafe op (ke_direct_loop_cut, pre-edge_slide) OR
+                # finalization depsgraph events from a just-confirmed edge_slide.
+                # Stay unsafe but ALLOW the clear timer — it will reschedule itself
+                # if it fires while edge_slide is still a modal, and will clear as
+                # soon as the modal exits.
+                state._mesh_modal_unsafe = True
+                if not state._mesh_modal_unsafe_clear_pending:
+                    state._mesh_modal_unsafe_clear_pending = True
+                    bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.016)
+            elif _was_unsafe:
+                # Just transitioned unsafe→possibly-safe.  Defer the actual clear
+                # to _unsafe_clear_timer which can check modal_operators.
+                if not state._mesh_modal_unsafe_clear_pending:
+                    state._mesh_modal_unsafe_clear_pending = True
+                    bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.016)
+                # Keep _mesh_modal_unsafe=True until the timer confirms safety.
+            # else: was already False, nothing to do.
+            _modals = sorted(_running)
+            _diag(f"depsgraph MESH update modals={_modals} active_op={_active_op_id!r} unsafe={state._mesh_modal_unsafe} clear_pending={state._mesh_modal_unsafe_clear_pending}")
+            print(f"[MODOKIT-DBG] depsgraph MESH update, modals={_modals} active_op={_active_op_id!r} unsafe={state._mesh_modal_unsafe}")
+        except Exception as _e:
+            print(f"[MODOKIT-DBG] depsgraph MESH update, modal query failed: {_e}")
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
         global _back_edge_dirty
         _back_edge_dirty = True   # force next draw frame to rebuild regardless of throttle
@@ -1062,12 +1183,14 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
         bpy.app.timers.register(_deferred, first_interval=state._UV_STABLE_DELAY)
         prefs = get_addon_preferences(context)
         if not getattr(prefs, 'enable_uv_boundary_overlay', True):
+            _diag("depsgraph handler: done (uv_boundary overlay disabled)")
             return
         screen = getattr(context, 'screen', None)
         if screen:
             for area in screen.areas:
                 if area.type == 'IMAGE_EDITOR':
                     area.tag_redraw()
+        _diag("depsgraph handler: done")
     except Exception as _exc:
         _uv_debug_log(f"[UV-DEPSGRAPH] EXCEPTION: {_exc}")
 
@@ -1094,9 +1217,21 @@ def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
             return None
         # If any modal operator is running it may be modifying the mesh —
         # reschedule until the modal exits rather than risk a crash.
+        # Check _mesh_modal_unsafe first (set reliably from depsgraph handler);
+        # fall back to active_operator for any other unknown modals.
+        if state._mesh_modal_unsafe:
+            _uv_debug_log("[UV-TIMER] unsafe modal active (_mesh_modal_unsafe), rescheduling")
+            _diag("UV-TIMER: rescheduling (unsafe modal)")
+            _sg, _sb = scheduled_gen, skip_back_edge
+            bpy.app.timers.register(
+                lambda: _refresh_uv_caches_timer(_sg, _sb),
+                first_interval=max(state._UV_STABLE_DELAY, 0.05),
+            )
+            return None
         _active_op = getattr(context, 'active_operator', None)
         if _active_op is not None:
             _uv_debug_log(f"[UV-TIMER] modal op active ({getattr(_active_op, 'bl_idname', '?')}), rescheduling")
+            _diag(f"UV-TIMER: rescheduling (active_op={getattr(_active_op, 'bl_idname', '?')})")
             _sg, _sb = scheduled_gen, skip_back_edge
             bpy.app.timers.register(
                 lambda: _refresh_uv_caches_timer(_sg, _sb),
@@ -1104,6 +1239,7 @@ def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
             )
             return None
         _uv_debug_log("[UV-TIMER] _refresh_uv_caches_timer firing")
+        _diag("UV-TIMER: firing, calling compute functions")
         if not skip_back_edge:
             # Adaptive throttle for back-edge cache rebuilds.
             _now = time.monotonic()
@@ -1123,7 +1259,9 @@ def _refresh_uv_caches_timer(scheduled_gen=None, skip_back_edge=False):
                 _uv_debug_log(f"[UV-TIMER] back-edge throttle: trailing in {_remaining:.3f}s")
                 bpy.app.timers.register(_back_edge_trailing_timer, first_interval=_remaining)
         _compute_flipped_face_uv_cache(context)
+        _diag("UV-TIMER: flipped_face done, calling uv_boundary")
         _compute_uv_boundary_cache(context)
+        _diag("UV-TIMER: uv_boundary done")
         prefs = get_addon_preferences(context)
         if getattr(prefs, 'enable_uv_boundary_overlay', True):
             screen = getattr(context, 'screen', None)
@@ -1223,6 +1361,11 @@ def _uv_flipped_face_draw_callback():
             return
         region = context.region
         if region is None:
+            return
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live —
+        # those operators modify UV loop data in C, causing an access violation crash.
+        if state._mesh_modal_unsafe:
+            _diag("DRAW flipped_face SKIPPED (unsafe modal)")
             return
         # Recompute live every draw so UV flips and moves are reflected
         # immediately — UV edits often don't trigger a MESH depsgraph update,
@@ -1392,7 +1535,11 @@ def _uv_overlap_draw_callback():
         if not objects:
             obj = context.edit_object
             objects = [obj] if obj is not None else []
-
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live.
+        if state._mesh_modal_unsafe:
+            _diag("DRAW uv_overlap SKIPPED (unsafe modal)")
+            return
+        _diag("DRAW uv_overlap: calling from_edit_mesh")
         tris = []
         for obj in objects:
             if obj is None or obj.type != 'MESH':
@@ -1637,6 +1784,10 @@ def _uv_distortion_draw_callback() -> None:
         region = context.region
         if region is None:
             return
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live.
+        if state._mesh_modal_unsafe:
+            _diag("DRAW distortion SKIPPED (unsafe modal)")
+            return
 
         _compute_distortion_uv_cache(context)
 
@@ -1724,6 +1875,10 @@ def _uv_active_face_draw_callback() -> None:
         if not objects:
             obj = context.edit_object
             objects = [obj] if obj is not None else []
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live.
+        if state._mesh_modal_unsafe:
+            _diag("DRAW active_face SKIPPED (unsafe modal)")
+            return
 
         tris = []
         for obj in objects:
@@ -1823,6 +1978,10 @@ def _coverage_timer() -> object:
         if getattr(ctx, 'mode', None) != 'EDIT_MESH':
             _cov_timer_running = False
             return None
+        # Also block on ke_direct_loop_cut (not a modal, shows as active_operator)
+        if state._mesh_modal_unsafe:
+            _diag("coverage_timer: SKIPPED (unsafe modal)")
+            return _COV_DIRTY_INTERVAL
         prefs = get_addon_preferences(ctx)
         if getattr(prefs, 'enable_uv_coverage_hud', True):
             _compute_uv_coverage_pct(ctx)
@@ -1858,8 +2017,13 @@ def _compute_uv_coverage_pct(context) -> None:
         if not objects:
             obj = context.edit_object
             objects = [obj] if obj is not None else []
+        # Skip BMesh UV access while an unsafe modal (e.g. edge_slide) is live.
+        if state._mesh_modal_unsafe:
+            _diag("coverage_pct SKIPPED (unsafe modal)")
+            return
 
         N = float(_COV_TEX_SIZE)
+        _diag("coverage_pct: calling from_edit_mesh")
         tris = []
         for obj in objects:
             if obj is None or obj.type != 'MESH':

@@ -132,7 +132,9 @@ def _compute_back_edge_cache(context, topo_only: bool = False):
                     mx3_mm = mx.to_3x3()  # mathutils Matrix3 — reused for positions (numpy) and per-face normal inline
 
                     with perf_time("bec: from_edit_mesh"):
+                        _diag(f"bec: from_edit_mesh PRE  obj={obj.name!r} is_editmode={mesh.is_editmode}")
                         bm = bmesh.from_edit_mesh(mesh)
+                        _diag(f"bec: from_edit_mesh POST nv={len(bm.verts)}")
                     nv = len(bm.verts)
                     perf_record("bec: mesh verts", nv)
 
@@ -329,10 +331,12 @@ def _bfv_rebuild_callback() -> None:
     """
     with perf_time("bfv: rebuild_callback"):
         try:
+            _diag("bfv_rebuild_callback: enter")
             context = bpy.context
             if getattr(context, 'mode', None) == 'EDIT_MESH':
                 from .uv_overlays import maybe_rebuild_back_edge
                 maybe_rebuild_back_edge(context)
+            _diag("bfv_rebuild_callback: done")
         except Exception:
             pass
 
@@ -340,7 +344,9 @@ def _bfv_rebuild_callback() -> None:
 def _back_edge_draw_callback() -> None:
     with perf_time("draw: back_edge"):
         try:
+            _diag("draw_back_edge: enter")
             _back_edge_draw_callback_inner()
+            _diag("draw_back_edge: done")
         except Exception:
             pass
 
@@ -430,7 +436,9 @@ def _back_vert_draw_callback() -> None:
     testing (full opacity when visible, 50% when occluded)."""
     with perf_time("draw: back_vert"):
         try:
+            _diag("draw_back_vert: enter")
             _back_vert_draw_callback_inner()
+            _diag("draw_back_vert: done")
         except Exception:
             pass
 
@@ -523,7 +531,9 @@ def _back_face_draw_callback() -> None:
     fully opaque when visible, 50% alpha when occluded."""
     with perf_time("draw: back_face"):
         try:
+            _diag("draw_back_face: enter")
             _back_face_draw_callback_inner()
+            _diag("draw_back_face: done")
         except Exception:
             pass
 

@@ -185,6 +185,7 @@ def register():
             p = bpy.context.preferences.addons.get('modokit')
             if p is not None:
                 _u._perf_enabled = bool(p.preferences.debug_perf)
+                _u._diag_enabled = bool(p.preferences.debug_crash_trace)
         except Exception:
             pass
         return None

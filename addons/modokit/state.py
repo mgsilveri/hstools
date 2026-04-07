@@ -168,3 +168,14 @@ _uv_tool_guardian_running = False
 
 # ── Header patch ─────────────────────────────────────────────────────────────
 _orig_editor_menus_draw_collapsible = None
+
+# ── Mesh modal safety gate ────────────────────────────────────────────────────
+# Set True by _uv_seam_redraw_depsgraph_handler when an operator that modifies
+# UV loop data live in C (e.g. TRANSFORM_OT_edge_slide with correct_uv=True)
+# is detected in window.modal_operators.  Cleared when no such modal is running.
+# Checked by all UV overlay draw callbacks before calling bmesh.from_edit_mesh()
+# to avoid a tbbmalloc access-violation crash (Blender 5.0.1, 2025).
+_mesh_modal_unsafe: bool = False
+# True while a deferred timer is pending to clear _mesh_modal_unsafe.
+# Prevents multiple clear timers being stacked.
+_mesh_modal_unsafe_clear_pending: bool = False

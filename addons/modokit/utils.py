@@ -63,11 +63,17 @@ except Exception:
     _diag_fd = -1
 
 
+_diag_enabled: bool = False   # toggled from AddonPreferences.debug_crash_trace
+
+
 def _diag(msg: str) -> None:
     """Write a flushed diagnostic breadcrumb via a persistent raw fd.
 
     Uses os.write + os.fsync so data hits disk even on a hard segfault.
+    Gated by _diag_enabled — off by default, enabled from addon prefs.
     """
+    if not _diag_enabled:
+        return
     try:
         if _diag_fd < 0:
             return
