@@ -418,9 +418,10 @@ def _join_to_single(objects, name, dest_col):
 def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
     """Generate a Toolbag 5 Python script.
 
-    Creates one ``BakerObject`` per group in Single tile mode (tileMode=0)
-    so output filenames are ``<group_name><map_suffix>.png`` with no
-    texture-set name appended.  Each group uses its own FBX.
+    Creates one ``BakerObject`` per group in Multiple texture-set mode
+    (tileMode=1).  ``outputPath`` is set to the bakes directory so Toolbag
+    produces ``<bakes_dir>/<TextureSetName><suffix>.png`` — one file per
+    material, named after the material/texture-set.
 
     Returns ``(script_path, tbscene_path)``.
     """
@@ -437,10 +438,9 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
 
     for group, fbx_path in group_fbx_pairs:
         fbx_esc = fbx_path.replace("\\", "/")
-        # outputPath uses the LP material name so baked textures match
-        # the material (e.g. bakes/mat_name_normal_base.png).
-        mat_name = get_output_name(group)
-        output_path = os.path.join(bakes_dir, f"{mat_name}.png").replace("\\", "/")
+        # outputPath must have a .png extension so Toolbag outputs PNG (not PSD).
+        # With tileMode=1 Toolbag produces: <group.name>_<TextureSetName>_<suffix>.png
+        output_path = os.path.join(bakes_dir, f"{group.name}.png").replace("\\", "/")
 
         enabled_maps = []
         for prop_name, tb_map_name, suffix in _MAP_DEFS:
@@ -458,7 +458,7 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
             f"{var}.outputSamples = 4",
             f"{var}.outputBits = 8",
             f"{var}.edgePadding = 'Extreme'",
-            f"{var}.tileMode = 0  # Single — no texture-set name appended",
+            f"{var}.tileMode = 1  # Multiple — one output file per texture set",
             "",
         ]
 

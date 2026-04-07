@@ -10,7 +10,7 @@ Install via the mgBaker Blender addon: Preferences -> Install Painter Plugin.
 
 from __future__ import annotations
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 import json
 import math
@@ -79,13 +79,23 @@ def _import_texture_as_mesh_map(ts, usage, file_path):
         print(f"[{PLUGIN_NAME}] {ts.name}: failed to set {usage.name}: {exc}")
 
 
-def _import_existing_bakes_for_ts(ts, mat_name, bakes_dir):
-    """Import bake files matching mat_name as mesh maps on ts."""
+def _import_existing_bakes_for_ts(ts, bakes_dir):
+    """Import bake files for ts by scanning bakes_dir for files ending in
+    <ts.name><suffix>.png (case-insensitive).  Handles any prefix that
+    Toolbag may prepend (e.g. group_name_) in tileMode=1.
+    """
+    ts_lower = ts.name.lower()
+    try:
+        dir_files = os.listdir(bakes_dir)
+    except Exception:
+        return
+    files_lower = {f.lower(): f for f in dir_files}
     for suffix, usage in _SUFFIX_TO_USAGE.items():
-        fname = f"{mat_name}{suffix}.png"
-        full_path = os.path.join(bakes_dir, fname)
-        if os.path.isfile(full_path):
-            _import_texture_as_mesh_map(ts, usage, full_path)
+        # suffix has a leading underscore e.g. "_normal_base"
+        target = f"{ts_lower}{suffix.lower()}.png"
+        matched = next((orig for low, orig in files_lower.items() if low.endswith(target)), None)
+        if matched:
+            _import_texture_as_mesh_map(ts, usage, os.path.join(bakes_dir, matched))
 
 
 def _import_existing_bakes(config):
@@ -100,24 +110,10 @@ def _import_existing_bakes(config):
         print(f"[{PLUGIN_NAME}] No texture sets found")
         return
 
-    groups = config.get("groups")
-    if groups:
-        ts_by_name = {ts.name: ts for ts in all_ts}
-        for grp in groups:
-            mat_name = grp.get("mat_name", "")
-            ts = ts_by_name.get(mat_name)
-            if ts is None:
-                print(f"[{PLUGIN_NAME}] No texture set found for '{mat_name}'")
-                continue
-            _import_existing_bakes_for_ts(ts, mat_name, bakes_dir)
-    else:
-        # Legacy single-group format
-        ts = all_ts[0]
-        for suffix, usage in _SUFFIX_TO_USAGE.items():
-            for fname in os.listdir(bakes_dir):
-                if fname.lower().endswith(f"{suffix}.png"):
-                    _import_texture_as_mesh_map(ts, usage, os.path.join(bakes_dir, fname))
-                    break
+    # With tileMode=1 Toolbag produces <prefix>_<TextureSetName>_<suffix>.png.
+    # _import_existing_bakes_for_ts scans by endswith so any prefix is handled.
+    for ts in all_ts:
+        _import_existing_bakes_for_ts(ts, bakes_dir)
 
 
 def _configure_baking_for_ts(ts, grp):
@@ -267,17 +263,34 @@ def _on_bakes_dir_changed(dir_path: str):
 
 
 def _on_project_opened(e):
-    """Handle ProjectOpened: import bakes, configure baking, set up watcher."""
-    config = _find_config()
-    if config is not None:
-        print(f"[{PLUGIN_NAME}] Config found - configuring project")
-        _import_existing_bakes(config)
-        _configure_baking(config)
-        bakes_dir = config.get("bakes_dir", "")
-        _delete_config(config)
-    else:
-        bakes_dir = _bakes_dir_from_project()
+    """Handle ProjectOpened: set up file watcher.
+
+    Actual import and baking configuration is deferred to
+    ``_on_edition_entered`` so texture sets are fully initialized.
+    """
+    bakes_dir = _bakes_dir_from_project()
     _setup_watcher(bakes_dir)
+
+
+def _on_edition_entered(e):
+    """Handle ProjectEditionEntered: import bakes and configure baking once.
+
+    This fires after Painter has fully loaded the mesh and created all texture
+    sets, so ``textureset.all_texture_sets()`` is reliably populated here.
+    The config JSON acts as a one-shot token — it is deleted after use so
+    subsequent Edition-Entered events are no-ops.
+    """
+    config = _find_config()
+    if config is None:
+        return
+    print(f"[{PLUGIN_NAME}] Config found on edition enter — configuring project")
+    _import_existing_bakes(config)
+    _configure_baking(config)
+    bakes_dir = config.get("bakes_dir", "")
+    _delete_config(config)
+    # Ensure watcher is pointed at the correct bakes dir
+    if bakes_dir:
+        _setup_watcher(bakes_dir)
 
 
 # -- Plugin entry points ----------------------------------------------------
@@ -296,6 +309,7 @@ def _bakes_dir_from_project() -> str:
 def start_plugin():
     print(f"[{PLUGIN_NAME}] Plugin loaded")
     event.DISPATCHER.connect(event.ProjectOpened, _on_project_opened)
+    event.DISPATCHER.connect(event.ProjectEditionEntered, _on_edition_entered)
     try:
         if project.is_open():
             bakes_dir = _bakes_dir_from_project()
@@ -308,6 +322,7 @@ def close_plugin():
     global _watcher
     print(f"[{PLUGIN_NAME}] Plugin unloaded")
     event.DISPATCHER.disconnect(event.ProjectOpened, _on_project_opened)
+    event.DISPATCHER.disconnect(event.ProjectEditionEntered, _on_edition_entered)
     if _watcher is not None:
         _watcher.deleteLater()
         _watcher = None
