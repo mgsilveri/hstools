@@ -155,6 +155,13 @@ class MG_PT_GroupSettings(bpy.types.Panel):
         split.label(text="LP:")
         split.prop_search(grp, "lp_collection", bpy.data, "collections", text="")
 
+        # Visibility toggles — affect all groups
+        row = box.row(align=True)
+        row.prop(scn, "mg_hp_hidden", text="Hide HP", toggle=True,
+                 icon='HIDE_ON' if scn.mg_hp_hidden else 'HIDE_OFF')
+        row.prop(scn, "mg_lp_hidden", text="Hide LP", toggle=True,
+                 icon='HIDE_ON' if scn.mg_lp_hidden else 'HIDE_OFF')
+
         layout.separator(type='LINE')
 
         # ── Materials ──

@@ -90,7 +90,27 @@ class MG_LogLine(bpy.types.PropertyGroup):
     level: StringProperty(name="Level", default="INFO")
 
 
-# ── helpers ───────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────
+
+def _set_collection_hide(col, hide):
+    """Recursively set hide_viewport on a collection and all its children."""
+    if col is None:
+        return
+    col.hide_viewport = hide
+    for child in col.children:
+        _set_collection_hide(child, hide)
+
+
+def _on_hp_hidden_update(self, context):
+    """Scene-level update: hide/show all HP collections across every group."""
+    for grp in self.mg_export_groups:
+        _set_collection_hide(grp.hp_collection, self.mg_hp_hidden)
+
+
+def _on_lp_hidden_update(self, context):
+    """Scene-level update: hide/show all LP collections across every group."""
+    for grp in self.mg_export_groups:
+        _set_collection_hide(grp.lp_collection, self.mg_lp_hidden)
 
 def _group_status(group):
     """Return a status string for the UIList row icon.
@@ -123,9 +143,23 @@ def register():
     bpy.types.Scene.mg_active_group_index = IntProperty()
     bpy.types.Scene.mg_export_log = CollectionProperty(type=MG_LogLine)
     bpy.types.Scene.mg_export_log_index = IntProperty()
+    bpy.types.Scene.mg_hp_hidden = BoolProperty(
+        name="Hide HP",
+        description="Hide all HP collections in the viewport",
+        default=False,
+        update=_on_hp_hidden_update,
+    )
+    bpy.types.Scene.mg_lp_hidden = BoolProperty(
+        name="Hide LP",
+        description="Hide all LP collections in the viewport",
+        default=False,
+        update=_on_lp_hidden_update,
+    )
 
 
 def unregister():
+    del bpy.types.Scene.mg_lp_hidden
+    del bpy.types.Scene.mg_hp_hidden
     del bpy.types.Scene.mg_export_log_index
     del bpy.types.Scene.mg_export_log
     del bpy.types.Scene.mg_active_group_index
