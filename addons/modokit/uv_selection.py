@@ -1305,10 +1305,12 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
         IMAGE_OT_modo_uv_paint_selection._paint(self, context, event)
 
         if context.tool_settings.use_uv_select_sync:
+            sm = tuple(context.tool_settings.mesh_select_mode)
             bm = bmesh.from_edit_mesh(obj.data)
-            _resync_uv_editor_selection(
-                context, obj,
-                tuple(context.tool_settings.mesh_select_mode), bm)
+            if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
+                bmesh.update_edit_mesh(obj.data)
+            else:
+                _resync_uv_editor_selection(context, obj, sm, bm)
 
         if context.area:
             context.area.tag_redraw()
@@ -1405,10 +1407,12 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if context.tool_settings.use_uv_select_sync:
                 obj = context.edit_object
                 if obj is not None and obj.type == 'MESH':
-                    bm = bmesh.from_edit_mesh(obj.data)
-                    _resync_uv_editor_selection(
-                        context, obj,
-                        tuple(context.tool_settings.mesh_select_mode), bm)
+                    sm = tuple(context.tool_settings.mesh_select_mode)
+                    if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
+                        bmesh.update_edit_mesh(obj.data)
+                    else:
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        _resync_uv_editor_selection(context, obj, sm, bm)
             return {'FINISHED'}
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
             from . import state as _state
@@ -1479,12 +1483,12 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if use_sync:
                 if uv_mode == 'VERTEX':
                     if 0 <= li < len(face.loops):
-                        for lp in face.loops:
-                            lp.vert.select = do_select
-                            try:
-                                lp.uv_select_vert = do_select
-                            except AttributeError:
-                                pass
+                        lp = face.loops[li]
+                        lp.vert.select = do_select
+                        try:
+                            lp.uv_select_vert = do_select
+                        except AttributeError:
+                            pass
                         dirty = True
                 elif uv_mode == 'EDGE':
                     if 0 <= li < len(face.loops):
