@@ -722,11 +722,24 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
                     if getattr(ctx, 'mode', None) == 'EDIT_MESH':
                         # keKit direct_loop_cut toggles OBJECT→EDIT just before invoking
                         # edge_slide, which triggers this seed while edge_slide is still
-                        # live.  Rescheduling avoids reading UV data while C is writing it.
+                        # live.  _mesh_modal_unsafe might not be set yet (it's only set
+                        # on the first MESH depsgraph event, which requires mouse movement).
+                        # Check modal_operators directly too — timers have reliable context.
                         if state._mesh_modal_unsafe:
                             bpy.app.timers.register(_edit_mode_entry_uv_seed,
                                                     first_interval=0.05)
                             return None
+                        try:
+                            from .uv_overlays import _UNSAFE_MODAL_IDS
+                            wm = ctx.window_manager
+                            live = {getattr(op, 'bl_idname', '')
+                                    for w in wm.windows for op in w.modal_operators}
+                            if live & _UNSAFE_MODAL_IDS:
+                                bpy.app.timers.register(_edit_mode_entry_uv_seed,
+                                                        first_interval=0.05)
+                                return None
+                        except Exception:
+                            pass
                         _compute_flipped_face_uv_cache(ctx)
                         _compute_uv_boundary_cache(ctx)
                         screen = getattr(ctx, 'screen', None)
