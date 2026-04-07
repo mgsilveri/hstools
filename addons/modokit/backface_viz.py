@@ -720,6 +720,13 @@ def _backface_viz_depsgraph_handler(scene, depsgraph):
                 try:
                     ctx = bpy.context
                     if getattr(ctx, 'mode', None) == 'EDIT_MESH':
+                        # keKit direct_loop_cut toggles OBJECT→EDIT just before invoking
+                        # edge_slide, which triggers this seed while edge_slide is still
+                        # live.  Rescheduling avoids reading UV data while C is writing it.
+                        if state._mesh_modal_unsafe:
+                            bpy.app.timers.register(_edit_mode_entry_uv_seed,
+                                                    first_interval=0.05)
+                            return None
                         _compute_flipped_face_uv_cache(ctx)
                         _compute_uv_boundary_cache(ctx)
                         screen = getattr(ctx, 'screen', None)

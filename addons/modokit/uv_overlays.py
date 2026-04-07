@@ -918,6 +918,8 @@ def _compute_uv_selected_verts(obj):
 
 def _compute_uv_boundary_cache(context):
     """Populate state._uv_boundary_cache from live BMesh. Safe Python context only."""
+    if state._mesh_modal_unsafe:
+        return
     state._uv_boundary_cache = {'uv_mode': None, 'points': [], 'sel_points': [], 'segments': []}
     _uv_debug_log("[UV-UBC] _compute_uv_boundary_cache called")
     try:
@@ -1304,6 +1306,8 @@ def _signed_area_uv(uvs):
 
 def _compute_flipped_face_uv_cache(context):
     """Populate state._flipped_face_uv_cache from live BMesh. Safe Python context only."""
+    if state._mesh_modal_unsafe:
+        return
     state._flipped_face_uv_cache = []
     _uv_debug_log("[UV-FFUVC] _compute_flipped_face_uv_cache called")
     try:
