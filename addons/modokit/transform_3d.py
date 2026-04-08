@@ -823,11 +823,11 @@ class VIEW3D_OT_modo_screen_move(bpy.types.Operator):
 # Drag:     live bmesh / matrix preview → confirms via transform.resize (undo)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SCALE_ARM_PX    = 90.0   # arm length in region pixels
-_SCALE_GAP_PX    = 14.0   # gap at pivot before arm starts
-_SCALE_HANDLE_HW = 5.0    # half-size of axis-end diamond handle
-_SCALE_PLANE_FRAC = 0.42  # plane handles positioned at this fraction of arm
-_SCALE_PLANE_SZ  = 14.0   # half-size of each side of the plane square
+_SCALE_ARM_PX    = 118.0  # arm length in region pixels
+_SCALE_GAP_PX    = 21.0   # gap at pivot before arm starts
+_SCALE_HANDLE_HW = 6.0    # half-size of axis-end cube handle
+_SCALE_PLANE_FRAC = 0.54  # plane handles positioned at this fraction of arm
+_SCALE_PLANE_SZ  = 8.0   # half-size of each side of the plane square
 _SCALE_DOT_R     = 6.0    # radius of uniform-scale dot
 _SCALE_HIT_R     = 20.0   # pixel hit radius for axis tips and plane centers
 _SCALE_DOT_HIT_R = 12.0   # pixel hit radius for uniform dot
@@ -1090,40 +1090,116 @@ def _scale_gizmo_draw_callback():
         # directly instead of projecting a nearby 3D point.  Projecting
         # pivot + ax * step can flip when the offset ends up behind/near the
         # camera (perspective division goes negative), making arms point toward
-        # screen centre.  The view matrix 3×3 is stable at all camera angles.
-        axis_world = {
+        # True-3D gizmo: every handle position is a real world-space point
+        # projected through the full perspective matrix.  This guarantees
+        # correct foreshortening, perspective convergence and consistent shape
+        # at all camera angles, just like Blender's native scale gizmo.
+        #
+        # Step 1 — measure pixels-per-world-unit at the pivot depth using the
+        #   camera-right vector (always perpendicular to view → stable reference).
+        # Step 2 — derive arm_world so the arm appears ~ARM px on screen.
+        # Step 3 — project every 3D endpoint with location_3d_to_region_2d.
+        axis_vecs = {
             'X': _Vector(orient.col[0]).normalized(),
             'Y': _Vector(orient.col[1]).normalized(),
             'Z': _Vector(orient.col[2]).normalized(),
         }
-        view_3x3 = rv3d.view_matrix.to_3x3()
+
+        cam_right = _Vector(rv3d.view_matrix.inverted().col[0][:3]).normalized()
+        cam_pos_w = _Vector(rv3d.view_matrix.inverted().col[3][:3])
+        ref_s = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, pivot_w + cam_right)
+        if ref_s is not None:
+            ppu = math.sqrt((ref_s.x - px)**2 + (ref_s.y - py)**2)
+            arm_world = ARM / ppu if ppu > 0.1 else ARM / 100.0
+        else:
+            arm_world = ARM / 100.0
+        sz_world  = arm_world * PSZ / ARM   # world-space half-size for plane squares
+        cube_hw   = arm_world * HW  / ARM   # world-space cube half-size
+        gap_world = arm_world * GAP / ARM   # world-space gap at pivot before shaft starts
+        xu = axis_vecs['X'];  yv = axis_vecs['Y'];  zw = axis_vecs['Z']
+        # 6 cube faces: (world-space normal, 4 corner sign-tuples in winding order)
+        _CUBE_FACES = [
+            ( xu,  [(+1,-1,-1),(+1,+1,-1),(+1,+1,+1),(+1,-1,+1)]),
+            (-xu,  [(-1,+1,-1),(-1,-1,-1),(-1,-1,+1),(-1,+1,+1)]),
+            ( yv,  [(-1,+1,-1),(+1,+1,-1),(+1,+1,+1),(-1,+1,+1)]),
+            (-yv,  [(+1,-1,-1),(-1,-1,-1),(-1,-1,+1),(+1,-1,+1)]),
+            ( zw,  [(-1,-1,+1),(+1,-1,+1),(+1,+1,+1),(-1,+1,+1)]),
+            (-zw,  [(-1,+1,-1),(+1,+1,-1),(+1,-1,-1),(-1,-1,-1)]),
+        ]
+
         screen_dirs = {}
         arm_ends    = {}
-        for name, ax in axis_world.items():
-            ax_view = view_3x3 @ ax
-            ndx, ndy = ax_view.x, ax_view.y
-            dl = math.sqrt(ndx*ndx + ndy*ndy)
-            if dl < 0.02:
+        axis_fades  = {}   # 0.0 = invisible (camera along axis), 1.0 = full
+        # Use cam→pivot ray for fade, not the global view_fwd.  In perspective
+        # the off-centre ray is what actually determines apparent foreshortening.
+        view_fwd = _Vector(rv3d.view_matrix.row[2][:3]).normalized()  # kept for ortho fallback
+        if rv3d.is_perspective:
+            cam_to_pivot = (pivot_w - cam_pos_w).normalized()
+        else:
+            cam_to_pivot = view_fwd
+        for name, ax in axis_vecs.items():
+            dot = abs(cam_to_pivot.dot(ax))   # 0 = perp to cam ray, 1 = along cam ray
+            # fade: full alpha when dot < FADE_START, zero when dot > FADE_END
+            FADE_START, FADE_END = 0.88, 0.98
+            if dot >= FADE_END:
+                axis_fades[name] = 0.0
                 screen_dirs[name] = arm_ends[name] = None
                 continue
-            screen_dirs[name] = (ndx/dl, ndy/dl)
-            arm_ends[name]    = (px + (ndx/dl) * ARM, py + (ndy/dl) * ARM)
+            elif dot > FADE_START:
+                axis_fades[name] = 1.0 - (dot - FADE_START) / (FADE_END - FADE_START)
+            else:
+                axis_fades[name] = 1.0
+            end_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, pivot_w + ax * arm_world)
+            if end_s is None:
+                screen_dirs[name] = arm_ends[name] = None
+                continue
+            dx = end_s.x - px
+            dy = end_s.y - py
+            dl = math.sqrt(dx * dx + dy * dy)
+            if dl < 1.0:   # axis pointing at/past camera
+                screen_dirs[name] = arm_ends[name] = None
+                continue
+            screen_dirs[name] = (dx / dl, dy / dl)
+            arm_ends[name]    = (end_s.x, end_s.y)
 
-        # Plane handle centers
+        # Plane handle centers and corners — all projected from true 3D positions
         plane_centers = {}
+        plane_corners = {}   # 4 screen-space corners per plane, projected from 3D
         for pa, pb in (('X', 'Y'), ('X', 'Z'), ('Y', 'Z')):
             da = screen_dirs.get(pa)
             db = screen_dirs.get(pb)
             if da is None or db is None:
-                plane_centers[pa+pb] = None
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
                 continue
             cross = abs(da[0]*db[1] - da[1]*db[0])
             if cross < 0.22:
-                plane_centers[pa+pb] = None
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
                 continue
-            fa = (px + da[0]*ARM*PF, py + da[1]*ARM*PF)
-            fb = (px + db[0]*ARM*PF, py + db[1]*ARM*PF)
-            plane_centers[pa+pb] = ((fa[0]+fb[0])/2, (fa[1]+fb[1])/2)
+            ax_a = axis_vecs[pa]
+            ax_b = axis_vecs[pb]
+            ctr_w = pivot_w + (ax_a + ax_b) * (arm_world * PF)
+            ctr_s = view3d_utils.location_3d_to_region_2d(region, rv3d, ctr_w)
+            if ctr_s is None:
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
+                continue
+            plane_centers[pa+pb] = (ctr_s.x, ctr_s.y)
+            c1_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w + ax_a * sz_world + ax_b * sz_world)
+            c2_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w - ax_a * sz_world + ax_b * sz_world)
+            c3_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w - ax_a * sz_world - ax_b * sz_world)
+            c4_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w + ax_a * sz_world - ax_b * sz_world)
+            if None in (c1_s, c2_s, c3_s, c4_s):
+                plane_corners[pa+pb] = None
+            else:
+                plane_corners[pa+pb] = (
+                    (c1_s.x, c1_s.y), (c2_s.x, c2_s.y),
+                    (c3_s.x, c3_s.y), (c4_s.x, c4_s.y),
+                )
 
         # Cache for hit testing
         state._scale_gizmo_screen_handles = {
@@ -1173,26 +1249,54 @@ def _scale_gizmo_draw_callback():
             if end is None:
                 continue
             ex, ey = end
+            fade = axis_fades.get(aname, 1.0)
 
             hover_hit = (hover == aname
                          or (len(hover) == 2 and aname in hover)
                          or hover == 'XYZ')
-            color    = _SCALE_COL_HL if hover_hit else base_col
+            if hover_hit:
+                color = _SCALE_COL_HL
+            else:
+                color = (base_col[0], base_col[1], base_col[2], base_col[3] * fade)
             shaft_hw = 1.5 if hover_hit else 0.9
 
-            sd = screen_dirs[aname]
-            gx = px + sd[0] * GAP
-            gy = py + sd[1] * GAP
-            ax = px + sd[0] * (ARM - HW - 1.0)
-            ay = py + sd[1] * (ARM - HW - 1.0)
-            _draw_aa([((gx, gy), (ax, ay))], color, shaft_hw * 0.5 + 1.0)
+            # Shaft: both endpoints projected from true 3D world positions
+            # so the arm has consistent world-space length at any camera angle.
+            shaft_start_w = pivot_w + axis_vecs[aname] * gap_world
+            shaft_end_w   = pivot_w + axis_vecs[aname] * (arm_world - cube_hw)
+            ss_s = view3d_utils.location_3d_to_region_2d(region, rv3d, shaft_start_w)
+            se_s = view3d_utils.location_3d_to_region_2d(region, rv3d, shaft_end_w)
+            if ss_s is not None and se_s is not None:
+                _draw_aa([((ss_s.x, ss_s.y), (se_s.x, se_s.y))], color, shaft_hw * 0.5 + 1.0)
 
-            dt   = (ex,      ey + HW)
-            dr   = (ex + HW, ey      )
-            db   = (ex,      ey - HW)
-            dl_p = (ex - HW, ey      )
-            _draw_flat([dt, dr, db, dt, db, dl_p], color)
-            _draw_aa([(dt, dr), (dr, db), (db, dl_p), (dl_p, dt)], color, 1.5)
+            # ── 3-D cube at arm end ──────────────────────────────────────
+            ctr_c = pivot_w + axis_vecs[aname] * arm_world
+            cpts  = {}
+            for su in (-1, 1):
+                for sv in (-1, 1):
+                    for sw in (-1, 1):
+                        p3 = ctr_c + xu*(su*cube_hw) + yv*(sv*cube_hw) + zw*(sw*cube_hw)
+                        s  = view3d_utils.location_3d_to_region_2d(region, rv3d, p3)
+                        cpts[(su, sv, sw)] = (s.x, s.y) if s else None
+            for fnorm, findices in _CUBE_FACES:
+                # Per-face perspective-correct culling: use cam→face_center,
+                # not the global view_fwd (which is only valid at screen centre).
+                face_ctr_w = _Vector((0.0, 0.0, 0.0))
+                for su2, sv2, sw2 in findices:
+                    face_ctr_w += ctr_c + xu*(su2*cube_hw) + yv*(sv2*cube_hw) + zw*(sw2*cube_hw)
+                face_ctr_w /= len(findices)
+                to_cam = (cam_pos_w - face_ctr_w).normalized()
+                ndot = to_cam.dot(fnorm)
+                if ndot <= 0.0:
+                    continue
+                fp = [cpts.get(k) for k in findices]
+                if any(p is None for p in fp):
+                    continue
+                shade    = ndot
+                face_col = (color[0], color[1], color[2], color[3] * (0.3 + 0.7 * shade))
+                a, b, cp, d = fp
+                _draw_flat([a, b, cp, a, cp, d], face_col)
+                _draw_aa([(a, b), (b, cp), (cp, d), (d, a)], color, 1.5)
 
         # ── Plane handles ─────────────────────────────────────────────────
         plane_axis_cols = {
@@ -1201,25 +1305,22 @@ def _scale_gizmo_draw_callback():
             'YZ': (_SCALE_COL_Y, _SCALE_COL_Z),
         }
         for pname, (col_a, col_b) in plane_axis_cols.items():
-            pc = plane_centers.get(pname)
-            if pc is None:
+            corners = plane_corners.get(pname)
+            if corners is None:
                 continue
-            cx_p, cy_p = pc
             is_hl = (hover == pname)
+            # Plane fades when either contributing axis is strongly foreshortened
+            fa = axis_fades.get(pname[0], 1.0)
+            fb = axis_fades.get(pname[1], 1.0)
+            plane_fade = fa * fb
+            if plane_fade <= 0.0:
+                continue
             blend_r = (col_a[0] + col_b[0]) * 0.5
             blend_g = (col_a[1] + col_b[1]) * 0.5
             blend_b = (col_a[2] + col_b[2]) * 0.5
-            fill_col   = (blend_r, blend_g, blend_b, 0.35 if is_hl else 0.18)
-            border_col = _SCALE_COL_HL if is_hl else (blend_r, blend_g, blend_b, 0.85)
-            d1 = screen_dirs.get(pname[0])
-            d2 = screen_dirs.get(pname[1])
-            if d1 is None or d2 is None:
-                continue
-            half = PSZ
-            c1 = (cx_p + d1[0]*half + d2[0]*half, cy_p + d1[1]*half + d2[1]*half)
-            c2 = (cx_p - d1[0]*half + d2[0]*half, cy_p - d1[1]*half + d2[1]*half)
-            c3 = (cx_p - d1[0]*half - d2[0]*half, cy_p - d1[1]*half - d2[1]*half)
-            c4 = (cx_p + d1[0]*half - d2[0]*half, cy_p + d1[1]*half - d2[1]*half)
+            fill_col   = (blend_r, blend_g, blend_b, (0.35 if is_hl else 0.18) * plane_fade)
+            border_col = _SCALE_COL_HL if is_hl else (blend_r, blend_g, blend_b, 0.85 * plane_fade)
+            c1, c2, c3, c4 = corners
             _draw_flat([c1, c2, c3, c1, c3, c4], fill_col)
             _draw_aa([(c1, c2), (c2, c3), (c3, c4), (c4, c1)], border_col, 1.5)
 
@@ -1321,7 +1422,7 @@ class VIEW3D_OT_modo_scale_gizmo_hover(bpy.types.Operator):
 
 class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
     """LMB on a scale gizmo handle: drag to scale.
-    S mid-drag → flatten (×0).  D mid-drag → flip (×-1)."""
+    C mid-drag → flatten (×0).  V mid-drag → flip (×-1)."""
     bl_idname  = 'view3d.modo_scale_gizmo_drag'
     bl_label   = 'Scale Gizmo Drag'
     bl_options = {'INTERNAL', 'BLOCKING'}
@@ -1454,6 +1555,8 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
         old_cursor = context.scene.cursor.location.copy()
         context.tool_settings.transform_pivot_point = 'CURSOR'
         context.scene.cursor.location = self._pivot_w
+        # negative scale = mirror → need to recalculate normals afterwards
+        is_flip = any(v < 0.0 for v in sv)
         try:
             bpy.ops.transform.resize(
                 'EXEC_DEFAULT',
@@ -1461,6 +1564,8 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
                 constraint_axis=constraint,
                 orient_type=self._orient_t,
             )
+            if is_flip and context.mode == 'EDIT_MESH':
+                bpy.ops.mesh.normals_make_consistent(inside=False)
         except Exception:
             pass
         finally:
@@ -1484,13 +1589,13 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
                 context.area.tag_redraw()
             return {'FINISHED'}
 
-        if event.type == 'S' and event.value == 'PRESS':
+        if event.type == 'C' and event.value == 'PRESS':
             self._finalize(context, 0.0)
             if context.area:
                 context.area.tag_redraw()
             return {'FINISHED'}
 
-        if event.type == 'D' and event.value == 'PRESS':
+        if event.type == 'V' and event.value == 'PRESS':
             self._finalize(context, -1.0)
             if context.area:
                 context.area.tag_redraw()
