@@ -529,6 +529,12 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
         'RESIZE':    'show_gizmo_object_scale',
     }
 
+    _TOOL_IDS = {
+        'TRANSLATE': 'builtin.move',
+        'ROTATE':    'builtin.rotate',
+        'RESIZE':    'builtin.scale',
+    }
+
     transform_type: EnumProperty(
         name='Transform Type',
         items=[
@@ -546,16 +552,28 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
                 and context.mode in ('OBJECT', 'EDIT_MESH', 'EDIT_CURVE',
                                      'EDIT_ARMATURE', 'POSE'))
 
+    def _active_tool_id(self, context):
+        """Return the idname of the current workspace tool, or '' on failure."""
+        try:
+            tool = context.workspace.tools.from_space_view3d_mode(context.mode)
+            return tool.idname if tool else ''
+        except Exception:
+            return ''
+
     def invoke(self, context, event):
         sv3d = context.space_data
         attr = self._GIZMO_ATTRS[self.transform_type]
         other_attrs   = [a for a in self._GIZMO_ATTRS.values() if a != attr]
-        currently_on  = getattr(sv3d, attr)
-        others_on     = any(getattr(sv3d, a) for a in other_attrs)
+        active_tool   = self._active_tool_id(context)
+        already_on    = (active_tool == self._TOOL_IDS[self.transform_type])
 
-        if currently_on and not others_on:
-            # Toggle off — same tool pressed again
+        if already_on:
+            # Toggle off — already on this transform tool, return to box select
             setattr(sv3d, attr, False)
+            try:
+                bpy.ops.wm.tool_set_by_id(name='builtin.select_box')
+            except Exception:
+                pass
             state._active_transform_mode = None
             _stop_snap_highlight()
             if self.transform_type == 'TRANSLATE':
@@ -583,7 +601,7 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
                 _implicit_deselect_all_geometry(context)
                 state._implicit_select_all = False
         else:
-            # Switch to (or activate) this transform type
+            # Activate this transform type (from any tool: extrude, bevel, box select, etc.)
             if (state._active_transform_mode is not None
                     and state._active_transform_mode != self.transform_type):
                 _stop_snap_highlight()
@@ -594,6 +612,10 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
             setattr(sv3d, attr, True)
             if not sv3d.show_gizmo:
                 sv3d.show_gizmo = True
+            try:
+                bpy.ops.wm.tool_set_by_id(name=self._TOOL_IDS[self.transform_type])
+            except Exception:
+                pass
             state._active_transform_mode = self.transform_type
             # Force snap base to CENTER
             if state._saved_snap_target is None:
