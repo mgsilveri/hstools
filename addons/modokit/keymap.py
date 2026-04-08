@@ -565,6 +565,19 @@ def register_keymaps():
                 )
                 state.addon_keymaps.append((target_km, kmi))
 
+            # Scale gizmo: hover highlight + LMB drag (active when RESIZE tool on)
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_scale_gizmo_hover',
+                type='MOUSEMOVE', value='ANY', any=True, head=True,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_scale_gizmo_drag',
+                type='LEFTMOUSE', value='PRESS', head=True,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
     # Build identity tuples for all registered items
     state._registered_kmi_ids.clear()
     for km, kmi in state.addon_keymaps:

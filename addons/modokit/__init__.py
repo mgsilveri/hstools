@@ -86,6 +86,8 @@ _ALL_CLASSES = (
     transform_3d.VIEW3D_OT_modo_transform,
     transform_3d.VIEW3D_OT_modo_drop_transform,
     transform_3d.VIEW3D_OT_modo_screen_move,
+    transform_3d.VIEW3D_OT_modo_scale_gizmo_hover,
+    transform_3d.VIEW3D_OT_modo_scale_gizmo_drag,
     uv_snap.IMAGE_OT_modo_uv_snap_highlight,
     ops_uv.IMAGE_OT_modo_uv_transform,
     ops_uv.IMAGE_OT_modo_uv_component_mode,

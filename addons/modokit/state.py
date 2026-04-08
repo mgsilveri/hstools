@@ -64,6 +64,14 @@ _implicit_select_all: bool = False
 _snap_highlight = None             # dict | None
 _snap_highlight_draw_handle = None
 
+# ── Scale gizmo (3D viewport R tool) ──────────────────────────────────────────
+_scale_gizmo_draw_handle = None
+# Cached per-frame screen-space handle positions for hit-testing.
+# Keys: 'pivot' (px,py), 'X/Y/Z' (ex,ey), 'XY/XZ/YZ' (cx,cy),
+#       'X_dir/Y_dir/Z_dir' (ndx,ndy)  — all in region pixels.
+_scale_gizmo_screen_handles: dict = {}
+_scale_gizmo_hover: str = ''       # '' | 'X' | 'Y' | 'Z' | 'XY' | 'XZ' | 'YZ' | 'XYZ'
+
 # ── UV transform ─────────────────────────────────────────────────────────────
 _uv_active_transform_mode = None   # 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
 _uv_gizmo_center = None            # (u, v) tuple | None
@@ -130,6 +138,8 @@ _OUR_IDNAMES = {
     'view3d.modo_transform',
     'view3d.modo_drop_transform',
     'view3d.modo_screen_move',
+    'view3d.modo_scale_gizmo_hover',
+    'view3d.modo_scale_gizmo_drag',
     'view3d.modo_preselect_highlight',
     'image.modo_preselect_highlight',
     'image.modo_uv_snap_highlight',

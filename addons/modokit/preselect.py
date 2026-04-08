@@ -824,12 +824,20 @@ def _preselect_draw_3d_inner():
 
     rv3d   = getattr(context, 'region_data', None)
     region = getattr(context, 'region', None)
-    prefs  = _get_prefs(context)
+    if region is None or rv3d is None:
+        return
+
+    prefs = _get_prefs(context)
     if prefs is not None and not prefs.enable_preselect_highlight:
         return
 
-    hover_col   = _hover_color(prefs)        # face: uses pref alpha (~30%)
-    hover_solid = (hover_col[0], hover_col[1], hover_col[2], 1.0)  # edge/vert: full opacity
+    # When a Modo transform tool is active (W/E/R), suppress face highlight
+    # entirely — user is manipulating, not selecting.
+    if state._active_transform_mode is not None:
+        return
+
+    hover_col   = _hover_color(prefs)
+    hover_solid = (hover_col[0], hover_col[1], hover_col[2], 1.0)
     sel_col     = _selected_hover_color(context)
     sel_solid   = (sel_col[0], sel_col[1], sel_col[2], 1.0)
     shader      = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -962,15 +970,20 @@ def _preselect_draw_3d_px_inner():
     if prefs is not None and not prefs.enable_preselect_highlight:
         return
 
+    # When a Modo transform tool is active, suppress edges — keep verts for snapping.
+    _transform_active = state._active_transform_mode is not None
+
     hover_solid = tuple(list(_hover_color(prefs)[:3]) + [1.0])
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-
     gpu.state.blend_set('ALPHA')
 
     try:
         for hit in state._preselect_hits:
             htype = hit['type']
             if htype not in ('EDGE', 'VERT'):
+                continue
+            # Skip edges when transform tool is active; keep verts for snap targets
+            if _transform_active and htype == 'EDGE':
                 continue
             color = hover_solid
 
