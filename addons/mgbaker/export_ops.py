@@ -37,7 +37,7 @@ _MAP_DEFS = [
     ("bake_ao",           "Ambient Occlusion",  "_ambient_occlusion"),
     ("bake_curvature",    "Curvature",           "_curvature"),
     ("bake_world_normal", "Normals (Object)",    "_world_space_normals"),
-    ("bake_id",           "Albedo",              "_id"),
+    ("bake_id",           "Object ID",           "_id"),
     ("bake_thickness",    "Thickness",           "_thickness"),
     ("bake_position",     "Position",            "_position"),
     ("bake_uv_islands",   "UV Island",           "_uv_islands"),
@@ -359,8 +359,16 @@ def _export_per_group_fbx(groups, bakes_dir):
             if group.hp_collection:
                 hp_temp = _prepare_collection(group.hp_collection, group)
                 hp_objs = [o for o in hp_temp.objects if o.type == 'MESH']
-                if hp_objs:
-                    _join_to_single(hp_objs, f"{group.name}_high", temp_col)
+                for i, obj in enumerate(hp_objs):
+                    # All HP objects share the group name prefix so Toolbag's
+                    # quick loader puts them all in the same bake group as
+                    # {group.name}_low.  Using a numeric suffix keeps names
+                    # unique while still matching the LP by base name.
+                    obj.name = f"{group.name}_high_{i}"
+                    obj.data.name = obj.name
+                    for col in list(obj.users_collection):
+                        col.objects.unlink(obj)
+                    temp_col.objects.link(obj)
                 _cleanup_temp_collection(hp_temp)
 
             if group.lp_collection:
