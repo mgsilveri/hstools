@@ -12,7 +12,7 @@
 import math
 import bpy
 import bmesh
-from bpy.props import EnumProperty
+from bpy.props import EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
 from mathutils import Vector as _Vector, Matrix as _Matrix
 
 from . import state
@@ -1384,8 +1384,33 @@ def _sg_hit_test(mx, my):
         if math.sqrt((mx-pivot[0])**2 + (my-pivot[1])**2) <= _SCALE_DOT_HIT_R:
             return 'XYZ'
 
+    _SHAFT_HIT_R = 8.0   # px proximity to arm shaft line segment
+
+    def _seg_dist(ax, ay, bx, by):
+        """Distance from (mx,my) to segment (ax,ay)-(bx,by)."""
+        dx, dy = bx - ax, by - ay
+        lsq = dx*dx + dy*dy
+        if lsq < 1e-6:
+            return math.sqrt((mx-ax)**2 + (my-ay)**2)
+        t = max(0.0, min(1.0, ((mx-ax)*dx + (my-ay)*dy) / lsq))
+        return math.sqrt((mx - ax - t*dx)**2 + (my - ay - t*dy)**2)
+
     best, best_d = '', float('inf')
-    for name in ('X', 'Y', 'Z', 'XY', 'XZ', 'YZ'):
+    px, py = pivot if pivot else (mx, my)
+
+    for name in ('X', 'Y', 'Z'):
+        pos = h.get(name)
+        if pos is None:
+            continue
+        d_tip   = math.sqrt((mx-pos[0])**2 + (my-pos[1])**2)
+        d_shaft = _seg_dist(px, py, pos[0], pos[1])
+        # Tip gets a generous click radius; shaft gets a tighter one.
+        if d_tip <= _SCALE_HIT_R and d_tip < best_d:
+            best_d, best = d_tip, name
+        elif d_shaft <= _SHAFT_HIT_R and d_shaft < best_d:
+            best_d, best = d_shaft, name
+
+    for name in ('XY', 'XZ', 'YZ'):
         pos = h.get(name)
         if pos is None:
             continue
@@ -1425,7 +1450,18 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
     C mid-drag → flatten (×0).  V mid-drag → flip (×-1)."""
     bl_idname  = 'view3d.modo_scale_gizmo_drag'
     bl_label   = 'Scale Gizmo Drag'
-    bl_options = {'INTERNAL', 'BLOCKING'}
+    bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
+
+    scale_x:     FloatProperty(name="X", default=100.0,
+                                soft_min=-500.0, soft_max=500.0, precision=1, step=100)
+    scale_y:     FloatProperty(name="Y", default=100.0,
+                                soft_min=-500.0, soft_max=500.0, precision=1, step=100)
+    scale_z:     FloatProperty(name="Z", default=100.0,
+                                soft_min=-500.0, soft_max=500.0, precision=1, step=100)
+    pivot_loc:   FloatVectorProperty(name="Pivot", default=(0.0, 0.0, 0.0),
+                                     size=3, options={'HIDDEN'})
+    orient_type: StringProperty(name="Orientation", default="GLOBAL",
+                                options={'HIDDEN'})
 
     @classmethod
     def poll(cls, context):
@@ -1494,14 +1530,14 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
         return cur / start if abs(start) > 1.0 else 1.0
 
     def _sv(self, s):
-        """Scale-value vector for axis + factor s."""
+        """Scale-value tuple for axis + factor s (used during live preview)."""
         a = self._axis
-        if a == 'X':   return (s, 1, 1)
-        if a == 'Y':   return (1, s, 1)
-        if a == 'Z':   return (1, 1, s)
-        if a == 'XY':  return (s, s, 1)
-        if a == 'XZ':  return (s, 1, s)
-        if a == 'YZ':  return (1, s, s)
+        if a == 'X':   return (s,   1.0, 1.0)
+        if a == 'Y':   return (1.0, s,   1.0)
+        if a == 'Z':   return (1.0, 1.0, s  )
+        if a == 'XY':  return (s,   s,   1.0)
+        if a == 'XZ':  return (s,   1.0, s  )
+        if a == 'YZ':  return (1.0, s,   s  )
         return (s, s, s)
 
     # ── apply / restore ──────────────────────────────────────────────────────
@@ -1544,25 +1580,34 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
                 if orig is not None:
                     obj.matrix_world = orig
 
-    def _finalize(self, context, s):
-        """Restore originals then replay with transform.resize for clean undo."""
-        self._restore(context)
-        sv = self._sv(s)
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        col = layout.column(align=True)
+        col.prop(self, 'scale_x', text="Scale X %", slider=False)
+        col.prop(self, 'scale_y', text="Y %",       slider=False)
+        col.prop(self, 'scale_z', text="Z %",       slider=False)
+
+    def execute(self, context):
+        """Apply the scale — called on first finish (from modal) and on redo."""
+        # On first call from modal the mesh is still in preview state; restore first.
+        if hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices'):
+            self._restore(context)
+        sv = (self.scale_x / 100.0, self.scale_y / 100.0, self.scale_z / 100.0)
         if all(abs(v - 1.0) < 1e-9 for v in sv):
-            return  # no effective change
-        constraint = _SCALE_AXIS_CONSTRAINTS.get(self._axis, (True, True, True))
+            return {'FINISHED'}
+        pivot_w    = _Vector(self.pivot_loc)
         old_pp     = context.tool_settings.transform_pivot_point
         old_cursor = context.scene.cursor.location.copy()
         context.tool_settings.transform_pivot_point = 'CURSOR'
-        context.scene.cursor.location = self._pivot_w
-        # negative scale = mirror → need to recalculate normals afterwards
+        context.scene.cursor.location = pivot_w
         is_flip = any(v < 0.0 for v in sv)
         try:
             bpy.ops.transform.resize(
                 'EXEC_DEFAULT',
                 value=sv,
-                constraint_axis=constraint,
-                orient_type=self._orient_t,
+                constraint_axis=(True, True, True),
+                orient_type=self.orient_type,
             )
             if is_flip and context.mode == 'EDIT_MESH':
                 bpy.ops.mesh.normals_make_consistent(inside=False)
@@ -1571,6 +1616,17 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
         finally:
             context.tool_settings.transform_pivot_point = old_pp
             context.scene.cursor.location = old_cursor
+        return {'FINISHED'}
+
+    def _commit(self, context, s):
+        """Snapshot sv as percentages into operator properties (enables redo panel)."""
+        sv = self._sv(s)
+        self.scale_x     = sv[0] * 100.0
+        self.scale_y     = sv[1] * 100.0
+        self.scale_z     = sv[2] * 100.0
+        self.pivot_loc   = self._pivot_w.to_tuple()
+        self.orient_type = self._orient_t
+        return self.execute(context)
 
     # ── modal ────────────────────────────────────────────────────────────────
 
@@ -1584,22 +1640,22 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            self._finalize(context, self._last_s)
+            result = self._commit(context, self._last_s)
             if context.area:
                 context.area.tag_redraw()
-            return {'FINISHED'}
+            return result
 
         if event.type == 'C' and event.value == 'PRESS':
-            self._finalize(context, 0.0)
+            result = self._commit(context, 0.0)
             if context.area:
                 context.area.tag_redraw()
-            return {'FINISHED'}
+            return result
 
         if event.type == 'V' and event.value == 'PRESS':
-            self._finalize(context, -1.0)
+            result = self._commit(context, -1.0)
             if context.area:
                 context.area.tag_redraw()
-            return {'FINISHED'}
+            return result
 
         if event.type in ('RIGHTMOUSE', 'ESC'):
             self._restore(context)
