@@ -257,7 +257,7 @@ def _find_uv_snap_target(context, mx, my, ctrl_held=False):
         return None
 
     snap_els  = _get_uv_snap_elements(ts)
-    want_vert = 'VERTEX' in snap_els or 'INCREMENT' in snap_els
+    want_vert = 'VERTEX' in snap_els
     want_edge = 'EDGE_MIDPOINT' in snap_els or 'EDGE' in snap_els
     if not want_vert and not want_edge:
         want_vert = True
@@ -355,41 +355,24 @@ class IMAGE_OT_modo_uv_snap_highlight(bpy.types.Operator):
                 and context.mode == 'EDIT_MESH')
 
     def invoke(self, context, event):
-        self._ctrl_override = False
-        self._snap_was_on   = False
-        self._last_mx       = event.mouse_region_x
-        self._last_my       = event.mouse_region_y
-        self._last_ctrl     = event.ctrl
+        self._last_mx   = event.mouse_region_x
+        self._last_my   = event.mouse_region_y
+        self._last_ctrl = event.ctrl
         context.window_manager.modal_handler_add(self)
         if state._uv_snap_highlight_draw_handle is None:
             state._uv_snap_highlight_draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
                 _uv_snap_highlight_draw_callback, (), 'WINDOW', 'POST_PIXEL')
-        if event.ctrl:
-            self._apply_ctrl_snap(context, True)
         return {'RUNNING_MODAL'}
-
-    def _apply_ctrl_snap(self, context, ctrl_held):
-        ts = context.tool_settings
-        if ctrl_held and not self._ctrl_override:
-            self._snap_was_on   = ts.use_snap
-            ts.use_snap         = True
-            self._ctrl_override = True
-        elif not ctrl_held and self._ctrl_override:
-            ts.use_snap         = self._snap_was_on
-            self._ctrl_override = False
 
     def modal(self, context, event):
         if state._uv_active_transform_mode is None:
-            self._apply_ctrl_snap(context, False)
             self._cleanup()
             return {'FINISHED'}
 
-        self._apply_ctrl_snap(context, event.ctrl)
-
+        self._last_ctrl = event.ctrl
         if event.type == 'MOUSEMOVE':
-            self._last_mx   = event.mouse_region_x
-            self._last_my   = event.mouse_region_y
-            self._last_ctrl = event.ctrl
+            self._last_mx = event.mouse_region_x
+            self._last_my = event.mouse_region_y
 
         if state._uv_handle_modal_active:
             if state._uv_snap_highlight is not None:
