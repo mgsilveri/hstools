@@ -167,8 +167,16 @@ class MG_OT_AddProject(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        import os
         scn = context.scene
         projects = scn.mg_projects
+
+        # When adding the second project, rename the first one to the blend filename
+        # so the default "Project" placeholder is replaced with the actual asset name.
+        if len(projects) == 1:
+            blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+            if blend_name:
+                projects[0].name = blend_name
 
         proj = projects.add()
         if context.active_object and context.active_object.type == 'MESH':
