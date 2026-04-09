@@ -324,6 +324,11 @@ def register_keymaps():
                             and _kmi.idname in _UV_CONFLICT_IDNAMES
                             and _kmi.active):
                         _kmi.active = False
+                    # Also disable any existing FOUR binding (e.g. uv.select_mode ISLAND)
+                    if (_kmi.type == 'FOUR'
+                            and not _kmi.shift and not _kmi.ctrl and not _kmi.alt
+                            and _kmi.active):
+                        _kmi.active = False
 
         # Disable uv.select_box / uv.select_lasso on LMB
         _UV_LMB_BOX_NAMES = {'uv.select_box', 'uv.select_lasso'}
@@ -386,6 +391,15 @@ def register_keymaps():
                 )
                 kmi.properties.mode = uv_mode
                 state.addon_keymaps.append((km_uv, kmi))
+
+            # 4 — UV material mode
+            kmi = km_uv.keymap_items.new(
+                'image.modo_uv_material_mode',
+                type='FOUR',
+                value='PRESS',
+                head=True,
+            )
+            state.addon_keymaps.append((km_uv, kmi))
 
         if prefs.enable_uv_handle_snap:
             for km_uv in _uv_km_targets:

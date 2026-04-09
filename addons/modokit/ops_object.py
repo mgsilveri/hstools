@@ -99,6 +99,11 @@ class OBJECT_OT_modo_click_select(bpy.types.Operator):
 
         # ── Modo handle reposition (Object Mode) ──────────────────────────────
         if state._active_transform_mode in ('TRANSLATE', 'ROTATE', 'RESIZE'):
+            print(f"[modokit DBG] object.modo_click_select invoke: "
+                  f"region={getattr(context.region, 'type', None)} "
+                  f"mouse_abs=({event.mouse_x},{event.mouse_y}) "
+                  f"mouse_region=({event.mouse_region_x},{event.mouse_region_y}) "
+                  f"transform={state._active_transform_mode}")
             from bpy_extras import view3d_utils
             from .transform_3d import _compute_selection_median, _start_anchor_timer, _start_pivot_crosshair
             coord     = (self.mouse_x, self.mouse_y)

@@ -107,9 +107,11 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.mode == 'EDIT_MESH' and
-                context.object and
-                context.object.type == 'MESH')
+        return (context.mode == 'EDIT_MESH'
+                and context.object is not None
+                and context.object.type == 'MESH'
+                and context.region is not None
+                and context.region.type == 'WINDOW')
 
     def invoke(self, context, event):
         self.mouse_x = event.mouse_region_x
@@ -127,6 +129,11 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
 
         # ── Modo handle reposition (Edit Mode) ───────────────────────────────
         if state._active_transform_mode in ('TRANSLATE', 'ROTATE', 'RESIZE'):
+            print(f"[modokit DBG] mesh.modo_select_element_under_mouse invoke: "
+                  f"region={getattr(context.region, 'type', None)} "
+                  f"mouse_abs=({event.mouse_x},{event.mouse_y}) "
+                  f"mouse_region=({event.mouse_region_x},{event.mouse_region_y}) "
+                  f"transform={state._active_transform_mode}")
             from bpy_extras import view3d_utils
             from .raycast import raycast_mesh
             from .transform_3d import _compute_selection_median, _start_anchor_timer, _start_pivot_crosshair
@@ -518,7 +525,7 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
                          'obj': ray_result.get('obj', context.edit_object),
                          'vert_index': ray_result['index'] if select_mode[0] else None,
                          'edge_index': ray_result['index'] if select_mode[1] else None,
-                         'face_index': ray_result['index'] if select_mode[2] else None,
+                         'face_index': ray_result['index'] if (select_mode[2] or state._material_mode_active) else None,
                          'hit_face_index': ray_result.get('hit_face_index')}]
 
         if not hits:
@@ -531,22 +538,29 @@ class MESH_OT_modo_select_element_under_mouse(bpy.types.Operator):
         first_obj = first.get('obj', context.edit_object)
         first_bm  = bmesh.from_edit_mesh(first_obj.data)
         first_bm.faces.ensure_lookup_table()
-        first_idx = first.get('face_index') if select_mode[2] else (
-                    first.get('edge_index') if select_mode[1] else first.get('vert_index'))
         first_element = None
-        if first_idx is not None:
-            if select_mode[2] and first_idx < len(first_bm.faces):
-                first_element = first_bm.faces[first_idx]
-            elif select_mode[1]:
-                first_bm.edges.ensure_lookup_table()
-                if first_idx < len(first_bm.edges):
-                    first_element = first_bm.edges[first_idx]
-            elif select_mode[0]:
-                first_bm.verts.ensure_lookup_table()
-                if first_idx < len(first_bm.verts):
-                    first_element = first_bm.verts[first_idx]
+        # In material mode we always resolve to the hovered face regardless of
+        # the active select sub-mode (face_mode is forced True in preselect).
+        if state._material_mode_active:
+            face_idx = first.get('face_index') or first.get('hit_face_index')
+            if face_idx is not None and face_idx < len(first_bm.faces):
+                first_element = first_bm.faces[face_idx]
+        else:
+            first_idx = first.get('face_index') if select_mode[2] else (
+                        first.get('edge_index') if select_mode[1] else first.get('vert_index'))
+            if first_idx is not None:
+                if select_mode[2] and first_idx < len(first_bm.faces):
+                    first_element = first_bm.faces[first_idx]
+                elif select_mode[1]:
+                    first_bm.edges.ensure_lookup_table()
+                    if first_idx < len(first_bm.edges):
+                        first_element = first_bm.edges[first_idx]
+                elif select_mode[0]:
+                    first_bm.verts.ensure_lookup_table()
+                    if first_idx < len(first_bm.verts):
+                        first_element = first_bm.verts[first_idx]
 
-        if (state._material_mode_active and select_mode[2]
+        if (state._material_mode_active
                 and isinstance(first_element, bmesh.types.BMFace)):
             mat_nr      = first_element.material_index
             mats        = first_obj.data.materials

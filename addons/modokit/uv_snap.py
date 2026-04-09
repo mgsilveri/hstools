@@ -182,8 +182,23 @@ def _snap_uv_translate(context, raw_du, raw_dv, uv_info, ctrl_held=False,
 
     # ── Increment / grid snap ─────────────────────────────────────────────────
     if want_increment:
-        gu, gv = _get_uv_grid_size(sima)
-        return (round(raw_du / gu) * gu, round(raw_dv / gv) * gv, None)
+        # PIXEL: snap to texel grid.  INCREMENT/GRID: snap to UV grid lines (1/8)
+        if 'PIXEL' in snap_els:
+            gu, gv = _get_uv_grid_size(sima)
+        else:
+            gu = gv = 0.125
+        # Snap the ABSOLUTE destination position to the grid, then derive the
+        # corrected delta.  Rounding the raw delta alone fails when the reference
+        # position is not already on a grid line.
+        if gizmo_center is not None:
+            cu, cv = gizmo_center
+        elif uv_info:
+            cu, cv = uv_info[0][3], uv_info[0][4]
+        else:
+            cu, cv = 0.0, 0.0
+        snapped_u = round((cu + raw_du) / gu) * gu
+        snapped_v = round((cv + raw_dv) / gv) * gv
+        return snapped_u - cu, snapped_v - cv, None
 
     return raw_du, raw_dv, None
 
@@ -201,7 +216,11 @@ def _snap_uv_cursor(context, mx, my, ctrl_held=False):
     want_vertex    = 'VERTEX' in snap_els
     want_increment = 'INCREMENT' in snap_els or 'GRID' in snap_els or 'PIXEL' in snap_els
     if not want_vertex and not want_increment:
-        want_vertex = True
+        if not snap_els:
+            # Could not read snap elements — fall back to vertex as safe default
+            want_vertex = True
+        else:
+            return None
 
     if want_vertex:
         try:
@@ -232,7 +251,10 @@ def _snap_uv_cursor(context, mx, my, ctrl_held=False):
         raw = _uv_region_to_view(region, sima, mx, my)
         if raw is None:
             return None
-        gu, gv = _get_uv_grid_size(sima)
+        if 'PIXEL' in snap_els:
+            gu, gv = _get_uv_grid_size(sima)
+        else:
+            gu = gv = 0.125
         return (round(raw[0] / gu) * gu, round(raw[1] / gv) * gv)
 
     return None
@@ -260,7 +282,13 @@ def _find_uv_snap_target(context, mx, my, ctrl_held=False):
     want_vert = 'VERTEX' in snap_els
     want_edge = 'EDGE_MIDPOINT' in snap_els or 'EDGE' in snap_els
     if not want_vert and not want_edge:
-        want_vert = True
+        if not snap_els:
+            # Could not read snap elements — fall back to vertex as safe default
+            want_vert = True
+        else:
+            # Snap is set to a non-geometry mode (INCREMENT, PIXEL, etc.) —
+            # no geometry highlight is applicable.
+            return None
 
     try:
         edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']

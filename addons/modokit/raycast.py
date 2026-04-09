@@ -51,13 +51,16 @@ def clear_bvh_cache():
     _bvh_cache.clear()
 
 
-def raycast_mesh(context, coord, bm=None):
+def raycast_mesh(context, coord, bm=None, force_face=False):
     """Perform raycast at a specific screen coordinate using BVH trees built
     directly from the live BMesh of every object in Edit Mode.
 
     This avoids the evaluated-depsgraph mesh whose face indices can diverge
     from BMesh indices (especially with modifiers) and which is unreliable at
     certain camera angles in Edit Mode.
+
+    force_face=True: always return a face hit regardless of mesh_select_mode.
+    Used by material-mode selection which needs a face regardless of sub-mode.
     """
     region = context.region
     rv3d   = context.region_data
@@ -69,6 +72,8 @@ def raycast_mesh(context, coord, bm=None):
     ray_origin  = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
 
     select_mode = context.tool_settings.mesh_select_mode
+    if force_face:
+        select_mode = (False, False, True)
     mode_name   = ['VERT', 'EDGE', 'FACE'][[select_mode[0], select_mode[1], select_mode[2]].index(True)]
     max_screen_dist = 20
 
@@ -305,13 +310,15 @@ def select_connected_verts_from(bm, start_vert):
                 to_visit.append(other)
 
 
-def raycast_with_tolerance(context, coord, tolerance):
+def raycast_with_tolerance(context, coord, tolerance, force_face=False):
     """Raycast with pixel tolerance for 'lazy' selection.
 
     Replicates Modo's remapping.selectionSize preference.
     Tries exact hit first, then expands outward within *tolerance* pixels.
+
+    force_face=True: always return a face hit (for material mode).
     """
-    result = raycast_mesh(context, coord)
+    result = raycast_mesh(context, coord, force_face=force_face)
     if result:
         return result
     for offset_x in range(-tolerance, tolerance + 1):
@@ -320,7 +327,7 @@ def raycast_with_tolerance(context, coord, tolerance):
                 continue
             if math.sqrt(offset_x**2 + offset_y**2) <= tolerance:
                 test_coord = (coord[0] + offset_x, coord[1] + offset_y)
-                result = raycast_mesh(context, test_coord)
+                result = raycast_mesh(context, test_coord, force_face=force_face)
                 if result:
                     return result
     return None

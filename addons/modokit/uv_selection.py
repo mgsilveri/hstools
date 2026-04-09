@@ -1550,6 +1550,30 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if fi >= len(bm.faces):
                 continue
             face = bm.faces[fi]
+
+            # ── UV Material Mode ──────────────────────────────────────────────
+            if state._uv_material_mode_active:
+                mat_done = island_done.setdefault(oi, set())
+                if face.index in mat_done:
+                    continue
+                mat_nr    = face.material_index
+                mat_slots = obj_list[oi].data.materials
+                clicked_mat = mat_slots[mat_nr] if mat_nr < len(mat_slots) else None
+                bm.faces.ensure_lookup_table()
+                for iface in bm.faces:
+                    slot_mat = (mat_slots[iface.material_index]
+                                if iface.material_index < len(mat_slots) else None)
+                    if slot_mat is clicked_mat:
+                        mat_done.add(iface.index)
+                        if uv_layer is not None:
+                            for lp in iface.loops:
+                                lp.uv_select_vert = do_select
+                                lp.uv_select_edge = do_select
+                        if use_sync:
+                            iface.select = do_select
+                dirty_set.add(oi)
+                continue
+
             if use_sync:
                 if uv_mode == 'VERTEX':
                     if 0 <= li < len(face.loops):

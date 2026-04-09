@@ -1462,6 +1462,8 @@ class VIEW3D_OT_modo_falloff_handle_drag(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return (getattr(getattr(context.scene, 'modokit_falloff', None), 'enabled', False)
+                and context.region is not None
+                and context.region.type == 'WINDOW'
                 and context.space_data is not None
                 and context.space_data.type == 'VIEW_3D')
 
@@ -2163,6 +2165,8 @@ class VIEW3D_OT_modo_scale_gizmo_hover(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return (state._active_transform_mode == 'RESIZE'
+                and context.region is not None
+                and context.region.type == 'WINDOW'
                 and context.space_data is not None
                 and context.space_data.type == 'VIEW_3D')
 
@@ -2198,6 +2202,8 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return (state._active_transform_mode == 'RESIZE'
+                and context.region is not None
+                and context.region.type == 'WINDOW'
                 and context.space_data is not None
                 and context.space_data.type == 'VIEW_3D'
                 and context.mode in ('OBJECT', 'EDIT_MESH'))

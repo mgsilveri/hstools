@@ -25,7 +25,7 @@ from .uv_overlays import (
 from .uv_snap import (
     _collect_uv_transform_targets, _uv_drop_transform, _stop_uv_snap_highlight,
     _is_uv_snap_active, _get_uv_snap_elements, _snap_uv_translate,
-    _uv_auto_drop_check,
+    _uv_auto_drop_check, _get_uv_grid_size,
 )
 
 
@@ -172,6 +172,8 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
             return {'CANCELLED'}
 
         _uv_drop_transform(context)
+        _was_material = state._uv_material_mode_active
+        state._uv_material_mode_active = False
         tgt_mode = self.mode
 
         if ts.use_uv_select_sync:
@@ -183,9 +185,8 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
 
             cur_v, cur_e, cur_f = ts.mesh_select_mode
             cur_key = 'FACE' if cur_f else ('EDGE' if cur_e else 'VERT')
-            if cur_key == tgt_key:
+            if cur_key == tgt_key and not _was_material:
                 return {'FINISHED'}
-
             bm = bmesh.from_edit_mesh(obj.data)
             bm.verts.ensure_lookup_table()
             bm.edges.ensure_lookup_table()
@@ -193,22 +194,23 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
             mem = state._selection_memory.setdefault(
                 obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()}
             )
-            if cur_key == 'VERT':
-                mem['VERT'] = {v.index for v in bm.verts if v.select}
-                uv_layer_snap = bm.loops.layers.uv.active
-                if uv_layer_snap is not None:
-                    mem['VERT_UV'] = {
-                        (f.index, li)
-                        for f in bm.faces
-                        for li, loop in enumerate(f.loops)
-                        if loop.uv_select_vert
-                    }
+            if not _was_material:
+                if cur_key == 'VERT':
+                    mem['VERT'] = {v.index for v in bm.verts if v.select}
+                    uv_layer_snap = bm.loops.layers.uv.active
+                    if uv_layer_snap is not None:
+                        mem['VERT_UV'] = {
+                            (f.index, li)
+                            for f in bm.faces
+                            for li, loop in enumerate(f.loops)
+                            if loop.uv_select_vert
+                        }
+                    else:
+                        mem.pop('VERT_UV', None)
+                elif cur_key == 'EDGE':
+                    mem['EDGE'] = {e.index for e in bm.edges if e.select}
                 else:
-                    mem.pop('VERT_UV', None)
-            elif cur_key == 'EDGE':
-                mem['EDGE'] = {e.index for e in bm.edges if e.select}
-            else:
-                mem['FACE'] = {f.index for f in bm.faces if f.select}
+                    mem['FACE'] = {f.index for f in bm.faces if f.select}
 
             v3d_win = v3d_area = v3d_region = None
             for win in context.window_manager.windows:
@@ -276,9 +278,8 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
 
         # Sync OFF
         cur_mode = ts.uv_select_mode
-        if cur_mode == tgt_mode:
+        if cur_mode == tgt_mode and not _was_material:
             return {'FINISHED'}
-
         bm = bmesh.from_edit_mesh(obj.data)
         bm.faces.ensure_lookup_table()
         uv_layer = bm.loops.layers.uv.active
@@ -287,7 +288,7 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
             obj.data.name, {'VERTEX': set(), 'EDGE': set(), 'FACE': set()}
         )
 
-        if uv_layer is not None:
+        if uv_layer is not None and not _was_material:
             if cur_mode == 'VERTEX':
                 _uv_mem['VERTEX'] = {
                     (f.index, li)
@@ -333,6 +334,78 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
                         loop.uv_select_edge = val
             bmesh.update_edit_mesh(obj.data)
 
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+class IMAGE_OT_modo_uv_material_mode(bpy.types.Operator):
+    """Modo-style 4: toggle UV material-selection mode.
+    Clicking a UV face selects all UV faces on the same material slot.
+    Press 4 again or 1/2/3 to leave this mode."""
+    bl_idname  = 'image.modo_uv_material_mode'
+    bl_label   = 'Modo UV Material Mode'
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.space_data is not None
+                and context.space_data.type == 'IMAGE_EDITOR'
+                and context.mode == 'EDIT_MESH')
+
+    def execute(self, context):
+        if state._uv_material_mode_active:
+            return {'FINISHED'}
+        # Save current component selection before activating material mode
+        # so 1/2/3 can restore it when exiting.
+        ts  = context.tool_settings
+        obj = context.edit_object
+        if obj and obj.type == 'MESH':
+            if not ts.use_uv_select_sync:
+                cur_mode = ts.uv_select_mode
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                uv_layer = bm.loops.layers.uv.active
+                _uv_mem = state._uv_selection_memory.setdefault(
+                    obj.data.name, {'VERTEX': set(), 'EDGE': set(), 'FACE': set()}
+                )
+                if uv_layer is not None:
+                    if cur_mode == 'VERTEX':
+                        _uv_mem['VERTEX'] = {
+                            (f.index, li)
+                            for f in bm.faces
+                            for li, loop in enumerate(f.loops)
+                            if loop.uv_select_vert
+                        }
+                    elif cur_mode == 'EDGE':
+                        _uv_mem['EDGE'] = {
+                            (f.index, li)
+                            for f in bm.faces
+                            for li, loop in enumerate(f.loops)
+                            if loop.uv_select_edge
+                        }
+                    else:
+                        _uv_mem['FACE'] = {
+                            f.index for f in bm.faces
+                            if f.loops and all(loop.uv_select_vert for loop in f.loops)
+                        }
+            else:
+                cur_v, cur_e, cur_f = ts.mesh_select_mode
+                cur_key = 'FACE' if cur_f else ('EDGE' if cur_e else 'VERT')
+                bm = bmesh.from_edit_mesh(obj.data)
+                mem = state._selection_memory.setdefault(
+                    obj.data.name, {'VERT': set(), 'EDGE': set(), 'FACE': set()}
+                )
+                if cur_key == 'VERT':
+                    bm.verts.ensure_lookup_table()
+                    mem['VERT'] = {v.index for v in bm.verts if v.select}
+                elif cur_key == 'EDGE':
+                    bm.edges.ensure_lookup_table()
+                    mem['EDGE'] = {e.index for e in bm.edges if e.select}
+                else:
+                    bm.faces.ensure_lookup_table()
+                    mem['FACE'] = {f.index for f in bm.faces if f.select}
+        state._uv_material_mode_active = True
         if context.area:
             context.area.tag_redraw()
         return {'FINISHED'}
@@ -745,6 +818,7 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             ts = context.tool_settings
             if _is_uv_snap_active(ts, event.ctrl):
                 snap_els = _get_uv_snap_elements(ts)
+                vertex_snapped = False
                 if 'VERTEX' in snap_els:
                     du, dv, snap_tgt = _snap_uv_translate(
                         context, 0.0, 0.0, [],
@@ -753,6 +827,7 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                         mouse_screen=(mx, my))
                     if snap_tgt is not None:
                         uv_point = snap_tgt
+                        vertex_snapped = True
                         sc_snap = _uv_view_to_region(region, sima, snap_tgt[0], snap_tgt[1])
                         if sc_snap is not None:
                             state._uv_snap_highlight = {
@@ -760,6 +835,13 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                                 'uv_pos': snap_tgt,
                                 'elem_type': 'SNAP_VERTEX',
                             }
+                if not vertex_snapped and bool(snap_els & {'INCREMENT', 'GRID', 'PIXEL'}):
+                    # Snap the click position to the UV grid
+                    gu = gv = 0.125
+                    if 'PIXEL' in snap_els:
+                        gu, gv = _get_uv_grid_size(sima)
+                    uv_point = (round(uv_point[0] / gu) * gu,
+                                round(uv_point[1] / gv) * gv)
 
         state._uv_gizmo_center = uv_point
         _sync_uv_gizmo_center_to_bmesh(context)
@@ -1021,6 +1103,18 @@ class IMAGE_OT_modo_uv_selection_guard(bpy.types.Operator):
             # gestures (e.g. Alt+Shift+LMB pan) and must not be consumed.
             if event.alt:
                 return {'PASS_THROUGH'}
+            # Pass through clicks that land on the header, toolbar, sidebar, or
+            # any other non-WINDOW region (e.g. snap menu in the header bar).
+            # Use absolute screen coordinates so the check is region-agnostic.
+            area = context.area
+            if area:
+                mx, my = event.mouse_x, event.mouse_y
+                for reg in area.regions:
+                    if reg.type == 'WINDOW':
+                        continue
+                    if (reg.x <= mx < reg.x + reg.width and
+                            reg.y <= my < reg.y + reg.height):
+                        return {'PASS_THROUGH'}
             # Delegate to handle_reposition; it will do the hit test and
             # either start a drag modal or reposition the pivot — all without
             # any selection change.
@@ -1241,3 +1335,139 @@ Face: tear the outer boundary of the selected face(s)."""
             context.area.tag_redraw()
         self.report({'INFO'}, f"Ripped {len(targets)} UV loop(s)")
         return {'FINISHED'}
+
+
+# ── UV header patch ───────────────────────────────────────────────────────────
+
+def _patched_image_ht_header_draw(self, context):
+    """Replacement for IMAGE_HT_header.draw.
+
+    Identical to the original except the ``use_uv_select_island`` toggle is
+    replaced by the Material Mode button at the same header position (between
+    the vertex/edge/face buttons and the sticky-select mode button).
+    """
+    layout = self.layout
+
+    sima = context.space_data
+    overlay = sima.overlay
+    ima = sima.image
+    iuser = sima.image_user
+    tool_settings = context.tool_settings
+
+    show_render = sima.show_render
+    show_uvedit = sima.show_uvedit
+    show_maskedit = sima.show_maskedit
+
+    layout.template_header()
+
+    if sima.mode != 'UV':
+        layout.prop(sima, "ui_mode", text="")
+
+    # UV editing.
+    if show_uvedit:
+        layout.prop(tool_settings, "use_uv_select_sync", text="")
+
+        if tool_settings.use_uv_select_sync:
+            if state._uv_material_mode_active:
+                # Draw manual buttons with depress=False — material mode is its own mode.
+                row = layout.row(align=True)
+                is_vert, is_edge, is_face = tool_settings.mesh_select_mode
+                row.operator('mesh.select_mode', text='', icon='VERTEXSEL',
+                             depress=False).type = 'VERT'
+                row.operator('mesh.select_mode', text='', icon='EDGESEL',
+                             depress=False).type = 'EDGE'
+                row.operator('mesh.select_mode', text='', icon='FACESEL',
+                             depress=False).type = 'FACE'
+            else:
+                layout.template_edit_mode_selection()
+        else:
+            row = layout.row(align=True)
+            uv_select_mode = tool_settings.uv_select_mode[:]
+            _mat = state._uv_material_mode_active
+            row.operator(
+                "uv.select_mode", text="", icon='UV_VERTEXSEL',
+                depress=(uv_select_mode == 'VERTEX') and not _mat,
+            ).type = 'VERTEX'
+            row.operator(
+                "uv.select_mode", text="", icon='UV_EDGESEL',
+                depress=(uv_select_mode == 'EDGE') and not _mat,
+            ).type = 'EDGE'
+            row.operator(
+                "uv.select_mode", text="", icon='UV_FACESEL',
+                depress=(uv_select_mode == 'FACE') and not _mat,
+            ).type = 'FACE'
+
+        # Material Mode button in place of the island-select toggle.
+        layout.row(align=True).operator(
+            'image.modo_uv_material_mode',
+            text='',
+            icon='MATERIAL',
+            depress=state._uv_material_mode_active,
+        )
+        layout.prop(tool_settings, "uv_sticky_select_mode", icon_only=True)
+
+    bpy.types.IMAGE_MT_editor_menus.draw_collapsible(context, layout)
+
+    layout.separator_spacer()
+
+    bpy.types.IMAGE_HT_header.draw_xform_template(layout, context)
+
+    layout.template_ID(sima, "image", new="image.new", open="image.open")
+
+    if show_maskedit:
+        layout.template_ID(sima, "mask", new="mask.new")
+        layout.prop(sima, "pivot_point", icon_only=True)
+
+        row = layout.row(align=True)
+        row.prop(tool_settings, "use_proportional_edit_mask", text="", icon_only=True)
+        sub = row.row(align=True)
+        sub.active = tool_settings.use_proportional_edit_mask
+        sub.prop_with_popover(
+            tool_settings,
+            "proportional_edit_falloff",
+            text="",
+            icon_only=True,
+            panel="IMAGE_PT_proportional_edit",
+        )
+
+    if not show_render:
+        layout.prop(sima, "use_image_pin", text="", emboss=False)
+
+    layout.separator_spacer()
+
+    # Gizmo toggle & popover.
+    row = layout.row(align=True)
+    row.prop(sima, "show_gizmo", icon='GIZMO', text="")
+    sub = row.row(align=True)
+    sub.active = sima.show_gizmo
+    sub.popover(panel="IMAGE_PT_gizmo_display", text="")
+
+    # Overlay toggle & popover.
+    row = layout.row(align=True)
+    row.prop(overlay, "show_overlays", icon='OVERLAY', text="")
+    sub = row.row(align=True)
+    sub.active = overlay.show_overlays
+    sub.popover(panel="IMAGE_PT_overlay", text="")
+
+    if show_uvedit:
+        mesh = context.edit_object.data
+        layout.prop_search(mesh.uv_layers, "active", mesh, "uv_layers", text="")
+
+    if ima:
+        seq_scene = getattr(context, 'sequencer_scene', None)
+        scene = context.scene
+
+        if show_render and seq_scene and (seq_scene != scene):
+            row = layout.row()
+            row.prop(sima, "show_sequencer_scene", text="")
+
+        if ima.is_stereo_3d:
+            row = layout.row()
+            row.prop(sima, "show_stereo_3d", text="")
+
+        # layers.
+        layout.template_image_layers(ima, iuser)
+
+        # draw options.
+        row = layout.row()
+        row.prop(sima, "display_channels", icon_only=True)

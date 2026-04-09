@@ -225,9 +225,11 @@ def _collect_edit_hits(context, mx, my):
     view_vec    = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
     ray_origin  = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
     sm          = context.tool_settings.mesh_select_mode
-    face_mode   = sm[2]
-    edge_mode   = sm[1]
-    vert_mode   = sm[0]
+    # Material mode always highlights faces regardless of the active select mode.
+    _mat_active = state._material_mode_active
+    face_mode   = sm[2] or _mat_active
+    edge_mode   = sm[1] and not _mat_active
+    vert_mode   = sm[0] and not _mat_active
 
     hits = []
 
@@ -628,9 +630,11 @@ def _collect_uv_hits(context, mx, my):
 
     from .uv_overlays import _uv_view_to_region
     sm        = ts.mesh_select_mode
-    face_mode = sm[2]
-    edge_mode = sm[1]
-    vert_mode = sm[0]
+    # UV material mode always highlights faces regardless of the active select mode.
+    _uv_mat = state._uv_material_mode_active
+    face_mode = sm[2] or _uv_mat
+    edge_mode = sm[1] and not _uv_mat
+    vert_mode = sm[0] and not _uv_mat
 
     hits = []
     try:
