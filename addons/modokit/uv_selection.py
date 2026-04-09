@@ -31,6 +31,7 @@ from .uv_overlays import (
     _clip_segment_to_rect,
     _point_to_segment_dist,
     _resync_uv_editor_selection,
+    _resync_uv_editor_selection_batch,
     _compute_uv_boundary_cache,
     _compute_uv_selection_median,
     _start_uv_boundary_overlay,
@@ -696,7 +697,9 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.space_data is not None
+        return (context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
                 and context.space_data.type == 'IMAGE_EDITOR'
                 and context.mode == 'EDIT_MESH')
 
@@ -877,7 +880,10 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
                 break
 
         if best_face is None or (best_dist > TOLERANCE and best_dist >= 0):
-            return {'CANCELLED'}
+            # Nothing under cursor — consume the event anyway (return FINISHED,
+            # not CANCELLED) so Blender doesn't fall back to treating DOUBLE_CLICK
+            # as a PRESS, which would fire paint_sel(set) and clear the selection.
+            return {'FINISHED'}
 
         bm       = best_bm
         obj      = best_obj
@@ -944,8 +950,12 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
             bm.select_flush_mode()
         bmesh.update_edit_mesh(obj.data)
         if use_sync:
-            _resync_uv_editor_selection(
-                context, obj, tuple(ts.mesh_select_mode), bm)
+            # Use batch resync so other edit objects' selections are preserved.
+            # The single-object variant runs uv.select_all(DESELECT) which wipes
+            # all objects in sync mode, losing selections on sibling objects.
+            bm_list_all = [(o, bmesh.from_edit_mesh(o.data)) for o in edit_objects]
+            _resync_uv_editor_selection_batch(
+                context, bm_list_all, tuple(ts.mesh_select_mode))
         context.area.tag_redraw()
         return {'FINISHED'}
 
@@ -1334,12 +1344,12 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
 
         if context.tool_settings.use_uv_select_sync:
             sm = tuple(context.tool_settings.mesh_select_mode)
-            for obj in _get_edit_objects(context):
-                bm = bmesh.from_edit_mesh(obj.data)
-                if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
+            if sm[0] or sm[1]:
+                for obj in _get_edit_objects(context):
                     bmesh.update_edit_mesh(obj.data)
-                else:
-                    _resync_uv_editor_selection(context, obj, sm, bm)
+            else:
+                bm_list = [(obj, bmesh.from_edit_mesh(obj.data)) for obj in _get_edit_objects(context)]
+                _resync_uv_editor_selection_batch(context, bm_list, sm)
 
         if context.area:
             context.area.tag_redraw()
@@ -1371,7 +1381,9 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.space_data is not None
+        return (context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
                 and context.space_data.type == 'IMAGE_EDITOR'
                 and context.mode == 'EDIT_MESH')
 
@@ -1433,14 +1445,24 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             if context.area:
                 context.area.tag_redraw()
         elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            if context.tool_settings.use_uv_select_sync:
-                sm = tuple(context.tool_settings.mesh_select_mode)
-                for obj in _get_edit_objects(context):
-                    if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
+            ts = context.tool_settings
+            use_sync = ts.use_uv_select_sync
+            sm       = tuple(ts.mesh_select_mode) if use_sync else (False, False, False)
+            edit_objs = _get_edit_objects(context)
+            if use_sync:
+                bm_list = [(obj, bmesh.from_edit_mesh(obj.data)) for obj in edit_objs]
+                if sm[0] or sm[1]:
+                    for obj, _ in bm_list:
                         bmesh.update_edit_mesh(obj.data)
-                    else:
-                        bm = bmesh.from_edit_mesh(obj.data)
-                        _resync_uv_editor_selection(context, obj, sm, bm)
+                else:
+                    _resync_uv_editor_selection_batch(context, bm_list, sm)
+            return {'FINISHED'}
+        elif event.type == 'LEFTMOUSE' and event.value == 'DOUBLE_CLICK':
+            sel_mode = 'add' if event.shift else ('remove' if event.ctrl else 'set')
+            try:
+                bpy.ops.image.modo_uv_double_click_select('INVOKE_DEFAULT', mode=sel_mode)
+            except Exception:
+                pass
             return {'FINISHED'}
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
             from . import state as _state
@@ -1451,6 +1473,19 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def invoke(self, context, event):
+        # If invoked by a DOUBLE_CLICK event, delegate to the island/loop selector.
+        if event.value == 'DOUBLE_CLICK':
+            sel_mode = 'add' if event.shift else ('remove' if event.ctrl else 'set')
+            try:
+                bpy.ops.image.modo_uv_double_click_select('INVOKE_DEFAULT', mode=sel_mode)
+            except Exception:
+                pass
+            return {'FINISHED'}
+        # click_count >= 2 means this PRESS is the fallback from a DOUBLE_CLICK event
+        # that was already handled by double_click_select. Consume it without starting
+        # paint mode so the island selection is not overwritten.
+        if getattr(event, 'click_count', 1) >= 2:
+            return {'FINISHED'}
         ts = context.tool_settings
         obj = context.edit_object
         _uv_debug_log(

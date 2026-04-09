@@ -1348,7 +1348,9 @@ class IMAGE_OT_modo_preselect_lmb_track(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.space_data is not None
+        return (context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
                 and context.space_data.type == 'IMAGE_EDITOR')
 
     def invoke(self, context, event):

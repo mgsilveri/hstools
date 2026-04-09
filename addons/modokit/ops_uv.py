@@ -37,6 +37,12 @@ class IMAGE_OT_modo_uv_transform(bpy.types.Operator):
 
     _last_invoke_time: float = 0.0
 
+    _UV_TOOL_IDS = {
+        'TRANSLATE': 'builtin.move',
+        'ROTATE':    'builtin.rotate',
+        'RESIZE':    'builtin.scale',
+    }
+
     transform_type: EnumProperty(
         name='Transform Type',
         items=[
@@ -53,19 +59,29 @@ class IMAGE_OT_modo_uv_transform(bpy.types.Operator):
                 and context.space_data.type == 'IMAGE_EDITOR'
                 and context.mode == 'EDIT_MESH')
 
+    def _active_uv_tool_id(self, context):
+        """Return the idname of the current UV workspace tool, or '' on failure."""
+        try:
+            tool = context.workspace.tools.from_space_image_mode('UV', create=False)
+            return tool.idname if tool else ''
+        except Exception:
+            return ''
+
     def invoke(self, context, event):
         now = time.monotonic()
         if now - IMAGE_OT_modo_uv_transform._last_invoke_time < 0.05:
             return {'CANCELLED'}
         IMAGE_OT_modo_uv_transform._last_invoke_time = now
 
-        was_active = state._uv_active_transform_mode
+        # Always check state — we keep builtin.select as the workspace tool while our
+        # custom gizmo is active, so checking the active tool id would always return False.
+        already_on = (state._uv_active_transform_mode == self.transform_type)
 
-        if was_active == self.transform_type:
+        if already_on:
             _uv_drop_transform(context)
             self.report({'INFO'}, f"UV {self.transform_type.title()} tool OFF")
         else:
-            if was_active is not None:
+            if state._uv_active_transform_mode is not None:
                 _stop_uv_snap_highlight()
             state._uv_active_transform_mode = self.transform_type
 
@@ -95,6 +111,29 @@ class IMAGE_OT_modo_uv_transform(bpy.types.Operator):
                     pass
 
             _start_uv_gizmo()
+            _TOOL_IDS = {
+                'TRANSLATE': 'builtin.move',
+                'ROTATE':    'builtin.rotate',
+                'RESIZE':    'builtin.scale',
+            }
+            try:
+                bpy.ops.wm.tool_set_by_id(
+                    name=_TOOL_IDS[self.transform_type], space_type='IMAGE_EDITOR')
+            except Exception:
+                pass
+            sima = context.space_data
+            if sima:
+                sima.show_gizmo = False
+
+            # Start the selection guard modal (if not already running).
+            # It sits at the top of Blender's modal stack and consumes all LMB
+            # events so the tool-keymap's uv.select never fires while our gizmo
+            # is active.  The guard delegates each LMB to handle_reposition instead.
+            if not state._uv_selection_guard_running:
+                try:
+                    bpy.ops.image.modo_uv_selection_guard('INVOKE_DEFAULT')
+                except Exception:
+                    pass
 
             if not bpy.app.timers.is_registered(_uv_auto_drop_check):
                 bpy.app.timers.register(_uv_auto_drop_check, first_interval=0.25)
@@ -355,42 +394,67 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
 
     def _refresh_uv_positions(self, context, snapshot):
         _dbg = getattr(get_addon_preferences(context), 'debug_uv_handle', False)
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
+        try:
+            obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                           if o.type == 'MESH'}
+        except AttributeError:
+            obj = context.edit_object
+            obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+        if not obj_by_name:
             return snapshot
-        bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.active
-        if uv_layer is None:
-            return snapshot
-        bm.faces.ensure_lookup_table()
+        bm_cache = {}
         refreshed = []
-        for fi, li, _u, _v in snapshot:
-            if fi < len(bm.faces):
-                loops = bm.faces[fi].loops
+        for oname, fi, li, _u, _v in snapshot:
+            if oname not in obj_by_name:
+                continue
+            if oname not in bm_cache:
+                bm_t = bmesh.from_edit_mesh(obj_by_name[oname].data)
+                uv_t = bm_t.loops.layers.uv.active
+                if uv_t is None:
+                    continue
+                bm_t.faces.ensure_lookup_table()
+                bm_cache[oname] = (bm_t, uv_t)
+            bm_t, uv_t = bm_cache[oname]
+            if fi < len(bm_t.faces):
+                loops = bm_t.faces[fi].loops
                 if li < len(loops):
-                    uv = loops[li][uv_layer].uv
-                    refreshed.append((fi, li, uv.x, uv.y))
+                    uv = loops[li][uv_t].uv
+                    refreshed.append((oname, fi, li, uv.x, uv.y))
         if _dbg:
             _uv_debug_log(f"[UV-HANDLE] _refresh_uv_positions: {len(refreshed)}/{len(snapshot)} valid")
         return refreshed if refreshed else snapshot
 
     def _apply_uvs(self, context, positions, finish=False):
         _dbg = getattr(get_addon_preferences(context), 'debug_uv_handle', False)
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
+        try:
+            obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                           if o.type == 'MESH'}
+        except AttributeError:
+            obj = context.edit_object
+            obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+        if not obj_by_name:
             return
-        bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
-        if uv_layer is None:
-            return
-        bm.faces.ensure_lookup_table()
-        for fi, li, u, v in positions:
-            if fi < len(bm.faces):
-                loops = bm.faces[fi].loops
+        bm_cache = {}
+        dirty = set()
+        for oname, fi, li, u, v in positions:
+            if oname not in obj_by_name:
+                continue
+            if oname not in bm_cache:
+                bm_t = bmesh.from_edit_mesh(obj_by_name[oname].data)
+                uv_t = bm_t.loops.layers.uv.verify()
+                if uv_t is None:
+                    continue
+                bm_t.faces.ensure_lookup_table()
+                bm_cache[oname] = (bm_t, uv_t)
+            bm_t, uv_t = bm_cache[oname]
+            if fi < len(bm_t.faces):
+                loops = bm_t.faces[fi].loops
                 if li < len(loops):
-                    loops[li][uv_layer].uv.x = u
-                    loops[li][uv_layer].uv.y = v
-        bmesh.update_edit_mesh(obj.data, destructive=finish)
+                    loops[li][uv_t].uv.x = u
+                    loops[li][uv_t].uv.y = v
+                    dirty.add(oname)
+        for oname in dirty:
+            bmesh.update_edit_mesh(obj_by_name[oname].data, destructive=finish)
 
     def execute(self, context):
         cx = self.center_u
@@ -408,17 +472,17 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
         mode = self.transform_mode
         if mode == 'RESIZE':
             sx = self.scale_x / 100.0; sy = self.scale_y / 100.0
-            for fi, li, iu, iv in targets:
-                new_positions.append((fi, li, cx + (iu - cx) * sx, cy + (iv - cy) * sy))
+            for oname, fi, li, iu, iv in targets:
+                new_positions.append((oname, fi, li, cx + (iu - cx) * sx, cy + (iv - cy) * sy))
         elif mode == 'TRANSLATE':
             du, dv = self.offset_u, self.offset_v
-            for fi, li, iu, iv in targets:
-                new_positions.append((fi, li, iu + du, iv + dv))
+            for oname, fi, li, iu, iv in targets:
+                new_positions.append((oname, fi, li, iu + du, iv + dv))
         elif mode == 'ROTATE':
             cos_a = math.cos(self.angle); sin_a = math.sin(self.angle)
-            for fi, li, iu, iv in targets:
+            for oname, fi, li, iu, iv in targets:
                 ox, oy = iu - cx, iv - cy
-                new_positions.append((fi, li,
+                new_positions.append((oname, fi, li,
                                       cx + ox * cos_a - oy * sin_a,
                                       cy + ox * sin_a + oy * cos_a))
         else:
@@ -463,41 +527,46 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             corner_set = snap['corners']
             if not (edge_set or vert_set or face_set or corner_set):
                 return
-            obj = context.edit_object
-            if obj is None or obj.type != 'MESH':
-                return
-            bm = bmesh.from_edit_mesh(obj.data)
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer is None:
-                return
-            bm.faces.ensure_lookup_table()
-            for face in bm.faces:
-                fi = face.index
-                for li, loop in enumerate(face.loops):
-                    if use_sync:
-                        if sm[2]:
-                            sel = fi in face_set
-                            loop.uv_select_edge = sel
-                            loop.uv_select_vert = sel
-                            face.select = sel
-                        elif sm[1]:
-                            sel_edge = loop.edge.index in edge_set
-                            sel_vert = loop.vert.index in vert_set
-                            loop.uv_select_edge = sel_edge
-                            loop.uv_select_vert = sel_vert
-                            loop.edge.select    = sel_edge
+            try:
+                edit_objects = [o for o in context.objects_in_mode_unique_data
+                                if o.type == 'MESH']
+            except AttributeError:
+                obj = context.edit_object
+                edit_objects = [obj] if obj and obj.type == 'MESH' else []
+            for obj in edit_objects:
+                bm = bmesh.from_edit_mesh(obj.data)
+                uv_layer = bm.loops.layers.uv.active
+                if uv_layer is None:
+                    continue
+                bm.faces.ensure_lookup_table()
+                oname = obj.name
+                for face in bm.faces:
+                    fi = face.index
+                    for li, loop in enumerate(face.loops):
+                        if use_sync:
+                            if sm[2]:
+                                sel = (oname, fi) in face_set
+                                loop.uv_select_edge = sel
+                                loop.uv_select_vert = sel
+                                face.select = sel
+                            elif sm[1]:
+                                sel_edge = (oname, loop.edge.index) in edge_set
+                                sel_vert = (oname, loop.vert.index) in vert_set
+                                loop.uv_select_edge = sel_edge
+                                loop.uv_select_vert = sel_vert
+                                loop.edge.select    = sel_edge
+                            else:
+                                sel_uv = (oname, fi, li) in corner_set
+                                loop.uv_select_vert = sel_uv
+                                loop.uv_select_edge = False
+                                loop.vert.select    = (oname, loop.vert.index) in vert_set
                         else:
-                            sel_uv = (fi, li) in corner_set
-                            loop.uv_select_vert = sel_uv
-                            loop.uv_select_edge = False
-                            loop.vert.select    = loop.vert.index in vert_set
-                    else:
-                        sel = (fi, li) in corner_set
-                        loop.uv_select_vert = sel
-                        loop.uv_select_edge = sel
-            if use_sync and not sm[0]:
-                bm.select_flush_mode()
-            bmesh.update_edit_mesh(obj.data, destructive=False)
+                            sel = (oname, fi, li) in corner_set
+                            loop.uv_select_vert = sel
+                            loop.uv_select_edge = sel
+                if use_sync and not sm[0]:
+                    bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data, destructive=False)
             if context.area:
                 context.area.tag_redraw()
         except Exception:
@@ -506,8 +575,13 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
     @staticmethod
     def _build_sel_corner_set(context):
         try:
-            obj = context.edit_object
-            if obj is None or obj.type != 'MESH':
+            try:
+                obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                               if o.type == 'MESH'}
+            except AttributeError:
+                obj = context.edit_object
+                obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+            if not obj_by_name:
                 return None
             ts = context.tool_settings
             use_sync = ts.use_uv_select_sync
@@ -518,30 +592,39 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             if not targets:
                 return None
 
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
+            # Group targets by object name (5-tuple: oname, fi, li, u, v)
+            by_obj = {}
+            for oname, fi, li, _u, _v in targets:
+                by_obj.setdefault(oname, []).append((fi, li))
 
             corners: set = set(); edges: set = set()
             verts: set = set();   faces: set = set()
 
-            for fi, li, _u, _v in targets:
-                if fi < len(bm.faces):
-                    loops = bm.faces[fi].loops
-                    if li < len(loops):
-                        corners.add((fi, li))
-                        verts.add(loops[li].vert.index)
-                        if use_sync and sm[2]:
-                            faces.add(fi)
-
-            if use_sync and sm[1]:
-                for fi, li, _u, _v in targets:
+            for oname, obj_items in by_obj.items():
+                if oname not in obj_by_name:
+                    continue
+                bm = bmesh.from_edit_mesh(obj_by_name[oname].data)
+                bm.faces.ensure_lookup_table()
+                obj_verts = set()
+                for fi, li in obj_items:
                     if fi < len(bm.faces):
                         loops = bm.faces[fi].loops
                         if li < len(loops):
-                            edge = loops[li].edge
-                            if (edge.verts[0].index in verts
-                                    and edge.verts[1].index in verts):
-                                edges.add(edge.index)
+                            corners.add((oname, fi, li))
+                            vi = loops[li].vert.index
+                            verts.add((oname, vi))
+                            obj_verts.add(vi)
+                            if use_sync and sm[2]:
+                                faces.add((oname, fi))
+                if use_sync and sm[1]:
+                    for fi, li in obj_items:
+                        if fi < len(bm.faces):
+                            loops = bm.faces[fi].loops
+                            if li < len(loops):
+                                edge = loops[li].edge
+                                if (edge.verts[0].index in obj_verts
+                                        and edge.verts[1].index in obj_verts):
+                                    edges.add((oname, edge.index))
 
             return {
                 'corners':  frozenset(corners),
@@ -574,20 +657,31 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
 
         # Auto-drop if external operation moved UVs
         if state._uv_transform_targets:
-            obj_chk = context.edit_object
-            if obj_chk and obj_chk.type == 'MESH':
-                bm_chk = bmesh.from_edit_mesh(obj_chk.data)
-                uv_chk = bm_chk.loops.layers.uv.active
-                if uv_chk is not None:
-                    bm_chk.faces.ensure_lookup_table()
-                    for fi, li, u, v in state._uv_transform_targets[:5]:
-                        if fi < len(bm_chk.faces):
-                            ls = bm_chk.faces[fi].loops
-                            if li < len(ls):
-                                cur = ls[li][uv_chk].uv
-                                if abs(cur.x - u) > 1e-6 or abs(cur.y - v) > 1e-6:
-                                    _uv_drop_transform(context)
-                                    return {'PASS_THROUGH'}
+            try:
+                obj_by_name_chk = {o.name: o for o in context.objects_in_mode_unique_data
+                                   if o.type == 'MESH'}
+            except AttributeError:
+                obj_chk = context.edit_object
+                obj_by_name_chk = {obj_chk.name: obj_chk} if obj_chk and obj_chk.type == 'MESH' else {}
+            bm_chk_cache = {}
+            for oname_chk, fi, li, u, v in state._uv_transform_targets[:5]:
+                if oname_chk not in obj_by_name_chk:
+                    continue
+                if oname_chk not in bm_chk_cache:
+                    bm_c = bmesh.from_edit_mesh(obj_by_name_chk[oname_chk].data)
+                    uv_c = bm_c.loops.layers.uv.active
+                    if uv_c is None:
+                        continue
+                    bm_c.faces.ensure_lookup_table()
+                    bm_chk_cache[oname_chk] = (bm_c, uv_c)
+                bm_c, uv_c = bm_chk_cache[oname_chk]
+                if fi < len(bm_c.faces):
+                    ls = bm_c.faces[fi].loops
+                    if li < len(ls):
+                        cur = ls[li][uv_c].uv
+                        if abs(cur.x - u) > 1e-6 or abs(cur.y - v) > 1e-6:
+                            _uv_drop_transform(context)
+                            return {'PASS_THROUGH'}
 
         # Detect handle hit
         on_handle = False
@@ -730,8 +824,8 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                 if self._axis == 'X': dv = 0.0
                 elif self._axis == 'Y': du = 0.0
                 self._last_du = du; self._last_dv = dv
-                for fi, li, iu, iv in self._uv_info:
-                    new_positions.append((fi, li, iu + du, iv + dv))
+                for oname, fi, li, iu, iv in self._uv_info:
+                    new_positions.append((oname, fi, li, iu + du, iv + dv))
                 state._uv_gizmo_center = (cx + du, cy + dv)
 
             elif self._mode == 'ROTATE':
@@ -750,9 +844,9 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                         angle = round(angle / snap_step) * snap_step
                 self._last_angle_rad = angle
                 cos_a = math.cos(angle); sin_a = math.sin(angle)
-                for fi, li, iu, iv in self._uv_info:
+                for oname, fi, li, iu, iv in self._uv_info:
                     ox = iu - cx; oy = iv - cy
-                    new_positions.append((fi, li,
+                    new_positions.append((oname, fi, li,
                                           cx + ox * cos_a - oy * sin_a,
                                           cy + ox * sin_a + oy * cos_a))
 
@@ -786,8 +880,8 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                 sx = scale if self._axis != 'Y' else 1.0
                 sy = scale if self._axis != 'X' else 1.0
                 self._last_sx = sx; self._last_sy = sy
-                for fi, li, iu, iv in self._uv_info:
-                    new_positions.append((fi, li,
+                for oname, fi, li, iu, iv in self._uv_info:
+                    new_positions.append((oname, fi, li,
                                           cx + (iu - cx) * sx,
                                           cy + (iv - cy) * sy))
 
@@ -810,37 +904,52 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
         elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             state._uv_handle_modal_active = False
             _sync_uv_gizmo_center_to_bmesh(context)
-            obj = context.edit_object
-            if obj and obj.type == 'MESH':
-                bmesh.update_edit_mesh(obj.data, destructive=True)
-                bm_post = bmesh.from_edit_mesh(obj.data)
-                uv_layer_post = bm_post.loops.layers.uv.verify()
-                bm_post.faces.ensure_lookup_table()
+            try:
+                obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                               if o.type == 'MESH'}
+            except AttributeError:
+                obj = context.edit_object
+                obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+            if obj_by_name:
+                # Group uv_info entries by object name
+                by_obj = {}
+                for entry in self._uv_info:
+                    by_obj.setdefault(entry[0], []).append(entry)
                 new_targets = []
-                moved_keys = set()
-                for fi, li, _iu, _iv in self._uv_info:
-                    if fi < len(bm_post.faces):
-                        loops_post = list(bm_post.faces[fi].loops)
-                        if li < len(loops_post):
-                            uv_co = loops_post[li][uv_layer_post].uv
-                            new_targets.append((fi, li, uv_co.x, uv_co.y))
-                            moved_keys.add((fi, li))
-                moved_verts = set()
-                for fi, li, _iu, _iv in self._uv_info:
-                    if fi < len(bm_post.faces):
-                        loops_post = list(bm_post.faces[fi].loops)
-                        if li < len(loops_post):
-                            moved_verts.add(loops_post[li].vert.index)
-                cleared = 0
-                for face in bm_post.faces:
-                    for li2, loop in enumerate(face.loops):
-                        if loop.vert.index in moved_verts:
-                            if (face.index, li2) not in moved_keys:
-                                if loop.uv_select_vert:
-                                    loop.uv_select_vert = False
-                                    cleared += 1
-                if cleared:
-                    bmesh.update_edit_mesh(obj.data, destructive=False)
+                for oname, obj in obj_by_name.items():
+                    obj_entries = by_obj.get(oname, [])
+                    if not obj_entries:
+                        continue
+                    bmesh.update_edit_mesh(obj.data, destructive=True)
+                    bm_post = bmesh.from_edit_mesh(obj.data)
+                    uv_layer_post = bm_post.loops.layers.uv.verify()
+                    if uv_layer_post is None:
+                        continue
+                    bm_post.faces.ensure_lookup_table()
+                    moved_keys = set()
+                    for oname2, fi, li, _iu, _iv in obj_entries:
+                        if fi < len(bm_post.faces):
+                            loops_post = list(bm_post.faces[fi].loops)
+                            if li < len(loops_post):
+                                uv_co = loops_post[li][uv_layer_post].uv
+                                new_targets.append((oname, fi, li, uv_co.x, uv_co.y))
+                                moved_keys.add((fi, li))
+                    moved_verts = set()
+                    for oname2, fi, li, _iu, _iv in obj_entries:
+                        if fi < len(bm_post.faces):
+                            loops_post = list(bm_post.faces[fi].loops)
+                            if li < len(loops_post):
+                                moved_verts.add(loops_post[li].vert.index)
+                    cleared = 0
+                    for face in bm_post.faces:
+                        for li2, loop in enumerate(face.loops):
+                            if loop.vert.index in moved_verts:
+                                if (face.index, li2) not in moved_keys:
+                                    if loop.uv_select_vert:
+                                        loop.uv_select_vert = False
+                                        cleared += 1
+                    if cleared:
+                        bmesh.update_edit_mesh(obj.data, destructive=False)
                 state._uv_transform_targets = (new_targets if new_targets
                                                else _collect_uv_transform_targets(context))
                 state._uv_sel_targets = _collect_uv_transform_targets(context, override_sticky='DISABLED')
@@ -869,6 +978,60 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             return {'CANCELLED'}
 
         return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_modo_uv_selection_guard(bpy.types.Operator):
+    """Running modal that sits at the top of Blender's modal stack and
+    consumes all LMB events while the UV W/E/R gizmo is active.
+
+    Blender's tool keymaps (UV Editor Tool: UV Transform, Tweak, etc.) fire
+    BEFORE editor keymaps, so uv.select can fire before image.modo_uv_handle_reposition
+    even if the latter has head=True.  A modal operator beats all keymaps, so this
+    guard guarantees our gizmo handler owns every LMB click/press without any
+    selection change in between.
+    """
+    bl_idname  = 'image.modo_uv_selection_guard'
+    bl_label   = 'UV Selection Guard'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return (state._uv_active_transform_mode is not None
+                and context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
+                and context.space_data.type == 'IMAGE_EDITOR'
+                and context.mode == 'EDIT_MESH')
+
+    def invoke(self, context, event):
+        if state._uv_selection_guard_running:
+            return {'CANCELLED'}
+        state._uv_selection_guard_running = True
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        # Exit when the transform tool is dropped.
+        if state._uv_active_transform_mode is None:
+            state._uv_selection_guard_running = False
+            return {'FINISHED'}
+
+        if event.type == 'LEFTMOUSE' and event.value in {'PRESS', 'CLICK'}:
+            # Pass through Alt-modified clicks — these are view navigation
+            # gestures (e.g. Alt+Shift+LMB pan) and must not be consumed.
+            if event.alt:
+                return {'PASS_THROUGH'}
+            # Delegate to handle_reposition; it will do the hit test and
+            # either start a drag modal or reposition the pivot — all without
+            # any selection change.
+            try:
+                bpy.ops.image.modo_uv_handle_reposition('INVOKE_DEFAULT')
+            except Exception:
+                pass
+            # Consume this event so the tool-keymap uv.select never fires.
+            return {'RUNNING_MODAL'}
+
+        return {'PASS_THROUGH'}
 
 
 class IMAGE_OT_modo_uv_rip(bpy.types.Operator):
