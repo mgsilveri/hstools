@@ -419,6 +419,35 @@ def register_keymaps():
                         )
                         state.addon_keymaps.append((km_uv, kmi))
 
+            # Also register image.modo_uv_handle_reposition in the UV editor TOOL
+            # keymaps.  Blender dispatches tool keymaps (UV Editor Tool: UV Transform,
+            # UV Editor Tool: Tweak, etc.) BEFORE editor keymaps (UV Editor), so without
+            # this the builtin uv.select fires first and changes the selection even when
+            # our gizmo is active.  Our operator's poll() returns False when the gizmo
+            # is not active, so it only fires (and blocks uv.select) when W/E/R is on.
+            _UV_TOOL_KM_NAMES = (
+                'UV Editor Tool: UV Transform',  # builtin.move / rotate / scale
+                'UV Editor Tool: Tweak',         # builtin.select (Tweak mode)
+                'UV Editor Tool: Select',        # builtin.select (Select mode)
+            )
+            for _tool_km_name in _UV_TOOL_KM_NAMES:
+                try:
+                    _tkm = kc.keymaps.new(name=_tool_km_name,
+                                          space_type='IMAGE_EDITOR')
+                except Exception:
+                    continue
+                for _shift, _ctrl in ((False, False), (True, False), (False, True)):
+                    for _ev_value in ('PRESS', 'CLICK'):
+                        _tkmi = _tkm.keymap_items.new(
+                            'image.modo_uv_handle_reposition',
+                            type='LEFTMOUSE',
+                            value=_ev_value,
+                            shift=_shift,
+                            ctrl=_ctrl,
+                            head=True,
+                        )
+                        state.addon_keymaps.append((_tkm, _tkmi))
+
         # UV navigation: Alt+LMB pan, Alt+MMB zoom
         for km_uv in _uv_km_targets:
             kmi = km_uv.keymap_items.new(

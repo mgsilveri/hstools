@@ -86,6 +86,7 @@ _uv_transform_targets = None       # list | None
 _uv_sel_targets = None             # list | None
 _uv_sel_corner_set = None          # dict | None
 _uv_handle_modal_active: bool = False
+_uv_selection_guard_running: bool = False  # True while selection-guard modal is active
 
 # ── UV snap highlight ─────────────────────────────────────────────────────────
 _uv_snap_highlight = None          # dict | None — keys: screen_pos, uv_pos, elem_type
@@ -156,6 +157,7 @@ _OUR_IDNAMES = {
     'image.modo_uv_transform',
     'image.modo_uv_drop_transform',
     'image.modo_uv_handle_reposition',
+    'image.modo_uv_selection_guard',
     'image.modo_uv_stitch',
     'image.modo_uv_component_mode',
     'image.modo_uv_paint_selection',

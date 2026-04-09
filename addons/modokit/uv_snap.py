@@ -110,23 +110,25 @@ def _snap_uv_translate(context, raw_du, raw_dv, uv_info, ctrl_held=False,
 
     # ── Vertex snap ───────────────────────────────────────────────────────────
     if want_vertex:
-        obj = context.edit_object
-        if obj is not None and obj.type == 'MESH':
-            bm = bmesh.from_edit_mesh(obj.data)
-            uv_layer = bm.loops.layers.uv.verify()
-            if uv_layer:
-                PREC = 6
-                bm.faces.ensure_lookup_table()
-                excluded = set()
-                for fi, li, iu, iv in uv_info:
-                    excluded.add((round(iu, PREC), round(iv, PREC)))
-                    if 0 <= fi < len(bm.faces):
-                        loops = list(bm.faces[fi].loops)
-                        if 0 <= li < len(loops):
-                            cu = loops[li][uv_layer].uv
-                            excluded.add((round(cu.x, PREC), round(cu.y, PREC)))
+        try:
+            edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
+        except AttributeError:
+            o = context.edit_object
+            edit_objects = [o] if o and o.type == 'MESH' else []
+        if edit_objects:
+            PREC = 6
+            # Exclude the UVs that are being moved (initial positions from uv_info 5-tuple).
+            excluded = set()
+            for oname, fi, li, iu, iv in uv_info:
+                excluded.add((round(iu, PREC), round(iv, PREC)))
 
-                all_uvs = []
+            # Collect all non-excluded UVs from every object in edit mode.
+            all_uvs = []
+            for obj in edit_objects:
+                bm = bmesh.from_edit_mesh(obj.data)
+                uv_layer = bm.loops.layers.uv.verify()
+                if not uv_layer:
+                    continue
                 for face in bm.faces:
                     for loop in face.loops:
                         uv_co = loop[uv_layer].uv
@@ -134,49 +136,49 @@ def _snap_uv_translate(context, raw_du, raw_dv, uv_info, ctrl_held=False,
                         if key not in excluded:
                             all_uvs.append((uv_co.x, uv_co.y))
 
-                if gizmo_center is not None:
-                    ref_u, ref_v = gizmo_center
-                elif uv_info:
-                    ref_u, ref_v = uv_info[0][2], uv_info[0][3]
-                else:
-                    ref_u, ref_v = 0.0, 0.0
+            if gizmo_center is not None:
+                ref_u, ref_v = gizmo_center
+            elif uv_info:
+                ref_u, ref_v = uv_info[0][3], uv_info[0][4]  # 5-tuple: (oname,fi,li,u,v)
+            else:
+                ref_u, ref_v = 0.0, 0.0
 
-                if mouse_screen is not None:
-                    sc_probe = mouse_screen
-                else:
-                    tent_u = ref_u + raw_du
-                    tent_v = ref_v + raw_dv
-                    sc_probe = _uv_view_to_region(region, sima, tent_u, tent_v)
+            if mouse_screen is not None:
+                sc_probe = mouse_screen
+            else:
+                tent_u = ref_u + raw_du
+                tent_v = ref_v + raw_dv
+                sc_probe = _uv_view_to_region(region, sima, tent_u, tent_v)
 
-                UV_SNAP_R = 25.0
-                best_screen_d = float('inf')
-                best_off_u = best_off_v = None
-                best_target = None
+            UV_SNAP_R = 25.0
+            best_screen_d = float('inf')
+            best_off_u = best_off_v = None
+            best_target = None
 
-                if sc_probe is not None:
-                    for (tu, tv) in all_uvs:
-                        sc_tgt = _uv_view_to_region(region, sima, tu, tv)
-                        if sc_tgt is None:
-                            continue
-                        dx = sc_probe[0] - sc_tgt[0]
-                        dy = sc_probe[1] - sc_tgt[1]
-                        d  = math.sqrt(dx * dx + dy * dy)
-                        if d < UV_SNAP_R and d < best_screen_d:
-                            best_screen_d = d
-                            best_off_u    = tu - ref_u
-                            best_off_v    = tv - ref_v
-                            best_target   = (tu, tv)
+            if sc_probe is not None:
+                for (tu, tv) in all_uvs:
+                    sc_tgt = _uv_view_to_region(region, sima, tu, tv)
+                    if sc_tgt is None:
+                        continue
+                    dx = sc_probe[0] - sc_tgt[0]
+                    dy = sc_probe[1] - sc_tgt[1]
+                    d  = math.sqrt(dx * dx + dy * dy)
+                    if d < UV_SNAP_R and d < best_screen_d:
+                        best_screen_d = d
+                        best_off_u    = tu - ref_u
+                        best_off_v    = tv - ref_v
+                        best_target   = (tu, tv)
 
-                if best_off_u is not None:
-                    if _dbg:
-                        _uv_debug_log(
-                            f"[UV-SNAP] vertex snap HIT: target={best_target} "
-                            f"off=({best_off_u:.5f},{best_off_v:.5f}) "
-                            f"screen_dist={best_screen_d:.1f}px"
-                        )
-                    return best_off_u, best_off_v, best_target
-                if not want_increment:
-                    return raw_du, raw_dv, None
+            if best_off_u is not None:
+                if _dbg:
+                    _uv_debug_log(
+                        f"[UV-SNAP] vertex snap HIT: target={best_target} "
+                        f"off=({best_off_u:.5f},{best_off_v:.5f}) "
+                        f"screen_dist={best_screen_d:.1f}px"
+                    )
+                return best_off_u, best_off_v, best_target
+            if not want_increment:
+                return raw_du, raw_dv, None
 
     # ── Increment / grid snap ─────────────────────────────────────────────────
     if want_increment:
@@ -202,24 +204,29 @@ def _snap_uv_cursor(context, mx, my, ctrl_held=False):
         want_vertex = True
 
     if want_vertex:
-        obj = context.edit_object
-        if obj is not None and obj.type == 'MESH':
+        try:
+            edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
+        except AttributeError:
+            o = context.edit_object
+            edit_objects = [o] if o and o.type == 'MESH' else []
+        UV_SNAP_R = 25.0
+        best_d = float('inf'); best_uv = None
+        for obj in edit_objects:
             bm = bmesh.from_edit_mesh(obj.data)
             uv_layer = bm.loops.layers.uv.verify()
-            if uv_layer:
-                UV_SNAP_R = 25.0
-                best_d = float('inf'); best_uv = None
-                for face in bm.faces:
-                    for loop in face.loops:
-                        uv_co = loop[uv_layer].uv
-                        sc = _uv_view_to_region(region, sima, uv_co.x, uv_co.y)
-                        if sc is not None:
-                            dx = sc[0] - mx; dy = sc[1] - my
-                            d = math.sqrt(dx * dx + dy * dy)
-                            if d < UV_SNAP_R and d < best_d:
-                                best_d = d; best_uv = (uv_co.x, uv_co.y)
-                if best_uv is not None:
-                    return best_uv
+            if not uv_layer:
+                continue
+            for face in bm.faces:
+                for loop in face.loops:
+                    uv_co = loop[uv_layer].uv
+                    sc = _uv_view_to_region(region, sima, uv_co.x, uv_co.y)
+                    if sc is not None:
+                        dx = sc[0] - mx; dy = sc[1] - my
+                        d = math.sqrt(dx * dx + dy * dy)
+                        if d < UV_SNAP_R and d < best_d:
+                            best_d = d; best_uv = (uv_co.x, uv_co.y)
+        if best_uv is not None:
+            return best_uv
 
     if want_increment:
         raw = _uv_region_to_view(region, sima, mx, my)
@@ -255,49 +262,53 @@ def _find_uv_snap_target(context, mx, my, ctrl_held=False):
     if not want_vert and not want_edge:
         want_vert = True
 
-    obj = context.edit_object
-    if obj is None or obj.type != 'MESH':
-        return None
-
-    bm = bmesh.from_edit_mesh(obj.data)
-    uv_layer = bm.loops.layers.uv.verify()
-    if uv_layer is None:
+    try:
+        edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
+    except AttributeError:
+        o = context.edit_object
+        edit_objects = [o] if o and o.type == 'MESH' else []
+    if not edit_objects:
         return None
 
     best_sdist = float('inf')
     best       = None
     use_sync   = ts.use_uv_select_sync
 
-    for face in bm.faces:
-        if not use_sync and not face.select:
+    for obj in edit_objects:
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.verify()
+        if uv_layer is None:
             continue
-        loops   = face.loops
-        n_loops = len(loops)
-        for i, loop in enumerate(loops):
-            uv_co = loop[uv_layer].uv
-            if want_vert:
-                sc = _uv_view_to_region(region, sima, uv_co.x, uv_co.y)
-                if sc is not None:
-                    dx, dy = sc[0] - mx, sc[1] - my
-                    sd = math.sqrt(dx * dx + dy * dy)
-                    if sd < UV_SNAP_SCREEN_RADIUS and sd < best_sdist:
-                        best_sdist = sd
-                        best = {'screen_pos': sc,
-                                'uv_pos': (uv_co.x, uv_co.y),
-                                'elem_type': 'UV_VERTEX'}
-            if want_edge:
-                next_uv = loops[(i + 1) % n_loops][uv_layer].uv
-                mid_u = (uv_co.x + next_uv.x) * 0.5
-                mid_v = (uv_co.y + next_uv.y) * 0.5
-                sc = _uv_view_to_region(region, sima, mid_u, mid_v)
-                if sc is not None:
-                    dx, dy = sc[0] - mx, sc[1] - my
-                    sd = math.sqrt(dx * dx + dy * dy)
-                    if sd < UV_SNAP_SCREEN_RADIUS and sd < best_sdist:
-                        best_sdist = sd
-                        best = {'screen_pos': sc,
-                                'uv_pos': (mid_u, mid_v),
-                                'elem_type': 'UV_EDGE_MIDPOINT'}
+        for face in bm.faces:
+            if not use_sync and not face.select:
+                continue
+            loops   = face.loops
+            n_loops = len(loops)
+            for i, loop in enumerate(loops):
+                uv_co = loop[uv_layer].uv
+                if want_vert:
+                    sc = _uv_view_to_region(region, sima, uv_co.x, uv_co.y)
+                    if sc is not None:
+                        dx, dy = sc[0] - mx, sc[1] - my
+                        sd = math.sqrt(dx * dx + dy * dy)
+                        if sd < UV_SNAP_SCREEN_RADIUS and sd < best_sdist:
+                            best_sdist = sd
+                            best = {'screen_pos': sc,
+                                    'uv_pos': (uv_co.x, uv_co.y),
+                                    'elem_type': 'UV_VERTEX'}
+                if want_edge:
+                    next_uv = loops[(i + 1) % n_loops][uv_layer].uv
+                    mid_u = (uv_co.x + next_uv.x) * 0.5
+                    mid_v = (uv_co.y + next_uv.y) * 0.5
+                    sc = _uv_view_to_region(region, sima, mid_u, mid_v)
+                    if sc is not None:
+                        dx, dy = sc[0] - mx, sc[1] - my
+                        sd = math.sqrt(dx * dx + dy * dy)
+                        if sd < UV_SNAP_SCREEN_RADIUS and sd < best_sdist:
+                            best_sdist = sd
+                            best = {'screen_pos': sc,
+                                    'uv_pos': (mid_u, mid_v),
+                                    'elem_type': 'UV_EDGE_MIDPOINT'}
     return best
 
 
@@ -437,15 +448,20 @@ def _stop_uv_snap_highlight():
 # ── Collect UV transform targets ──────────────────────────────────────────────
 
 def _collect_uv_transform_targets(context, override_sticky=None):
-    """Return list of (face_index, loop_offset, init_u, init_v) for selected UV corners."""
-    obj = context.edit_object
-    if obj is None or obj.type != 'MESH':
+    """Return list of (obj_name, face_index, loop_offset, init_u, init_v) for selected UV corners.
+
+    Iterates all mesh objects in edit mode so multi-object transforms work correctly.
+    Vertex indices are scoped per-object (BMesh vert 0 is different in each mesh),
+    so sticky-select logic runs independently per object.
+    """
+    try:
+        edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
+    except AttributeError:
+        o = context.edit_object
+        edit_objects = [o] if o and o.type == 'MESH' else []
+    if not edit_objects:
         return []
-    bm = bmesh.from_edit_mesh(obj.data)
-    uv_layer = bm.loops.layers.uv.verify()
-    if uv_layer is None:
-        return []
-    bm.faces.ensure_lookup_table()
+
     ts = context.tool_settings
     use_sync = ts.use_uv_select_sync
     sticky = getattr(ts, 'uv_sticky_select_mode', 'SHARED_VERTEX')
@@ -454,61 +470,68 @@ def _collect_uv_transform_targets(context, override_sticky=None):
     if use_sync:
         mesh_mode = ts.mesh_select_mode
 
-    all_loops = []
-    for face in bm.faces:
-        if not use_sync and not face.select:
-            continue
-        for li, loop in enumerate(face.loops):
-            uv_data = loop[uv_layer]
-            u, v = uv_data.uv.x, uv_data.uv.y
-            vi = loop.vert.index
-            if use_sync:
-                if mesh_mode[2]:
-                    flag = face.select
-                    all_loops.append((face.index, li, u, v, vi, flag, flag))
-                elif mesh_mode[1]:
-                    uv_edge_flag  = (loop.uv_select_edge or loop.link_loop_prev.uv_select_edge)
-                    mesh_edge_flag = (loop.edge.select or loop.link_loop_prev.edge.select)
-                    all_loops.append((face.index, li, u, v, vi, uv_edge_flag, mesh_edge_flag))
-                else:
-                    all_loops.append((face.index, li, u, v, vi,
-                                      loop.uv_select_vert, loop.vert.select))
-            else:
-                flag = loop.uv_select_vert
-                all_loops.append((face.index, li, u, v, vi, flag, flag))
-
-    if use_sync and not (mesh_mode[2] if use_sync else False):
-        use_uv_flag = any(is_uv for _, _, _, _, _, is_uv, _ in all_loops)
-    else:
-        use_uv_flag = True
-
-    sel_verts = set()
-    vert_sel_positions = {}
-    for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
-        is_sel = is_uv if use_uv_flag else is_mesh
-        if is_sel:
-            sel_verts.add(vi)
-            vert_sel_positions.setdefault(vi, set()).add((round(u, PREC), round(v, PREC)))
-
-    effective_sticky = 'SHARED_LOCATION' if use_sync else sticky
-    if override_sticky is not None:
-        effective_sticky = override_sticky
-
     result = []
-    if effective_sticky == 'SHARED_VERTEX':
-        for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
-            if vi in sel_verts:
-                result.append((fi, li, u, v))
-    elif effective_sticky == 'SHARED_LOCATION':
-        for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
-            if vi in vert_sel_positions:
-                if (round(u, PREC), round(v, PREC)) in vert_sel_positions[vi]:
-                    result.append((fi, li, u, v))
-    else:  # DISABLED
+    for obj in edit_objects:
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.verify()
+        if uv_layer is None:
+            continue
+        bm.faces.ensure_lookup_table()
+
+        all_loops = []
+        for face in bm.faces:
+            if not use_sync and not face.select:
+                continue
+            for li, loop in enumerate(face.loops):
+                uv_data = loop[uv_layer]
+                u, v = uv_data.uv.x, uv_data.uv.y
+                vi = loop.vert.index
+                if use_sync:
+                    if mesh_mode[2]:
+                        flag = face.select
+                        all_loops.append((face.index, li, u, v, vi, flag, flag))
+                    elif mesh_mode[1]:
+                        uv_edge_flag  = (loop.uv_select_edge or loop.link_loop_prev.uv_select_edge)
+                        mesh_edge_flag = (loop.edge.select or loop.link_loop_prev.edge.select)
+                        all_loops.append((face.index, li, u, v, vi, uv_edge_flag, mesh_edge_flag))
+                    else:
+                        all_loops.append((face.index, li, u, v, vi,
+                                          loop.uv_select_vert, loop.vert.select))
+                else:
+                    flag = loop.uv_select_vert
+                    all_loops.append((face.index, li, u, v, vi, flag, flag))
+
+        if use_sync and not (mesh_mode[2] if use_sync else False):
+            use_uv_flag = any(is_uv for _, _, _, _, _, is_uv, _ in all_loops)
+        else:
+            use_uv_flag = True
+
+        sel_verts = set()
+        vert_sel_positions = {}
         for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
             is_sel = is_uv if use_uv_flag else is_mesh
             if is_sel:
-                result.append((fi, li, u, v))
+                sel_verts.add(vi)
+                vert_sel_positions.setdefault(vi, set()).add((round(u, PREC), round(v, PREC)))
+
+        effective_sticky = 'SHARED_LOCATION' if use_sync else sticky
+        if override_sticky is not None:
+            effective_sticky = override_sticky
+
+        if effective_sticky == 'SHARED_VERTEX':
+            for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
+                if vi in sel_verts:
+                    result.append((obj.name, fi, li, u, v))
+        elif effective_sticky == 'SHARED_LOCATION':
+            for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
+                if vi in vert_sel_positions:
+                    if (round(u, PREC), round(v, PREC)) in vert_sel_positions[vi]:
+                        result.append((obj.name, fi, li, u, v))
+        else:  # DISABLED
+            for fi, li, u, v, vi, is_uv, is_mesh in all_loops:
+                is_sel = is_uv if use_uv_flag else is_mesh
+                if is_sel:
+                    result.append((obj.name, fi, li, u, v))
 
     try:
         _dbg = getattr(get_addon_preferences(bpy.context), 'debug_uv_handle', False)
@@ -516,8 +539,7 @@ def _collect_uv_transform_targets(context, override_sticky=None):
         _dbg = False
     if _dbg:
         _uv_debug_log(
-            f"[UV-COLLECT] sticky={sticky!r} effective={effective_sticky!r} "
-            f"use_sync={use_sync} result={len(result)}"
+            f"[UV-COLLECT] sticky={sticky!r} use_sync={use_sync} result={len(result)}"
         )
     return result
 
@@ -536,19 +558,30 @@ def _uv_auto_drop_check():
         context = bpy.context
         if getattr(context, 'mode', None) != 'EDIT_MESH':
             return 0.25
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
+        try:
+            obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                           if o.type == 'MESH'}
+        except AttributeError:
+            obj = context.edit_object
+            obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+        if not obj_by_name:
             return 0.25
-        bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.active
-        if uv_layer is None:
-            return 0.25
-        bm.faces.ensure_lookup_table()
-        for fi, li, u, v in state._uv_transform_targets[:5]:
-            if fi < len(bm.faces):
-                loops = bm.faces[fi].loops
+        bm_cache = {}
+        for oname, fi, li, u, v in state._uv_transform_targets[:5]:
+            if oname not in obj_by_name:
+                continue
+            if oname not in bm_cache:
+                bm_t = bmesh.from_edit_mesh(obj_by_name[oname].data)
+                uv_t = bm_t.loops.layers.uv.active
+                if uv_t is None:
+                    continue
+                bm_t.faces.ensure_lookup_table()
+                bm_cache[oname] = (bm_t, uv_t)
+            bm_t, uv_t = bm_cache[oname]
+            if fi < len(bm_t.faces):
+                loops = bm_t.faces[fi].loops
                 if li < len(loops):
-                    cur = loops[li][uv_layer].uv
+                    cur = loops[li][uv_t].uv
                     if abs(cur.x - u) > 1e-6 or abs(cur.y - v) > 1e-6:
                         _uv_drop_transform(context)
                         return None
@@ -570,3 +603,10 @@ def _uv_drop_transform(context):
     state._uv_sel_targets           = None
     if bpy.app.timers.is_registered(_uv_auto_drop_check):
         bpy.app.timers.unregister(_uv_auto_drop_check)
+    try:
+        bpy.ops.wm.tool_set_by_id(name='builtin.select', space_type='IMAGE_EDITOR')
+    except Exception:
+        pass
+    sima = getattr(context, 'space_data', None)
+    if sima and getattr(sima, 'type', '') == 'IMAGE_EDITOR':
+        sima.show_gizmo = True

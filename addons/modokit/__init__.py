@@ -99,6 +99,7 @@ _ALL_CLASSES = (
     ops_uv.IMAGE_OT_modo_uv_component_mode,
     ops_uv.IMAGE_OT_modo_uv_drop_transform,
     ops_uv.IMAGE_OT_modo_uv_handle_reposition,
+    ops_uv.IMAGE_OT_modo_uv_selection_guard,
     ops_uv.IMAGE_OT_modo_uv_rip,
     uv_selection.IMAGE_OT_modo_uv_stitch,
     uv_selection.IMAGE_OT_modo_uv_double_click_select,

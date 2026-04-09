@@ -461,84 +461,93 @@ def _compute_uv_selection_median(context):
     """Return the median UV position of all selected UV vertices as (u, v), or None.
 
     Respects *uv_sticky_select_mode* (Blender 5.0).
+    Iterates all mesh objects in edit mode for multi-object UV editing.
     """
-    obj = context.edit_object
-    if obj is None or obj.type != 'MESH':
+    try:
+        edit_objects = [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
+    except AttributeError:
+        o = context.edit_object
+        edit_objects = [o] if o and o.type == 'MESH' else []
+    if not edit_objects:
         return None
-    bm = bmesh.from_edit_mesh(obj.data)
-    uv_layer = bm.loops.layers.uv.verify()
-    if uv_layer is None:
-        return None
+
     ts = context.tool_settings
     use_sync = ts.use_uv_select_sync
-
     PREC = 5
-    seen = set()
     sticky = getattr(ts, 'uv_sticky_select_mode', 'SHARED_VERTEX')
 
     if use_sync:
         mesh_mode = ts.mesh_select_mode
 
-    all_loops_raw = []
-    for face in bm.faces:
-        if not use_sync and not face.select:
-            continue
-        for loop in face.loops:
-            uv_data = loop[uv_layer]
-            u, v = uv_data.uv.x, uv_data.uv.y
-            vi = loop.vert.index
-            if use_sync:
-                if mesh_mode[2]:
-                    flag = face.select
-                    all_loops_raw.append((vi, u, v, flag, flag))
-                elif mesh_mode[1]:
-                    uv_edge_flag = (loop.uv_select_edge or loop.link_loop_prev.uv_select_edge)
-                    mesh_edge_flag = (loop.edge.select or loop.link_loop_prev.edge.select)
-                    all_loops_raw.append((vi, u, v, uv_edge_flag, mesh_edge_flag))
-                else:
-                    all_loops_raw.append((vi, u, v, loop.uv_select_vert, loop.vert.select))
-            else:
-                flag = loop.uv_select_vert
-                all_loops_raw.append((vi, u, v, flag, flag))
-
-    if use_sync and not (mesh_mode[2] if use_sync else False):
-        use_uv_flag = any(is_uv for _, _, _, is_uv, _ in all_loops_raw)
-    else:
-        use_uv_flag = True
-
-    all_loops = []
-    sel_verts = set()
-    vert_sel_positions = {}
-    for vi, u, v, is_uv, is_mesh in all_loops_raw:
-        is_sel = is_uv if use_uv_flag else is_mesh
-        all_loops.append((vi, u, v, is_sel))
-        if is_sel:
-            sel_verts.add(vi)
-            pos_key = (round(u, PREC), round(v, PREC))
-            vert_sel_positions.setdefault(vi, set()).add(pos_key)
-
     total_u, total_v, count = 0.0, 0.0, 0
-    effective_sticky = 'DISABLED' if use_sync else sticky
+    seen = set()
 
-    for vi, u, v, is_sel in all_loops:
-        include = False
-        if effective_sticky == 'SHARED_VERTEX':
-            include = vi in sel_verts
-        elif effective_sticky == 'SHARED_LOCATION':
-            if vi in vert_sel_positions:
-                include = (round(u, PREC), round(v, PREC)) in vert_sel_positions[vi]
+    for obj in edit_objects:
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.verify()
+        if uv_layer is None:
+            continue
+
+        all_loops_raw = []
+        for face in bm.faces:
+            if not use_sync and not face.select:
+                continue
+            for loop in face.loops:
+                uv_data = loop[uv_layer]
+                u, v = uv_data.uv.x, uv_data.uv.y
+                vi = loop.vert.index
+                if use_sync:
+                    if mesh_mode[2]:
+                        flag = face.select
+                        all_loops_raw.append((vi, u, v, flag, flag))
+                    elif mesh_mode[1]:
+                        uv_edge_flag = (loop.uv_select_edge or loop.link_loop_prev.uv_select_edge)
+                        mesh_edge_flag = (loop.edge.select or loop.link_loop_prev.edge.select)
+                        all_loops_raw.append((vi, u, v, uv_edge_flag, mesh_edge_flag))
+                    else:
+                        all_loops_raw.append((vi, u, v, loop.uv_select_vert, loop.vert.select))
+                else:
+                    flag = loop.uv_select_vert
+                    all_loops_raw.append((vi, u, v, flag, flag))
+
+        if use_sync and not (mesh_mode[2] if use_sync else False):
+            use_uv_flag = any(is_uv for _, _, _, is_uv, _ in all_loops_raw)
         else:
-            include = is_sel
+            use_uv_flag = True
 
-        if not include:
-            continue
-        key = (round(u, 6), round(v, 6), vi)
-        if key in seen:
-            continue
-        seen.add(key)
-        total_u += u
-        total_v += v
-        count += 1
+        all_loops = []
+        sel_verts = set()
+        vert_sel_positions = {}
+        for vi, u, v, is_uv, is_mesh in all_loops_raw:
+            is_sel = is_uv if use_uv_flag else is_mesh
+            all_loops.append((vi, u, v, is_sel))
+            if is_sel:
+                sel_verts.add(vi)
+                pos_key = (round(u, PREC), round(v, PREC))
+                vert_sel_positions.setdefault(vi, set()).add(pos_key)
+
+        effective_sticky = 'DISABLED' if use_sync else sticky
+        oname = obj.name
+
+        for vi, u, v, is_sel in all_loops:
+            include = False
+            if effective_sticky == 'SHARED_VERTEX':
+                include = vi in sel_verts
+            elif effective_sticky == 'SHARED_LOCATION':
+                if vi in vert_sel_positions:
+                    include = (round(u, PREC), round(v, PREC)) in vert_sel_positions[vi]
+            else:
+                include = is_sel
+
+            if not include:
+                continue
+            key = (round(u, 6), round(v, 6), oname, vi)
+            if key in seen:
+                continue
+            seen.add(key)
+            total_u += u
+            total_v += v
+            count += 1
 
     result = (total_u / count, total_v / count) if count else None
     try:
@@ -547,8 +556,7 @@ def _compute_uv_selection_median(context):
         _dbg = False
     if _dbg:
         _uv_debug_log(
-            f"[UV-MEDIAN] use_sync={use_sync} use_uv_flag={use_uv_flag} "
-            f"sticky={sticky!r} effective={effective_sticky!r} "
+            f"[UV-MEDIAN] use_sync={use_sync} sticky={sticky!r} "
             f"corners_included={count} result={result}"
         )
     return result
@@ -1205,9 +1213,8 @@ def _uv_seam_redraw_depsgraph_handler(scene, depsgraph):
             # else: was already False, nothing to do.
             _modals = sorted(_running)
             _diag(f"depsgraph MESH update modals={_modals} active_op={_active_op_id!r} unsafe={state._mesh_modal_unsafe} clear_pending={state._mesh_modal_unsafe_clear_pending}")
-            print(f"[MODOKIT-DBG] depsgraph MESH update, modals={_modals} active_op={_active_op_id!r} unsafe={state._mesh_modal_unsafe}")
         except Exception as _e:
-            print(f"[MODOKIT-DBG] depsgraph MESH update, modal query failed: {_e}")
+            pass
         _uv_debug_log("[UV-DEPSGRAPH] MESH update detected, scheduling UV cache timer")
         global _back_edge_dirty
         _back_edge_dirty = True   # force next draw frame to rebuild regardless of throttle
@@ -2200,9 +2207,11 @@ def _stop_uv_coverage_hud():
 # ── UV Wireframe redraw ───────────────────────────────────────────────────────
 # ── UV editor selection resync ────────────────────────────────────────────────
 
-def _resync_uv_editor_selection(context, obj, select_mode, bm):
+def _resync_uv_editor_selection(context, obj, select_mode, bm, do_deselect=True):
     """Rebuild Blender's UV element map by running uv.select_all(DESELECT) in
-    IMAGE_EDITOR context, then re-applying the current BMesh selection."""
+    IMAGE_EDITOR context, then re-applying the current BMesh selection.
+    Pass do_deselect=False when calling in a multi-object loop to avoid
+    wiping sibling objects' selections on each iteration."""
     if not context.tool_settings.use_uv_select_sync:
         return
     screen = getattr(context, 'screen', None)
@@ -2229,12 +2238,13 @@ def _resync_uv_editor_selection(context, obj, select_mode, bm):
     sel_vert_idxs = [v.index for v in bm.verts if v.select]
     act_face_idx  = bm.faces.active.index if bm.faces.active else None
 
-    try:
-        with context.temp_override(area=target_area, region=target_region):
-            bpy.ops.uv.select_all(action='DESELECT')
-    except Exception as _exc:
-        _uv_debug_log(f"[UV-RESYNC] uv.select_all DESELECT failed: {_exc}")
-        return
+    if do_deselect:
+        try:
+            with context.temp_override(area=target_area, region=target_region):
+                bpy.ops.uv.select_all(action='DESELECT')
+        except Exception as _exc:
+            _uv_debug_log(f"[UV-RESYNC] uv.select_all DESELECT failed: {_exc}")
+            return
 
     bm2 = bmesh.from_edit_mesh(obj.data)
     bm2.faces.ensure_lookup_table()
@@ -2282,6 +2292,96 @@ def _resync_uv_editor_selection(context, obj, select_mode, bm):
         f"[UV-RESYNC] rebuilt: sel_faces={len(sel_face_idxs)} "
         f"sel_edges={len(sel_edge_idxs)} sel_verts={len(sel_vert_idxs)}"
     )
+
+
+def _resync_uv_editor_selection_batch(context, obj_bm_list, select_mode):
+    """Multi-object variant of _resync_uv_editor_selection.
+    Captures all objects' selections BEFORE running uv.select_all(DESELECT),
+    then re-applies them all.  This is necessary because select_all(DESELECT)
+    in sync mode clears mesh face.select flags on all objects simultaneously,
+    which would wipe snapshots captured mid-loop."""
+    if not context.tool_settings.use_uv_select_sync:
+        return
+    screen = getattr(context, 'screen', None)
+    if not screen:
+        return
+
+    target_area = target_region = None
+    for area in screen.areas:
+        if area.type != 'IMAGE_EDITOR':
+            continue
+        for region in area.regions:
+            if region.type == 'WINDOW':
+                target_area = area; target_region = region; break
+        if target_area:
+            break
+    if target_area is None:
+        return
+
+    # ── Step 1: snapshot all selections before any global DESELECT ────────────
+    snapshots = []
+    for obj, bm in obj_bm_list:
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        snapshots.append((
+            obj,
+            [f.index for f in bm.faces if f.select],
+            [e.index for e in bm.edges if e.select],
+            [v.index for v in bm.verts if v.select],
+            bm.faces.active.index if bm.faces.active else None,
+        ))
+
+    # ── Step 2: global DESELECT once ──────────────────────────────────────────
+    try:
+        with context.temp_override(area=target_area, region=target_region):
+            bpy.ops.uv.select_all(action='DESELECT')
+    except Exception as _exc:
+        _uv_debug_log(f"[UV-RESYNC-BATCH] uv.select_all DESELECT failed: {_exc}")
+        return
+
+    # ── Step 3: re-apply each object's selection ──────────────────────────────
+    for obj, sel_face_idxs, sel_edge_idxs, sel_vert_idxs, act_face_idx in snapshots:
+        bm2 = bmesh.from_edit_mesh(obj.data)
+        bm2.faces.ensure_lookup_table()
+        bm2.edges.ensure_lookup_table()
+        bm2.verts.ensure_lookup_table()
+        uv_layer = bm2.loops.layers.uv.active
+
+        if select_mode[2]:
+            for fi in sel_face_idxs:
+                if fi < len(bm2.faces):
+                    face = bm2.faces[fi]
+                    face.select = True
+                    if uv_layer:
+                        for lp in face.loops:
+                            lp.uv_select_vert = True
+                            lp.uv_select_edge = True
+            if act_face_idx is not None and act_face_idx < len(bm2.faces):
+                bm2.faces.active = bm2.faces[act_face_idx]
+        elif select_mode[1]:
+            for ei in sel_edge_idxs:
+                if ei < len(bm2.edges):
+                    edge = bm2.edges[ei]
+                    edge.select = True
+                    if uv_layer:
+                        for lp in edge.link_loops:
+                            lp.uv_select_edge = True
+                            lp.uv_select_vert = True
+        else:
+            for vi in sel_vert_idxs:
+                if vi < len(bm2.verts):
+                    vert = bm2.verts[vi]
+                    vert.select = True
+                    if uv_layer:
+                        for face in vert.link_faces:
+                            for lp in face.loops:
+                                if lp.vert == vert:
+                                    lp.uv_select_vert = True
+
+        if not select_mode[1]:
+            bm2.select_flush_mode()
+        bmesh.update_edit_mesh(obj.data)
 
 
 # ── UV region utilities ───────────────────────────────────────────────────────
