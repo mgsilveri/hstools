@@ -322,6 +322,7 @@ class MG_PT_Export(bpy.types.Panel):
 
     def draw(self, context):
         from . import get_icon
+        from .export_ops import _p4_status_cache
         layout = self.layout
         wm = context.window_manager
         delete_mode = wm.mg_baker_delete_mode
@@ -336,16 +337,42 @@ class MG_PT_Export(bpy.types.Panel):
         else:
             icon_tb = get_icon("toolbag")
             icon_pa = get_icon("painter")
-            col.operator("mg.export_to_toolbag", icon_value=icon_tb if icon_tb else 0,
+
+            # Status icons for P4 depot state
+            # DEPOT_ONLY → ERROR (file exists in P4 but not local)
+            # OUTDATED   → TRIA_UP (local is behind head)
+            _STATUS_ICON = {
+                'DEPOT_ONLY': 'ERROR',
+                'OUTDATED':   'TRIA_UP',
+            }
+
+            tb_status = _p4_status_cache.get('tb', '')
+            pa_status = _p4_status_cache.get('pa', '')
+
+            # Toolbag row
+            row = col.row(align=True)
+            row.scale_y = 1.2
+            row.operator("mg.export_to_toolbag", icon_value=icon_tb if icon_tb else 0,
                          icon='SHADING_RENDERED' if not icon_tb else 'NONE')
-            col.operator("mg.export_to_painter", icon_value=icon_pa if icon_pa else 0,
+            if tb_status in _STATUS_ICON:
+                op = row.operator("mg.p4_status_hint", text="", icon=_STATUS_ICON[tb_status], emboss=False)
+                op.status = tb_status
+
+            # Painter row
+            row = col.row(align=True)
+            row.scale_y = 1.2
+            row.operator("mg.export_to_painter", icon_value=icon_pa if icon_pa else 0,
                          icon='BRUSH_DATA' if not icon_pa else 'NONE')
+            if pa_status in _STATUS_ICON:
+                op = row.operator("mg.p4_status_hint", text="", icon=_STATUS_ICON[pa_status], emboss=False)
+                op.status = pa_status
 
         layout.separator()
         col = layout.column(align=True)
         col.operator("mg.export_fbx_only", icon='EXPORT')
         col.operator("mg.open_bakes_folder", icon='FILE_FOLDER')
         col.operator("mg.open_textures_folder", icon='FILE_FOLDER')
+        col.operator("mg.refresh_p4_status", icon='FILE_REFRESH', text="Refresh P4 Status")
 
 
 # ── Preferences (inline) ─────────────────────────────────────────────────

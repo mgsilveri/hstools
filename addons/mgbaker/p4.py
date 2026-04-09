@@ -252,6 +252,74 @@ def p4_delete_cl_if_empty(cl_description: str) -> None:
         print(f"[mgBaker P4] delete CL failed for {cl_id}: {exc}")
 
 
+def p4_file_status(local_path: str) -> str:
+    """Return the depot status of *local_path*.
+
+    Returns one of:
+      'NONE'        – not in depot and not local (never exported)
+      'LOCAL_ONLY'  – exists locally but not mapped in depot
+      'DEPOT_ONLY'  – in depot but not synced locally (haveRev missing)
+      'OUTDATED'    – local haveRev < headRev
+      'CURRENT'     – local haveRev == headRev
+
+    Always returns 'NONE' if P4 is unavailable or the file is not mapped.
+    """
+    if not _p4_available():
+        return 'NONE'
+    try:
+        out = _run_p4("fstat", local_path)
+        if out is None or "no such file" in out.lower():
+            # File not in depot at all
+            return 'NONE' if not os.path.isfile(local_path) else 'LOCAL_ONLY'
+
+        # Parse headRev and haveRev from fstat output
+        head_rev = have_rev = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("... headRev "):
+                try:
+                    head_rev = int(line.split()[-1])
+                except ValueError:
+                    pass
+            elif line.startswith("... haveRev "):
+                try:
+                    have_rev = int(line.split()[-1])
+                except ValueError:
+                    pass
+            elif "headAction" in line and "delete" in line:
+                return 'NONE' if not os.path.isfile(local_path) else 'LOCAL_ONLY'
+
+        if head_rev is None:
+            return 'LOCAL_ONLY' if os.path.isfile(local_path) else 'NONE'
+        if have_rev is None:
+            return 'DEPOT_ONLY'
+        # haveRev is recorded in the workspace DB even if the file was deleted
+        # locally — always check actual disk presence before reporting CURRENT.
+        if not os.path.isfile(local_path):
+            return 'DEPOT_ONLY'
+        if have_rev < head_rev:
+            return 'OUTDATED'
+        return 'CURRENT'
+    except Exception as exc:
+        print(f"[mgBaker P4] fstat failed for {local_path}: {exc}")
+        return 'NONE'
+
+
+def p4_sync(local_path: str) -> bool:
+    """Force-sync *local_path* to the head revision.
+
+    Returns True on success, False on failure.
+    """
+    if not _p4_available():
+        return False
+    try:
+        out = _run_p4("sync", "-f", local_path)
+        return out is not None
+    except Exception as exc:
+        print(f"[mgBaker P4] sync failed for {local_path}: {exc}")
+        return False
+
+
 def delayed_checkout_tbscene(tbscene_path: str, cl_description: str, max_wait: float = 120.0) -> None:
     """Poll for *tbscene_path* to appear on disk, then P4 checkout it.
 

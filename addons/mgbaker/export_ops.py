@@ -29,6 +29,85 @@ def _prefs():
     return addon.preferences if addon else None
 
 
+# ── P4 status cache ───────────────────────────────────────────────────────
+
+# Keyed by ('tb'|'pa').  Values: 'NONE'|'LOCAL_ONLY'|'DEPOT_ONLY'|'OUTDATED'|'CURRENT'
+_p4_status_cache: dict = {}
+
+
+def _output_paths_for_context(context):
+    """Return (tbscene_path, spp_path) for the active project, or (None, None)."""
+    if not bpy.data.filepath:
+        return None, None
+    proj = get_active_project(context.scene)
+    if proj is None:
+        return None, None
+    bakes = _bakes_dir()
+    out_name = get_project_output_name(proj, context.scene)
+    blend_dir = os.path.dirname(bpy.data.filepath)
+    tbscene = os.path.join(bakes, f"{out_name}.tbscene")
+    spp = os.path.join(blend_dir, "textures", f"{out_name}.spp")
+    return tbscene, spp
+
+
+def refresh_p4_status(context=None) -> None:
+    """Update _p4_status_cache for the active project's output files.
+
+    Safe to call from load_post handlers and operators.
+    No-op when P4 is unavailable or the blend file is not saved.
+    """
+    global _p4_status_cache
+    ctx = context or bpy.context
+    _p4_status_cache.clear()
+    if not bpy.data.filepath:
+        return
+    tbscene, spp = _output_paths_for_context(ctx)
+    if tbscene is not None:
+        _p4_status_cache['tb'] = p4.p4_file_status(tbscene)
+    if spp is not None:
+        _p4_status_cache['pa'] = p4.p4_file_status(spp)
+    print(f"[mgBaker P4] status — tb:{_p4_status_cache.get('tb','?')}  pa:{_p4_status_cache.get('pa','?')}")
+
+
+class MG_OT_RefreshP4Status(bpy.types.Operator):
+    bl_idname = "mg.refresh_p4_status"
+    bl_label = "Refresh P4 Status"
+    bl_description = "Query Perforce for the current status of the .tbscene and .spp files"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(bpy.data.filepath)
+
+    def execute(self, context):
+        refresh_p4_status(context)
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {'FINISHED'}
+
+
+_P4_STATUS_MESSAGES = {
+    'DEPOT_ONLY': "In Perforce but not synced locally — exporting will sync and checkout the existing file",
+    'OUTDATED':   "Local file is behind the latest revision — exporting will sync to head first",
+}
+
+
+class MG_OT_P4StatusHint(bpy.types.Operator):
+    """No-op operator used as a tooltip-bearing icon label for P4 file status."""
+    bl_idname = "mg.p4_status_hint"
+    bl_label = ""
+    bl_options = {'INTERNAL'}
+
+    status: bpy.props.StringProperty(default='DEPOT_ONLY')
+
+    @classmethod
+    def description(cls, context, props):
+        return _P4_STATUS_MESSAGES.get(props.status, "")
+
+    def execute(self, context):
+        return {'CANCELLED'}
+
+
 # ── Bake-map definitions ─────────────────────────────────────────────────
 
 # (prop_name, toolbag_map_name, output_suffix)
@@ -687,50 +766,68 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
             self.report({'WARNING'}, f"Toolbag not found at {toolbag_exe}")
             return {'FINISHED'}
 
-        # Always re-export per-group FBX files so the .tbscene reflects
-        # the current mesh state.
-        group_fbx_pairs = _export_per_group_fbx(groups, bakes)
-        if not group_fbx_pairs:
-            self.report({'ERROR'}, "All FBX exports failed.")
-            return {'CANCELLED'}
-        for _, fbx_path in group_fbx_pairs:
-            log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
+        tbscene_path = os.path.join(bakes, f"{out_name}.tbscene")
+        tb_status = _p4_status_cache.get('tb', 'NONE')
+        synced_from_p4 = False
 
-        script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes, out_name)
-
-        if prefs.launch_app_after_export:
-            exe_stem = os.path.splitext(os.path.basename(toolbag_exe))[0]  # "toolbag"
-            try:
-                result = subprocess.run(
-                    [
-                        "powershell", "-NoProfile", "-Command",
-                        f"if (Get-Process -Name '{exe_stem}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
-                    ],
-                    capture_output=True, text=True, timeout=5,
-                )
-                tb_running = result.stdout.strip().lower() == "yes"
-            except Exception:
-                tb_running = False
-
-            if tb_running:
-                log_lines.append("⚠ Toolbag open — FBX updated on disk (auto-reloads). Close Toolbag and re-export to update baker settings.")
+        if tb_status in ('DEPOT_ONLY', 'OUTDATED') and p4._p4_available():
+            # Depot has a file we don't have (or are behind on) — sync + open it
+            # instead of regenerating the .tbscene from scratch.
+            synced = p4.p4_sync(tbscene_path)
+            if synced and os.path.isfile(tbscene_path):
+                p4.p4_checkout(tbscene_path, p4.get_cl_description())
+                verb = "synced" if tb_status == 'DEPOT_ONLY' else "updated to latest"
+                log_lines.append(f"✓ .tbscene {verb} from Perforce")
+                if prefs.launch_app_after_export:
+                    os.system(f'start "" "{toolbag_exe}" "{tbscene_path}"')
+                    log_lines.append("✓ Toolbag launched with existing .tbscene")
+                synced_from_p4 = True
             else:
-                os.system(f'start "" "{toolbag_exe}" "{script_path}"')
-                log_lines.append("✓ Toolbag launched")
+                log_lines.append("⚠ P4 sync failed — falling back to full export")
 
-                # Delayed P4 checkout for the .tbscene
-                p4.delayed_checkout_tbscene(tbscene_out, p4.get_cl_description())
+        if not synced_from_p4:
+            # Normal path: re-export all FBX + generate + run bake script
+            group_fbx_pairs = _export_per_group_fbx(groups, bakes)
+            if not group_fbx_pairs:
+                self.report({'ERROR'}, "All FBX exports failed.")
+                return {'CANCELLED'}
+            for _, fbx_path in group_fbx_pairs:
+                log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
 
-                # Clean up script after 30s
-                def _delayed_script_cleanup():
-                    try:
-                        if os.path.isfile(script_path):
-                            os.remove(script_path)
-                    except Exception:
-                        pass
-                    return None
-                bpy.app.timers.register(_delayed_script_cleanup, first_interval=30.0)
+            script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes, out_name)
 
+            if prefs.launch_app_after_export:
+                exe_stem = os.path.splitext(os.path.basename(toolbag_exe))[0]
+                try:
+                    result = subprocess.run(
+                        [
+                            "powershell", "-NoProfile", "-Command",
+                            f"if (Get-Process -Name '{exe_stem}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
+                        ],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    tb_running = result.stdout.strip().lower() == "yes"
+                except Exception:
+                    tb_running = False
+
+                if tb_running:
+                    log_lines.append("⚠ Toolbag open — FBX updated on disk (auto-reloads). Close Toolbag and re-export to update baker settings.")
+                else:
+                    os.system(f'start "" "{toolbag_exe}" "{script_path}"')
+                    log_lines.append("✓ Toolbag launched")
+
+                    p4.delayed_checkout_tbscene(tbscene_out, p4.get_cl_description())
+
+                    def _delayed_script_cleanup():
+                        try:
+                            if os.path.isfile(script_path):
+                                os.remove(script_path)
+                        except Exception:
+                            pass
+                        return None
+                    bpy.app.timers.register(_delayed_script_cleanup, first_interval=30.0)
+
+        refresh_p4_status(context)
         _store_log(context, log_lines)
 
         if any(line.startswith("⚠") for line in log_lines):
@@ -819,12 +916,23 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
                 hp_fbx_by_group[g.name] = hp_path
                 log_lines.append(f"✓ {os.path.basename(hp_path)} exported")
 
-        # Copy .spp template if output doesn't exist
+        # .spp: sync from depot if available, otherwise copy template
         textures_dir = os.path.join(blend_dir, "textures")
         os.makedirs(textures_dir, exist_ok=True)
         spp_out_path = os.path.join(textures_dir, f"{out_name}.spp")
+        pa_status = _p4_status_cache.get('pa', 'NONE')
 
-        if not os.path.isfile(spp_out_path):
+        if pa_status in ('DEPOT_ONLY', 'OUTDATED') and p4._p4_available():
+            synced = p4.p4_sync(spp_out_path)
+            if synced and os.path.isfile(spp_out_path):
+                p4.p4_checkout(spp_out_path, p4.get_cl_description())
+                verb = "synced" if pa_status == 'DEPOT_ONLY' else "updated to latest"
+                log_lines.append(f"✓ .spp {verb} from Perforce")
+            else:
+                log_lines.append("⚠ P4 sync failed — will use local .spp or template")
+                pa_status = 'NONE'  # fall through
+
+        if pa_status not in ('DEPOT_ONLY', 'OUTDATED') and not os.path.isfile(spp_out_path):
             template_path = prefs.spp_template
             if not template_path or not os.path.isfile(template_path):
                 # Try bundled template
@@ -891,6 +999,7 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
                 subprocess.Popen(cmd)
                 log_lines.append("✓ Painter launched")
 
+        refresh_p4_status(context)
         _store_log(context, log_lines)
 
         self.report({'INFO'}, f"Exported {len(groups)} group(s) to Painter")

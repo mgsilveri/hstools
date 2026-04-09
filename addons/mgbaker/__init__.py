@@ -69,6 +69,8 @@ _ALL_CLASSES = (
     # Export operators
     export_ops.MG_OT_ExportToToolbag,
     export_ops.MG_OT_ExportToPainter,
+    export_ops.MG_OT_RefreshP4Status,
+    export_ops.MG_OT_P4StatusHint,
     export_ops.MG_OT_DeleteToolbagFiles,
     export_ops.MG_OT_DeletePainterFiles,
     export_ops.MG_OT_ExportFBXOnly,
@@ -82,6 +84,16 @@ _ALL_CLASSES = (
     baker_panel.MG_PT_PanelPrefs,
     baker_panel.MG_PT_Log,
 )
+
+
+# ============================================================================
+# App handlers
+# ============================================================================
+
+@bpy.app.handlers.persistent
+def _on_load_post(dummy):
+    """Refresh P4 file status after opening a .blend file."""
+    export_ops.refresh_p4_status()
 
 
 # ============================================================================
@@ -102,6 +114,8 @@ def register():
 
     baker_props.register()
 
+    bpy.app.handlers.load_post.append(_on_load_post)
+
     bpy.types.WindowManager.mg_baker_delete_mode = bpy.props.BoolProperty(
         name="Delete Mode",
         default=False,
@@ -113,6 +127,7 @@ def register():
 
 def unregister():
     global _icon_previews
+    bpy.app.handlers.load_post.remove(_on_load_post)
     bpy.types.OUTLINER_MT_collection.remove(baker_ops._draw_outliner_collection_menu)
 
     baker_props.unregister()

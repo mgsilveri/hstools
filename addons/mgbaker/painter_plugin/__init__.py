@@ -39,6 +39,8 @@ _SUFFIX_TO_USAGE = {
     "_id":                  textureset.MeshMapUsage.ID,
     "_thickness":           textureset.MeshMapUsage.Thickness,
     "_position":            textureset.MeshMapUsage.Position,
+    "_height":              textureset.MeshMapUsage.Height,
+    "_opacity":             textureset.MeshMapUsage.Opacity,
 }
 
 _SUFFIX_NO_UNDERSCORE_TO_USAGE = {
@@ -153,8 +155,14 @@ def _configure_baking_for_ts(ts, grp):
             common["DilationWidth"]: 128,
         }
 
+        if "SubSampling" in common:
+            set_values[common["SubSampling"]] = common["SubSampling"].enum_value("Subsampling 8x8")
+
         if hp_fbx and os.path.isfile(hp_fbx):
             set_values[common["HipolyMesh"]] = QUrl.fromLocalFile(hp_fbx).toString()
+
+        if "CageMode" in common:
+            set_values[common["CageMode"]] = common["CageMode"].enum_value("Automatic (experimental)")
 
         baking.BakingParameters.set(set_values)
         print(f"[{PLUGIN_NAME}] {ts_name}: baking params configured (HP: {os.path.basename(hp_fbx) if hp_fbx else 'none'})")
@@ -171,6 +179,20 @@ def _configure_baking_for_ts(ts, grp):
             print(f"[{PLUGIN_NAME}] {ts_name}: {len(enabled_usages)} bakers enabled")
         except Exception as exc:
             print(f"[{PLUGIN_NAME}] {ts_name}: enable bakers failed: {exc}")
+
+    # AO per-baker defaults
+    if "ambient_occlusion" in maps:
+        try:
+            params = baking.BakingParameters.from_texture_set_name(ts_name)
+            ao_params = params.baker(textureset.MeshMapUsage.AO)
+            ao_values = {}
+            if "NbSecondary" in ao_params:
+                ao_values[ao_params["NbSecondary"]] = 256
+            if ao_values:
+                baking.BakingParameters.set(ao_values)
+                print(f"[{PLUGIN_NAME}] {ts_name}: AO params configured")
+        except Exception as exc:
+            print(f"[{PLUGIN_NAME}] {ts_name}: AO params failed: {exc}")
 
 
 def _configure_baking(config):
@@ -331,7 +353,7 @@ def close_plugin():
         pass
     if _watcher is not None:
         try:
-            _watcher.directoryChanged.disconnect(_on_bakes_dir_changed)
+            _watcher.directoryChanged.disconnect()
         except Exception:
             pass
         try:
@@ -340,5 +362,4 @@ def close_plugin():
                 _watcher.removePaths(dirs)
         except Exception:
             pass
-        _watcher.deleteLater()
         _watcher = None
