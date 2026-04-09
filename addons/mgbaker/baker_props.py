@@ -84,7 +84,7 @@ class MG_ExportGroup(bpy.types.PropertyGroup):
     smooth_by_uv: BoolProperty(name="Smooth by UV", description="Mark edges sharp at UV seam boundaries", default=True)
     export_at_origin: BoolProperty(name="Export at Origin", description="Reset object transforms to world origin before exporting", default=False)
     instance_uv_offset: BoolProperty(
-        name="Instance UV Offset",
+        name="UV Offset",
         description="Shift instanced LP meshes sharing the same source data by +1 U (tile 1002)",
         default=True,
     )
