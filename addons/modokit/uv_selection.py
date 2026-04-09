@@ -276,6 +276,15 @@ class IMAGE_OT_modo_uv_stitch(bpy.types.Operator):
 _UV_EPS = 1e-5
 
 
+def _get_edit_objects(context):
+    """Return all mesh objects currently in edit mode."""
+    objects = getattr(context, 'objects_in_mode_unique_data', None)
+    if objects:
+        return [o for o in objects if o and o.type == 'MESH']
+    obj = context.edit_object
+    return [obj] if obj and obj.type == 'MESH' else []
+
+
 def _uv_clear_all_loop_flags(obj, use_sync=True):
     """Clear UV selection state on obj via BMesh.
 
@@ -704,8 +713,8 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
 
         region   = context.region
         sima     = context.space_data
-        obj      = context.edit_object
-        if obj is None or obj.type != 'MESH':
+        edit_objects = _get_edit_objects(context)
+        if not edit_objects:
             return {'CANCELLED'}
 
         ts       = context.tool_settings
@@ -718,142 +727,161 @@ class IMAGE_OT_modo_uv_double_click_select(bpy.types.Operator):
 
         do_select = (self.mode != 'remove')
 
-        if self.mode == 'set' and use_sync:
-            _uv_clear_all_loop_flags(obj)
+        if self.mode == 'set':
+            for _o in edit_objects:
+                _uv_clear_all_loop_flags(_o, use_sync=use_sync)
 
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        uv_layer = bm.loops.layers.uv.active
-        if uv_layer is None:
-            return {'CANCELLED'}
-
-        if self.mode == 'set' and not use_sync:
-            for _f in bm.faces:
-                for _lp in _f.loops:
-                    _lp.uv_select_vert = False
-                    _lp.uv_select_edge = False
-
-        # Edge mode + Add: expand ALL selected edges to their UV loops
+        # Edge mode + Add: expand ALL selected edges to their UV loops across all objects
         if uv_mode == 'EDGE' and self.mode == 'add':
-            seed_loops = []
-            for face in bm.faces:
-                if face.hide:
-                    continue
-                for li, loop in enumerate(face.loops):
-                    try:
-                        sel = loop.uv_select_edge
-                    except AttributeError:
-                        sel = loop.edge.select if use_sync else False
-                    if sel:
-                        seed_loops.append(loop)
             best_dist_pre = float('inf')
             best_loop_pre = None
+            best_bm_pre   = None
+            best_obj_pre  = None
             TOLERANCE_PRE = 40
-            for face in bm.faces:
-                if face.hide:
+            for obj in edit_objects:
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                uv_layer = bm.loops.layers.uv.active
+                if uv_layer is None:
                     continue
-                for li, loop in enumerate(face.loops):
-                    uv_a = loop[uv_layer].uv
-                    uv_b = loop.link_loop_next[uv_layer].uv
-                    sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
-                    sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
-                    if sc_a is None or sc_b is None:
+                seed_loops = []
+                for face in bm.faces:
+                    if face.hide:
                         continue
-                    d = _dist_point_to_segment_2d(mx, my,
-                                                  sc_a[0], sc_a[1],
-                                                  sc_b[0], sc_b[1])
-                    if d < best_dist_pre:
-                        best_dist_pre = d
-                        best_loop_pre = loop
-            if best_loop_pre is not None and best_dist_pre <= TOLERANCE_PRE:
-                if best_loop_pre not in seed_loops:
-                    seed_loops.append(best_loop_pre)
-            for seed in seed_loops:
-                for lp in _collect_uv_edge_loop(seed, uv_layer):
-                    if use_sync:
-                        lp.edge.select = True
+                    for li, loop in enumerate(face.loops):
                         try:
-                            lp.uv_select_edge = True
+                            sel = loop.uv_select_edge
                         except AttributeError:
-                            pass
-                        try:
-                            lp.uv_select_vert = True
-                            lp.link_loop_next.uv_select_vert = True
-                        except AttributeError:
-                            pass
-                    else:
-                        try:
-                            lp.uv_select_edge = True
-                            lp.uv_select_vert = True
-                            lp.link_loop_next.uv_select_vert = True
-                        except AttributeError:
-                            pass
-            if use_sync:
-                bm.select_flush_mode()
-            bmesh.update_edit_mesh(obj.data)
+                            sel = loop.edge.select if use_sync else False
+                        if sel:
+                            seed_loops.append(loop)
+                for face in bm.faces:
+                    if face.hide:
+                        continue
+                    for li, loop in enumerate(face.loops):
+                        uv_a = loop[uv_layer].uv
+                        uv_b = loop.link_loop_next[uv_layer].uv
+                        sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
+                        sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
+                        if sc_a is None or sc_b is None:
+                            continue
+                        d = _dist_point_to_segment_2d(mx, my,
+                                                      sc_a[0], sc_a[1],
+                                                      sc_b[0], sc_b[1])
+                        if d < best_dist_pre:
+                            best_dist_pre = d
+                            best_loop_pre = loop
+                            best_bm_pre   = bm
+                            best_obj_pre  = obj
+                if best_loop_pre is not None and best_dist_pre <= TOLERANCE_PRE:
+                    if best_loop_pre not in seed_loops:
+                        seed_loops.append(best_loop_pre)
+                for seed in seed_loops:
+                    uv_layer_s = bm.loops.layers.uv.active
+                    if uv_layer_s is None:
+                        continue
+                    for lp in _collect_uv_edge_loop(seed, uv_layer_s):
+                        if use_sync:
+                            lp.edge.select = True
+                            try:
+                                lp.uv_select_edge = True
+                            except AttributeError:
+                                pass
+                            try:
+                                lp.uv_select_vert = True
+                                lp.link_loop_next.uv_select_vert = True
+                            except AttributeError:
+                                pass
+                        else:
+                            try:
+                                lp.uv_select_edge = True
+                                lp.uv_select_vert = True
+                                lp.link_loop_next.uv_select_vert = True
+                            except AttributeError:
+                                pass
+                if use_sync:
+                    bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data)
             return {'FINISHED'}
 
-        # Hit-test: find nearest UV element to cursor
+        # Hit-test across all objects: find nearest UV element to cursor
         best_dist = float('inf')
         best_face = None
         best_li   = -1
+        best_bm   = None
+        best_obj  = None
+        best_uv_layer = None
         TOLERANCE = 40
 
-        for face in bm.faces:
-            if face.hide:
+        for obj in edit_objects:
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
                 continue
-            loops = list(face.loops)
-            if uv_mode == 'VERTEX':
-                for li, loop in enumerate(loops):
-                    uv = loop[uv_layer].uv
-                    sc = _uv_view_to_region(region, sima, uv.x, uv.y)
+            for face in bm.faces:
+                if face.hide:
+                    continue
+                loops = list(face.loops)
+                if uv_mode == 'VERTEX':
+                    for li, loop in enumerate(loops):
+                        uv = loop[uv_layer].uv
+                        sc = _uv_view_to_region(region, sima, uv.x, uv.y)
+                        if sc is None:
+                            continue
+                        d = math.sqrt((sc[0] - mx) ** 2 + (sc[1] - my) ** 2)
+                        if d < best_dist:
+                            best_dist = d; best_face = face; best_li = li
+                            best_bm = bm; best_obj = obj; best_uv_layer = uv_layer
+                elif uv_mode == 'EDGE':
+                    for li, loop in enumerate(loops):
+                        uv_a = loop[uv_layer].uv
+                        uv_b = loop.link_loop_next[uv_layer].uv
+                        sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
+                        sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
+                        if sc_a is None or sc_b is None:
+                            continue
+                        d = _dist_point_to_segment_2d(mx, my,
+                                                      sc_a[0], sc_a[1],
+                                                      sc_b[0], sc_b[1])
+                        if d < best_dist:
+                            best_dist = d; best_face = face; best_li = li
+                            best_bm = bm; best_obj = obj; best_uv_layer = uv_layer
+                else:  # FACE or ISLAND
+                    sc_poly = []
+                    poly_ok = True
+                    for lp in loops:
+                        sc = _uv_view_to_region(region, sima,
+                                                lp[uv_layer].uv.x,
+                                                lp[uv_layer].uv.y)
+                        if sc is None:
+                            poly_ok = False
+                            break
+                        sc_poly.append(sc)
+                    if poly_ok and len(sc_poly) >= 3:
+                        if _point_in_poly_2d(mx, my, sc_poly):
+                            best_dist = -1.0; best_face = face; best_li = -1
+                            best_bm = bm; best_obj = obj; best_uv_layer = uv_layer
+                            break
+                    n  = max(len(loops), 1)
+                    su = sum(lp[uv_layer].uv.x for lp in loops) / n
+                    sv = sum(lp[uv_layer].uv.y for lp in loops) / n
+                    sc = _uv_view_to_region(region, sima, su, sv)
                     if sc is None:
                         continue
                     d = math.sqrt((sc[0] - mx) ** 2 + (sc[1] - my) ** 2)
                     if d < best_dist:
-                        best_dist = d; best_face = face; best_li = li
-            elif uv_mode == 'EDGE':
-                for li, loop in enumerate(loops):
-                    uv_a = loop[uv_layer].uv
-                    uv_b = loop.link_loop_next[uv_layer].uv
-                    sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
-                    sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
-                    if sc_a is None or sc_b is None:
-                        continue
-                    d = _dist_point_to_segment_2d(mx, my,
-                                                  sc_a[0], sc_a[1],
-                                                  sc_b[0], sc_b[1])
-                    if d < best_dist:
-                        best_dist = d; best_face = face; best_li = li
-            else:  # FACE or ISLAND
-                sc_poly = []
-                poly_ok = True
-                for lp in loops:
-                    sc = _uv_view_to_region(region, sima,
-                                            lp[uv_layer].uv.x,
-                                            lp[uv_layer].uv.y)
-                    if sc is None:
-                        poly_ok = False
-                        break
-                    sc_poly.append(sc)
-                if poly_ok and len(sc_poly) >= 3:
-                    if _point_in_poly_2d(mx, my, sc_poly):
-                        best_dist = -1.0; best_face = face; best_li = -1
-                        break
-                n  = max(len(loops), 1)
-                su = sum(lp[uv_layer].uv.x for lp in loops) / n
-                sv = sum(lp[uv_layer].uv.y for lp in loops) / n
-                sc = _uv_view_to_region(region, sima, su, sv)
-                if sc is None:
-                    continue
-                d = math.sqrt((sc[0] - mx) ** 2 + (sc[1] - my) ** 2)
-                if d < best_dist:
-                    best_dist = d; best_face = face; best_li = -1
+                        best_dist = d; best_face = face; best_li = -1
+                        best_bm = bm; best_obj = obj; best_uv_layer = uv_layer
+            if best_dist < 0:  # exact face hit, stop searching
+                break
 
         if best_face is None or (best_dist > TOLERANCE and best_dist >= 0):
             return {'CANCELLED'}
+
+        bm       = best_bm
+        obj      = best_obj
+        uv_layer = best_uv_layer
 
         if uv_mode == 'EDGE':
             start_loop = list(best_face.loops)[best_li]
@@ -1287,8 +1315,7 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
                 and context.mode == 'EDIT_MESH')
 
     def invoke(self, context, event):
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
+        if not _get_edit_objects(context):
             return {'CANCELLED'}
 
         _uv_debug_log(
@@ -1298,7 +1325,8 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
 
         if self.mode == 'set':
             _use_sync = context.tool_settings.use_uv_select_sync
-            _uv_clear_all_loop_flags(obj, use_sync=_use_sync)
+            for _o in _get_edit_objects(context):
+                _uv_clear_all_loop_flags(_o, use_sync=_use_sync)
 
         self._cache = IMAGE_OT_modo_uv_paint_selection._build_cache(self, context)
         _uv_debug_log(f"[UV-CLICK] cache size={len(self._cache)}")
@@ -1306,11 +1334,12 @@ class IMAGE_OT_modo_uv_click_select(bpy.types.Operator):
 
         if context.tool_settings.use_uv_select_sync:
             sm = tuple(context.tool_settings.mesh_select_mode)
-            bm = bmesh.from_edit_mesh(obj.data)
-            if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
-                bmesh.update_edit_mesh(obj.data)
-            else:
-                _resync_uv_editor_selection(context, obj, sm, bm)
+            for obj in _get_edit_objects(context):
+                bm = bmesh.from_edit_mesh(obj.data)
+                if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
+                    bmesh.update_edit_mesh(obj.data)
+                else:
+                    _resync_uv_editor_selection(context, obj, sm, bm)
 
         if context.area:
             context.area.tag_redraw()
@@ -1349,9 +1378,6 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
     def _build_cache(self, context):
         region = context.region
         sima   = context.space_data
-        obj    = context.edit_object
-        if obj is None or obj.type != 'MESH':
-            return []
         ts       = context.tool_settings
         use_sync = ts.use_uv_select_sync
         if use_sync:
@@ -1359,42 +1385,45 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             uv_mode = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
         else:
             uv_mode = ts.uv_select_mode
-        bm       = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        uv_layer = bm.loops.layers.uv.active
-        entries  = []
-        for fi, face in enumerate(bm.faces):
-            if face.hide or uv_layer is None:
-                continue
-            if uv_mode == 'VERTEX':
-                for li, loop in enumerate(face.loops):
-                    uv = loop[uv_layer].uv
-                    sc = _uv_view_to_region(region, sima, uv.x, uv.y)
-                    if sc is not None:
-                        entries.append((sc[0], sc[1], fi, li, 'VERTEX'))
-            elif uv_mode == 'EDGE':
-                for li, loop in enumerate(face.loops):
-                    uv_a = loop[uv_layer].uv
-                    uv_b = loop.link_loop_next[uv_layer].uv
-                    sc_a = _uv_view_to_region_unclamped(region, uv_a.x, uv_a.y)
-                    sc_b = _uv_view_to_region_unclamped(region, uv_b.x, uv_b.y)
-                    if sc_a is not None and sc_b is not None:
-                        clipped = _clip_segment_to_rect(
-                            sc_a[0], sc_a[1], sc_b[0], sc_b[1],
-                            0, 0, region.width, region.height,
-                        )
-                        if clipped is not None:
-                            entries.append((clipped[0], clipped[1], fi, li,
-                                            'EDGE', clipped[2], clipped[3]))
-            else:
-                poly = []
-                for lp in face.loops:
-                    uv = lp[uv_layer].uv
-                    sc = _uv_view_to_region(region, sima, uv.x, uv.y)
-                    if sc is not None:
-                        poly.append((sc[0], sc[1]))
-                if len(poly) >= 3:
-                    entries.append((poly[0][0], poly[0][1], fi, -1, uv_mode, poly))
+        edit_objects = _get_edit_objects(context)
+        self._cache_objects = edit_objects
+        entries = []
+        for oi, obj in enumerate(edit_objects):
+            bm       = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
+            for fi, face in enumerate(bm.faces):
+                if face.hide or uv_layer is None:
+                    continue
+                if uv_mode == 'VERTEX':
+                    for li, loop in enumerate(face.loops):
+                        uv = loop[uv_layer].uv
+                        sc = _uv_view_to_region(region, sima, uv.x, uv.y)
+                        if sc is not None:
+                            entries.append((sc[0], sc[1], fi, li, 'VERTEX', oi))
+                elif uv_mode == 'EDGE':
+                    for li, loop in enumerate(face.loops):
+                        uv_a = loop[uv_layer].uv
+                        uv_b = loop.link_loop_next[uv_layer].uv
+                        sc_a = _uv_view_to_region_unclamped(region, uv_a.x, uv_a.y)
+                        sc_b = _uv_view_to_region_unclamped(region, uv_b.x, uv_b.y)
+                        if sc_a is not None and sc_b is not None:
+                            clipped = _clip_segment_to_rect(
+                                sc_a[0], sc_a[1], sc_b[0], sc_b[1],
+                                0, 0, region.width, region.height,
+                            )
+                            if clipped is not None:
+                                entries.append((clipped[0], clipped[1], fi, li,
+                                                'EDGE', oi, clipped[2], clipped[3]))
+                else:
+                    poly = []
+                    for lp in face.loops:
+                        uv = lp[uv_layer].uv
+                        sc = _uv_view_to_region(region, sima, uv.x, uv.y)
+                        if sc is not None:
+                            poly.append((sc[0], sc[1]))
+                    if len(poly) >= 3:
+                        entries.append((poly[0][0], poly[0][1], fi, -1, uv_mode, oi, poly))
         return entries
 
     def modal(self, context, event):
@@ -1405,9 +1434,8 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                 context.area.tag_redraw()
         elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if context.tool_settings.use_uv_select_sync:
-                obj = context.edit_object
-                if obj is not None and obj.type == 'MESH':
-                    sm = tuple(context.tool_settings.mesh_select_mode)
+                sm = tuple(context.tool_settings.mesh_select_mode)
+                for obj in _get_edit_objects(context):
                     if sm[0] or sm[1]:  # vertex/edge mode: skip resync to avoid shared-element propagation
                         bmesh.update_edit_mesh(obj.data)
                     else:
@@ -1432,8 +1460,8 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             f"obj={obj.name if obj else None!r}"
         )
         if self.mode == 'set':
-            if obj and obj.type == 'MESH':
-                _uv_clear_all_loop_flags(obj, use_sync=ts.use_uv_select_sync)
+            for _o in _get_edit_objects(context):
+                _uv_clear_all_loop_flags(_o, use_sync=ts.use_uv_select_sync)
         self._mouse_pos = (event.mouse_region_x, event.mouse_region_y)
         self._cache     = self._build_cache(context)
         self._paint(context, event)
@@ -1450,9 +1478,6 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
         radius_px = (prefs.paint_selection_size if prefs else 50) / 4
         mx, my    = event.mouse_region_x, event.mouse_region_y
         do_select = (self.mode in {'set', 'add'})
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
-            return
         ts       = context.tool_settings
         use_sync = ts.use_uv_select_sync
         if use_sync:
@@ -1460,23 +1485,33 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
             uv_mode = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
         else:
             uv_mode = ts.uv_select_mode
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        uv_layer = bm.loops.layers.uv.active
-        dirty    = False
-        island_done = set()
+        obj_list  = getattr(self, '_cache_objects', None) or _get_edit_objects(context)
+        if not obj_list:
+            return
+        bm_list  = [bmesh.from_edit_mesh(o.data) for o in obj_list]
+        uv_list  = []
+        for bm in bm_list:
+            bm.faces.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            uv_list.append(bm.loops.layers.uv.active)
+        dirty_set   = set()
+        island_done = {}  # oi -> set of face indices
         for entry in self._cache:
             sx, sy, fi, li, etype = entry[:5]
-            if etype == 'EDGE' and len(entry) == 7:
-                if _point_to_segment_dist(mx, my, sx, sy, entry[5], entry[6]) > radius_px:
+            oi = entry[5]
+            if etype == 'EDGE' and len(entry) == 8:
+                if _point_to_segment_dist(mx, my, sx, sy, entry[6], entry[7]) > radius_px:
                     continue
-            elif etype in {'FACE', 'ISLAND'} and len(entry) == 6:
-                if not _circle_touches_polygon(mx, my, radius_px, entry[5]):
+            elif etype in {'FACE', 'ISLAND'} and len(entry) == 7:
+                if not _circle_touches_polygon(mx, my, radius_px, entry[6]):
                     continue
             elif math.sqrt((sx - mx) ** 2 + (sy - my) ** 2) > radius_px:
                 continue
+            if oi >= len(bm_list):
+                continue
+            bm       = bm_list[oi]
+            uv_layer = uv_list[oi]
             if fi >= len(bm.faces):
                 continue
             face = bm.faces[fi]
@@ -1489,7 +1524,7 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                             lp.uv_select_vert = do_select
                         except AttributeError:
                             pass
-                        dirty = True
+                        dirty_set.add(oi)
                 elif uv_mode == 'EDGE':
                     if 0 <= li < len(face.loops):
                         lp = face.loops[li]
@@ -1504,7 +1539,7 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                                 lp.link_loop_next.uv_select_vert = True
                             except AttributeError:
                                 pass
-                        dirty = True
+                        dirty_set.add(oi)
                 else:
                     face.select = do_select
                     if not do_select:
@@ -1522,7 +1557,7 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                                 lp.uv_select_edge = do_select
                             except AttributeError:
                                 pass
-                    dirty = True
+                    dirty_set.add(oi)
             else:
                 if uv_layer is None:
                     continue
@@ -1534,7 +1569,7 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                         else:
                             _uv_deselect_shared_verts(bm, uv_layer,
                                                       lp[uv_layer].uv.copy())
-                        dirty = True
+                        dirty_set.add(oi)
                 elif uv_mode == 'EDGE':
                     if 0 <= li < len(face.loops):
                         lp = face.loops[li]
@@ -1546,17 +1581,18 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                             _uv_deselect_shared_edges(bm, uv_layer,
                                                       lp[uv_layer].uv.copy(),
                                                       lp.link_loop_next[uv_layer].uv.copy())
-                        dirty = True
+                        dirty_set.add(oi)
                 elif uv_mode == 'FACE':
                     for lp in face.loops:
                         lp.uv_select_vert = do_select
                         lp.uv_select_edge = do_select
-                    dirty = True
+                    dirty_set.add(oi)
                 else:  # ISLAND
-                    if face.index in island_done:
+                    oi_done = island_done.setdefault(oi, set())
+                    if face.index in oi_done:
                         continue
                     island = _uv_island_flood_fill(bm, face, uv_layer)
-                    island_done |= island
+                    oi_done |= island
                     bm.faces.ensure_lookup_table()
                     for ifi in island:
                         if ifi < len(bm.faces):
@@ -1564,11 +1600,14 @@ class IMAGE_OT_modo_uv_paint_selection(bpy.types.Operator):
                             for lp in iface.loops:
                                 lp.uv_select_vert = do_select
                                 lp.uv_select_edge = do_select
-                    dirty = True
-        if dirty:
-            if use_sync:
-                bm.select_flush_mode()
-            bmesh.update_edit_mesh(obj.data)
+                    dirty_set.add(oi)
+        if dirty_set:
+            for oi in dirty_set:
+                bm = bm_list[oi]
+                obj = obj_list[oi]
+                if use_sync:
+                    bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data)
             if state._uv_active_transform_mode is not None:
                 state._uv_transform_targets = _collect_uv_transform_targets(context)
                 _median = _compute_uv_selection_median(context)
@@ -1773,9 +1812,6 @@ class IMAGE_OT_modo_uv_lasso_select(bpy.types.Operator):
         region  = context.region
         sima    = context.space_data
         polygon = self.lasso_points
-        obj     = context.edit_object
-        if obj is None or obj.type != 'MESH':
-            return {'CANCELLED'}
         ts       = context.tool_settings
         use_sync = ts.use_uv_select_sync
         if use_sync:
@@ -1783,116 +1819,122 @@ class IMAGE_OT_modo_uv_lasso_select(bpy.types.Operator):
             uv_mode = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
         else:
             uv_mode = ts.uv_select_mode
+        edit_objects = _get_edit_objects(context)
+        if not edit_objects:
+            return {'CANCELLED'}
         if self.mode == 'set':
-            _uv_clear_all_loop_flags(obj, use_sync=use_sync)
-        do_select = (self.mode != 'remove')
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.faces.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        uv_layer    = bm.loops.layers.uv.active
-        dirty       = False
-        island_done = set()
-        for face in bm.faces:
-            if face.hide or uv_layer is None:
-                continue
-            if uv_mode == 'VERTEX':
-                for loop in face.loops:
-                    uv = loop[uv_layer].uv
-                    sc = _uv_view_to_region(region, sima, uv.x, uv.y)
-                    if sc is None or not point_in_polygon(sc, polygon):
-                        continue
-                    if use_sync:
-                        loop.vert.select = do_select
-                        try:
-                            loop.uv_select_vert = do_select
-                        except AttributeError:
-                            pass
-                    else:
-                        loop.uv_select_vert = do_select
-                    dirty = True
-            elif uv_mode == 'EDGE':
-                for loop in face.loops:
-                    uv_a = loop[uv_layer].uv
-                    uv_b = loop.link_loop_next[uv_layer].uv
-                    sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
-                    sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
-                    if sc_a is None or sc_b is None:
-                        continue
-                    if not (point_in_polygon(sc_a, polygon) and point_in_polygon(sc_b, polygon)):
-                        continue
-                    if use_sync:
-                        loop.edge.select = do_select
-                        try:
-                            loop.uv_select_edge = do_select
-                        except AttributeError:
-                            pass
-                        if do_select:
+            for _o in edit_objects:
+                _uv_clear_all_loop_flags(_o, use_sync=use_sync)
+        do_select  = (self.mode != 'remove')
+        dirty_set  = set()
+        for obj in edit_objects:
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            uv_layer    = bm.loops.layers.uv.active
+            island_done = set()
+            for face in bm.faces:
+                if face.hide or uv_layer is None:
+                    continue
+                if uv_mode == 'VERTEX':
+                    for loop in face.loops:
+                        uv = loop[uv_layer].uv
+                        sc = _uv_view_to_region(region, sima, uv.x, uv.y)
+                        if sc is None or not point_in_polygon(sc, polygon):
+                            continue
+                        if use_sync:
+                            loop.vert.select = do_select
                             try:
-                                loop.uv_select_vert = True
-                                loop.link_loop_next.uv_select_vert = True
+                                loop.uv_select_vert = do_select
                             except AttributeError:
                                 pass
-                    else:
-                        loop.uv_select_edge = do_select
-                        if do_select:
-                            loop.uv_select_vert = True
-                            loop.link_loop_next.uv_select_vert = True
-                    dirty = True
-            elif uv_mode == 'FACE':
-                corner_scs = [_uv_view_to_region(region, sima,
-                                                  lp[uv_layer].uv.x,
-                                                  lp[uv_layer].uv.y)
-                              for lp in face.loops]
-                if any(sc is None or not point_in_polygon(sc, polygon)
-                       for sc in corner_scs):
-                    continue
-                if use_sync:
-                    face.select = do_select
-                    for lp in face.loops:
-                        try:
-                            lp.uv_select_vert = do_select
-                            lp.uv_select_edge = do_select
-                        except AttributeError:
-                            pass
-                else:
-                    for lp in face.loops:
-                        lp.uv_select_vert = do_select
-                        lp.uv_select_edge = do_select
-                dirty = True
-            else:  # ISLAND
-                if face.index in island_done:
-                    continue
-                corner_scs = [_uv_view_to_region(region, sima,
-                                                  lp[uv_layer].uv.x,
-                                                  lp[uv_layer].uv.y)
-                              for lp in face.loops]
-                if any(sc is None or not point_in_polygon(sc, polygon)
-                       for sc in corner_scs):
-                    continue
-                island = _uv_island_flood_fill(bm, face, uv_layer)
-                island_done |= island
-                bm.faces.ensure_lookup_table()
-                for ifi in island:
-                    if ifi < len(bm.faces):
+                        else:
+                            loop.uv_select_vert = do_select
+                        dirty_set.add(id(obj))
+                elif uv_mode == 'EDGE':
+                    for loop in face.loops:
+                        uv_a = loop[uv_layer].uv
+                        uv_b = loop.link_loop_next[uv_layer].uv
+                        sc_a = _uv_view_to_region(region, sima, uv_a.x, uv_a.y)
+                        sc_b = _uv_view_to_region(region, sima, uv_b.x, uv_b.y)
+                        if sc_a is None or sc_b is None:
+                            continue
+                        if not (point_in_polygon(sc_a, polygon) and point_in_polygon(sc_b, polygon)):
+                            continue
                         if use_sync:
-                            bm.faces[ifi].select = do_select
-                            for lp in bm.faces[ifi].loops:
+                            loop.edge.select = do_select
+                            try:
+                                loop.uv_select_edge = do_select
+                            except AttributeError:
+                                pass
+                            if do_select:
                                 try:
-                                    lp.uv_select_vert = do_select
-                                    lp.uv_select_edge = do_select
+                                    loop.uv_select_vert = True
+                                    loop.link_loop_next.uv_select_vert = True
                                 except AttributeError:
                                     pass
                         else:
-                            iface = bm.faces[ifi]
-                            for lp in iface.loops:
+                            loop.uv_select_edge = do_select
+                            if do_select:
+                                loop.uv_select_vert = True
+                                loop.link_loop_next.uv_select_vert = True
+                        dirty_set.add(id(obj))
+                elif uv_mode == 'FACE':
+                    corner_scs = [_uv_view_to_region(region, sima,
+                                                      lp[uv_layer].uv.x,
+                                                      lp[uv_layer].uv.y)
+                                  for lp in face.loops]
+                    if any(sc is None or not point_in_polygon(sc, polygon)
+                           for sc in corner_scs):
+                        continue
+                    if use_sync:
+                        face.select = do_select
+                        for lp in face.loops:
+                            try:
                                 lp.uv_select_vert = do_select
                                 lp.uv_select_edge = do_select
-                dirty = True
-        if dirty:
-            if use_sync:
-                bm.select_flush_mode()
-            bmesh.update_edit_mesh(obj.data)
+                            except AttributeError:
+                                pass
+                    else:
+                        for lp in face.loops:
+                            lp.uv_select_vert = do_select
+                            lp.uv_select_edge = do_select
+                    dirty_set.add(id(obj))
+                else:  # ISLAND
+                    if face.index in island_done:
+                        continue
+                    corner_scs = [_uv_view_to_region(region, sima,
+                                                      lp[uv_layer].uv.x,
+                                                      lp[uv_layer].uv.y)
+                                  for lp in face.loops]
+                    if any(sc is None or not point_in_polygon(sc, polygon)
+                           for sc in corner_scs):
+                        continue
+                    island = _uv_island_flood_fill(bm, face, uv_layer)
+                    island_done |= island
+                    bm.faces.ensure_lookup_table()
+                    for ifi in island:
+                        if ifi < len(bm.faces):
+                            if use_sync:
+                                bm.faces[ifi].select = do_select
+                                for lp in bm.faces[ifi].loops:
+                                    try:
+                                        lp.uv_select_vert = do_select
+                                        lp.uv_select_edge = do_select
+                                    except AttributeError:
+                                        pass
+                            else:
+                                iface = bm.faces[ifi]
+                                for lp in iface.loops:
+                                    lp.uv_select_vert = do_select
+                                    lp.uv_select_edge = do_select
+                    dirty_set.add(id(obj))
+            if id(obj) in dirty_set:
+                if use_sync:
+                    bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data)
+        if dirty_set:
             if state._uv_active_transform_mode is not None:
                 state._uv_transform_targets = _collect_uv_transform_targets(context)
                 _median = _compute_uv_selection_median(context)
