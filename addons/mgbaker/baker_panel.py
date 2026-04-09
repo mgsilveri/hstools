@@ -9,7 +9,22 @@ from __future__ import annotations
 
 import bpy
 
-from .baker_props import _group_status
+from .baker_props import _group_status, get_active_project
+
+
+def _fit(text, context, prefix="", reserved_px=36):
+    """Truncate *text* so that *prefix* + *text* fits the N-panel header.
+
+    *reserved_px* covers the fold arrow and surrounding chrome (~36 px).
+    Blender's default UI font is roughly 7 px per character at scale 1.
+    """
+    scale = getattr(getattr(context, 'preferences', None) and context.preferences.system, 'ui_scale', 1.0)
+    region_px = context.region.width if (context.region and context.region.width) else 200
+    total_avail = max(4, int((region_px - reserved_px) / (7 * scale)))
+    text_avail = max(4, total_avail - len(prefix))
+    if len(text) <= text_avail:
+        return text
+    return text[:max(1, text_avail - 1)] + "\u2026"
 
 
 def _get_lp_materials(group):
@@ -77,26 +92,84 @@ class MG_PT_Baker(bpy.types.Panel):
 # ── Export Groups ─────────────────────────────────────────────────────────
 
 class MG_PT_ExportGroups(bpy.types.Panel):
-    bl_label = "Export Groups"
+    bl_label = ""
     bl_idname = "MG_PT_ExportGroups"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "mgBaker"
     bl_parent_id = "MG_PT_Baker"
 
+    def draw_header(self, context):
+        import os
+        proj = get_active_project(context.scene)
+        multi = len(context.scene.mg_projects) > 1
+        if proj is not None:
+            if multi:
+                raw = proj.name
+            else:
+                raw = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else proj.name
+            label = _fit(raw, context, prefix="Baker Setup — ")
+            self.layout.label(text=f"Baker Setup — {label}")
+        else:
+            self.layout.label(text="Baker Setup")
+
     def draw(self, context):
         layout = self.layout
         scn = context.scene
+        projects = scn.mg_projects
+        multi = len(projects) > 1
 
+        proj = get_active_project(scn)
+
+        if proj is None:
+            row = layout.row(align=True)
+            row.label(text="No project yet", icon='INFO')
+            row.operator("mg.add_project", icon='ADD', text="Add Project")
+            return
+
+        # ── Projects list (only shown when more than one exists) ──────────
+        if multi:
+            _pname = _fit(proj.name, context, prefix="Projects  —  ")
+            row = layout.row(align=True)
+            row.scale_y = 0.75
+            row.label(text=f"Projects  \u2014  {_pname}", icon='FILE_3D')
+
+            row = layout.row()
+            row.template_list(
+                "MG_UL_Projects", "",
+                scn, "mg_projects",
+                scn, "mg_active_project_index",
+                rows=2,
+            )
+            col = row.column(align=True)
+            col.operator("mg.add_project", icon='ADD', text="")
+            col.operator("mg.remove_project", icon='REMOVE', text="")
+            col.separator()
+            op_up = col.operator("mg.move_project", icon='TRIA_UP', text="")
+            op_up.direction = 'UP'
+            op_down = col.operator("mg.move_project", icon='TRIA_DOWN', text="")
+            op_down.direction = 'DOWN'
+
+        # ── Groups bridge label ───────────────────────────────────────────
+        # A tight label row that names which project's groups are shown below.
+        if multi:
+            _gname = _fit(proj.name, context, prefix="Groups  —  ")
+            row = layout.row(align=True)
+            row.scale_y = 0.75
+            row.label(text=f"Groups  \u2014  {_gname}", icon='OBJECT_DATAMODE')
+
+        # ── Groups list ───────────────────────────────────────────────────
         row = layout.row()
         row.template_list(
             "MG_UL_ExportGroups", "",
-            scn, "mg_export_groups",
-            scn, "mg_active_group_index",
+            proj, "groups",
+            proj, "active_group_index",
             rows=3,
         )
-
         col = row.column(align=True)
+        if not multi:
+            col.operator("mg.add_project", text="", icon='FILE_NEW')
+            col.separator()
         col.operator("mg.add_export_group", icon='ADD', text="")
         col.operator("mg.remove_export_group", icon='REMOVE', text="")
         col.separator()
@@ -128,21 +201,24 @@ class MG_PT_GroupSettings(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        scn = context.scene
+        proj = get_active_project(context.scene)
         return (
-            len(scn.mg_export_groups) > 0
-            and 0 <= scn.mg_active_group_index < len(scn.mg_export_groups)
+            proj is not None
+            and len(proj.groups) > 0
+            and 0 <= proj.active_group_index < len(proj.groups)
         )
 
     def draw_header(self, context):
-        grp = context.scene.mg_export_groups[context.scene.mg_active_group_index]
-        self.layout.label(text=f"Group Settings - {grp.name}")
+        proj = get_active_project(context.scene)
+        grp = proj.groups[proj.active_group_index]
+        name = _fit(grp.name, context, prefix="Group Settings — ")
+        self.layout.label(text=f"Group Settings — {name}")
 
     def draw(self, context):
         layout = self.layout
         scn = context.scene
-        idx = scn.mg_active_group_index
-        grp = scn.mg_export_groups[idx]
+        proj = get_active_project(scn)
+        grp = proj.groups[proj.active_group_index]
 
         # ── Collections ──
         layout.label(text="Collections", icon='OUTLINER_COLLECTION')
@@ -211,10 +287,9 @@ class MG_PT_GroupSettings(bpy.types.Panel):
         flow.prop(grp, "bake_ao", text="AO")
         flow.prop(grp, "bake_curvature", text="Curvature")
         flow.prop(grp, "bake_world_normal", text="World Normal")
-        flow.prop(grp, "bake_id", text="ID / Albedo")
+        flow.prop(grp, "bake_id", text="Object ID")
         flow.prop(grp, "bake_thickness", text="Thickness")
         flow.prop(grp, "bake_position", text="Position")
-        flow.prop(grp, "bake_uv_islands", text="UV Islands")
         flow.prop(grp, "bake_opacity", text="Opacity")
         flow.prop(grp, "bake_height", text="Height")
 
@@ -227,6 +302,7 @@ class MG_PT_GroupSettings(bpy.types.Panel):
         flow.prop(grp, "triangulate")
         flow.prop(grp, "smooth_by_uv")
         flow.prop(grp, "export_at_origin")
+        flow.prop(grp, "instance_uv_offset")
 
 
 # ── Export ────────────────────────────────────────────────────────────────
@@ -240,8 +316,9 @@ class MG_PT_Export(bpy.types.Panel):
     bl_parent_id = "MG_PT_Baker"
 
     def draw_header(self, context):
-        n = sum(1 for g in context.scene.mg_export_groups if g.include)
-        self.layout.label(text=f"Export - {n} group{'s' if n != 1 else ''}")
+        proj = get_active_project(context.scene)
+        n = sum(1 for g in proj.groups if g.include) if proj is not None else 0
+        self.layout.label(text=f"Export — {n} group{'s' if n != 1 else ''}")
 
     def draw(self, context):
         from . import get_icon

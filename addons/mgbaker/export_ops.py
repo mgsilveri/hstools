@@ -18,7 +18,7 @@ import time
 import bpy
 from bpy.props import EnumProperty
 
-from .baker_props import get_output_name
+from .baker_props import get_output_name, get_active_project, get_project_output_name
 from . import p4
 
 
@@ -37,10 +37,10 @@ _MAP_DEFS = [
     ("bake_ao",           "Ambient Occlusion",  "_ambient_occlusion"),
     ("bake_curvature",    "Curvature",           "_curvature"),
     ("bake_world_normal", "Normals (Object)",    "_world_space_normals"),
-    ("bake_id",           "Object ID",           "_id"),
+    ("bake_id",           "Object ID",          "_id"),
     ("bake_thickness",    "Thickness",           "_thickness"),
     ("bake_position",     "Position",            "_position"),
-    ("bake_uv_islands",   "UV Island",           "_uv_islands"),
+
     ("bake_opacity",      "Transparency",        "_opacity"),
     ("bake_height",       "Height",              "_height"),
 ]
@@ -98,8 +98,20 @@ def _ensure_painter_plugin() -> str:
         return f"⚠ Painter plugin install failed: {exc}"
 
 
+def _check_groups_complete(groups):
+    """Return a list of error strings for groups missing HP or LP collections."""
+    errors = []
+    for g in groups:
+        if g.hp_collection is None and g.lp_collection is None:
+            errors.append(f"'{g.name}': missing HP and LP")
+        elif g.hp_collection is None:
+            errors.append(f"'{g.name}': missing HP")
+        elif g.lp_collection is None:
+            errors.append(f"'{g.name}': missing LP")
+    return errors
+
+
 def _bakes_dir() -> str:
-    """Return the absolute bakes directory, creating it if needed."""
     prefs = _prefs()
     sub = prefs.bakes_subfolder if prefs else "bakes"
     blend_dir = os.path.dirname(bpy.data.filepath)
@@ -196,7 +208,127 @@ def _apply_smooth_by_uv(obj):
     mesh.update()
 
 
-def _prepare_collection(source_col, group):
+def _apply_uv_u_offset(obj, offset_u: float):
+    """Shift all UV loops on *obj* by *offset_u* in the U direction."""
+    for uv_layer in obj.data.uv_layers:
+        for loop_data in uv_layer.data:
+            loop_data.uv.x += offset_u
+
+
+def _offset_overlapping_uv_islands(objects):
+    """Assign unique U-offset tiles to identical UV islands across a list of objects.
+
+    Replaces both the per-object intra-array dedup and the cross-object linked-
+    duplicate shift.  A single coordinated pass avoids the tile collision that
+    occurs when both mechanisms independently choose U+1.
+
+    Algorithm:
+      1. Union-find within each object to identify UV islands.
+      2. Compute centroid (rounded to 2 dp) for each island as its signature.
+      3. Group all islands from all objects by centroid.
+      4. First occurrence of each centroid stays at U+0; duplicates get U+1, U+2, …
+
+    Handles:
+      - Geo-nodes / classic Array objects (intra-object stacking)
+      - Linked duplicates (cross-object stacking)
+      - Any combination of both
+    """
+    import bmesh as bmesh_mod
+
+    # ── Phase 1: collect islands from every object ────────────────────────
+    # bm_islands: list of (obj, bm, uv_layer, [face_indices])
+    bm_islands = []
+    centroid_entries = []  # parallel list: centroid key for bm_islands[i]
+
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        bm = bmesh_mod.new()
+        bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            bm.free()
+            continue
+
+        n_faces = len(bm.faces)
+        parent = list(range(n_faces))
+
+        # Union-find with default-arg capture so each loop iteration is isolated
+        def _find(x, p=parent):
+            while p[x] != x:
+                p[x] = p[p[x]]
+                x = p[x]
+            return x
+
+        for f in bm.faces:
+            for loop in f.loops:
+                for link in loop.edge.link_loops:
+                    if link == loop:
+                        continue
+                    if link.vert == loop.vert:
+                        same = (
+                            (loop[uv_layer].uv - link[uv_layer].uv).length < 1e-6
+                            and (loop.link_loop_next[uv_layer].uv
+                                 - link.link_loop_next[uv_layer].uv).length < 1e-6
+                        )
+                    else:
+                        same = (
+                            (loop[uv_layer].uv - link.link_loop_next[uv_layer].uv).length < 1e-6
+                            and (loop.link_loop_next[uv_layer].uv
+                                 - link[uv_layer].uv).length < 1e-6
+                        )
+                    if same:
+                        ra, rb = _find(f.index), _find(link.face.index)
+                        if ra != rb:
+                            parent[ra] = rb
+
+        island_map: dict = {}
+        for f in bm.faces:
+            island_map.setdefault(_find(f.index), []).append(f.index)
+
+        for face_idxs in island_map.values():
+            sx = sy = n = 0.0
+            for fi in face_idxs:
+                for lp in bm.faces[fi].loops:
+                    sx += lp[uv_layer].uv.x
+                    sy += lp[uv_layer].uv.y
+                    n += 1.0
+            key = (round(sx / n, 2), round(sy / n, 2)) if n else (0.0, 0.0)
+            centroid_entries.append(key)
+            bm_islands.append((obj, bm, uv_layer, face_idxs))
+
+    # ── Phase 2: group by centroid, assign unique tiles ───────────────────
+    groups: dict = {}
+    for i, key in enumerate(centroid_entries):
+        groups.setdefault(key, []).append(i)
+
+    shift_total = 0
+    for idxs in groups.values():
+        for tile, island_idx in enumerate(idxs):
+            if tile == 0:
+                continue
+            _, bm, uv_layer, face_idxs = bm_islands[island_idx]
+            for fi in face_idxs:
+                for lp in bm.faces[fi].loops:
+                    lp[uv_layer].uv.x += 1.0
+            shift_total += 1
+
+    # ── Phase 3: write back (once per bmesh, not per island) ─────────────
+    written: set = set()
+    for obj, bm, _uv, _ in bm_islands:
+        bid = id(bm)
+        if bid not in written:
+            written.add(bid)
+            bm.to_mesh(obj.data)
+            bm.free()
+            obj.data.update()
+
+    print(f"[mgBaker] UV island offset: {len(bm_islands)} islands across "
+          f"{len(written)} objects — {shift_total} shifted")
+
+
+def _prepare_collection(source_col, group, offset_instance_uvs=False):
     """Duplicate all meshes from *source_col* into a temp collection.
 
     Applies modifiers, smooth-by-uv, triangulate, and export-at-origin
@@ -227,6 +359,11 @@ def _prepare_collection(source_col, group):
             dup.location = (0, 0, 0)
             dup.rotation_euler = (0, 0, 0)
             dup.scale = (1, 1, 1)
+
+    # Single global pass: handles both intra-object (geo-nodes array) and
+    # cross-object (linked duplicate) stacking in one coordinated assignment.
+    if offset_instance_uvs:
+        _offset_overlapping_uv_islands(list(temp_col.objects))
 
     return temp_col
 
@@ -272,15 +409,14 @@ def _export_fbx(filepath, collection):
     )
 
 
-def _export_combined_lp_fbx(groups, bakes_dir):
+def _export_combined_lp_fbx(groups, bakes_dir, out_name):
     """Export LP objects from all groups into a single combined FBX.
 
     Each group's LP objects keep their materials, so Painter sees one
     texture set per material.  Returns the output filepath on success,
     None on failure.
     """
-    blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-    filepath = os.path.join(bakes_dir, f"{blend_name}_lp.fbx")
+    filepath = os.path.join(bakes_dir, f"{out_name}_lp.fbx")
 
     temp_cols = []
     try:
@@ -290,7 +426,10 @@ def _export_combined_lp_fbx(groups, bakes_dir):
         for group in groups:
             if group.lp_collection is None:
                 continue
-            temp_col = _prepare_collection(group.lp_collection, group)
+            temp_col = _prepare_collection(
+                group.lp_collection, group,
+                offset_instance_uvs=group.instance_uv_offset,
+            )
             temp_cols.append(temp_col)
             for obj in list(temp_col.objects):
                 combined_col.objects.link(obj)
@@ -372,10 +511,17 @@ def _export_per_group_fbx(groups, bakes_dir):
                 _cleanup_temp_collection(hp_temp)
 
             if group.lp_collection:
-                lp_temp = _prepare_collection(group.lp_collection, group)
+                lp_temp = _prepare_collection(
+                    group.lp_collection, group,
+                    offset_instance_uvs=group.instance_uv_offset,
+                )
                 lp_objs = [o for o in lp_temp.objects if o.type == 'MESH']
-                if lp_objs:
-                    _join_to_single(lp_objs, f"{group.name}_low", temp_col)
+                for i, obj in enumerate(lp_objs):
+                    obj.name = f"{group.name}_low_{i}"
+                    obj.data.name = obj.name
+                    for col in list(obj.users_collection):
+                        col.objects.unlink(obj)
+                    temp_col.objects.link(obj)
                 _cleanup_temp_collection(lp_temp)
 
             _export_fbx(fbx_path, temp_col)
@@ -391,39 +537,9 @@ def _export_per_group_fbx(groups, bakes_dir):
     return results
 
 
-def _join_to_single(objects, name, dest_col):
-    """Join *objects* into a single mesh named *name* inside *dest_col*.
-
-    Objects are expected to already live in a temp collection (they'll be
-    unlinked from their source).  The joined result is linked into
-    *dest_col*.
-    """
-    if not objects:
-        return None
-
-    # Move all into dest_col so join has a common collection context
-    for obj in objects:
-        for col in list(obj.users_collection):
-            col.objects.unlink(obj)
-        dest_col.objects.link(obj)
-
-    bpy.ops.object.select_all(action='DESELECT')
-    for obj in objects:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = objects[0]
-
-    if len(objects) > 1:
-        bpy.ops.object.join()
-
-    joined = bpy.context.view_layer.objects.active
-    joined.name = name
-    joined.data.name = name
-    return joined
-
-
 # ── Toolbag script generation ─────────────────────────────────────────────
 
-def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
+def _generate_toolbag_script(group_fbx_pairs, bakes_dir, out_name):
     """Generate a Toolbag 5 Python script.
 
     Creates one ``BakerObject`` per group in Multiple texture-set mode
@@ -433,8 +549,7 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
 
     Returns ``(script_path, tbscene_path)``.
     """
-    tbscene_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-    tbscene_path = os.path.join(bakes_dir, f"{tbscene_name}.tbscene").replace("\\", "/")
+    tbscene_path = os.path.join(bakes_dir, f"{out_name}.tbscene").replace("\\", "/")
 
     lines = [
         "import mset",
@@ -463,7 +578,7 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
             f"{var}.outputPath = r'{output_path}'",
             f"{var}.outputWidth = {group.res_x}",
             f"{var}.outputHeight = {group.res_y}",
-            f"{var}.outputSamples = 4",
+            f"{var}.outputSamples = 32",
             f"{var}.outputBits = 8",
             f"{var}.edgePadding = 'Extreme'",
             f"{var}.tileMode = 1  # Multiple — one output file per texture set",
@@ -477,6 +592,10 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir):
                 f"    _m = {var}.getMap('{map_name}')",
                 f"    _m.enabled = True",
                 f"    _m.suffix = '{tb_suffix}'",
+            ]
+            if map_name == "Ambient Occlusion":
+                lines.append(f"    _m.rayCount = 4096")
+            lines += [
                 f"except Exception as _e:",
                 f"    print('[mgBaker] {group.name} map {map_name}:', _e)",
             ]
@@ -540,9 +659,18 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
             self.report({'ERROR'}, "Save the .blend file before exporting.")
             return {'CANCELLED'}
 
-        groups = [g for g in context.scene.mg_export_groups if g.include]
+        proj = get_active_project(context.scene)
+        if proj is None:
+            self.report({'ERROR'}, "No active project.")
+            return {'CANCELLED'}
+        groups = [g for g in proj.groups if g.include]
         if not groups:
             self.report({'ERROR'}, "No groups are checked for export.")
+            return {'CANCELLED'}
+
+        incomplete = _check_groups_complete(groups)
+        if incomplete:
+            self.report({'ERROR'}, "Incomplete groups: " + "; ".join(incomplete))
             return {'CANCELLED'}
 
         prefs = _prefs()
@@ -551,6 +679,7 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
             return {'CANCELLED'}
 
         bakes = _bakes_dir()
+        out_name = get_project_output_name(proj, context.scene)
         log_lines = []
 
         toolbag_exe = prefs.toolbag_exe
@@ -567,7 +696,7 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
         for _, fbx_path in group_fbx_pairs:
             log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
 
-        script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes)
+        script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes, out_name)
 
         if prefs.launch_app_after_export:
             exe_stem = os.path.splitext(os.path.basename(toolbag_exe))[0]  # "toolbag"
@@ -602,8 +731,6 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                     return None
                 bpy.app.timers.register(_delayed_script_cleanup, first_interval=30.0)
 
-        for line in log_lines:
-            print(f"[mgBaker] {line}")
         _store_log(context, log_lines)
 
         if any(line.startswith("⚠") for line in log_lines):
@@ -648,9 +775,18 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
             self.report({'ERROR'}, "Save the .blend file before exporting.")
             return {'CANCELLED'}
 
-        groups = [g for g in context.scene.mg_export_groups if g.include]
+        proj = get_active_project(context.scene)
+        if proj is None:
+            self.report({'ERROR'}, "No active project.")
+            return {'CANCELLED'}
+        groups = [g for g in proj.groups if g.include]
         if not groups:
             self.report({'ERROR'}, "No groups are checked for export.")
+            return {'CANCELLED'}
+
+        incomplete = _check_groups_complete(groups)
+        if incomplete:
+            self.report({'ERROR'}, "Incomplete groups: " + "; ".join(incomplete))
             return {'CANCELLED'}
 
         prefs = _prefs()
@@ -660,7 +796,7 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
 
         bakes = _bakes_dir()
         blend_dir = os.path.dirname(bpy.data.filepath)
-        blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+        out_name = get_project_output_name(proj, context.scene)
         log_lines = []
 
         plugin_log = _ensure_painter_plugin()
@@ -668,7 +804,7 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
             log_lines.append(plugin_log)
 
         # Export combined LP FBX (all groups into one file so Painter sees all texture sets)
-        lp_fbx = _export_combined_lp_fbx(groups, bakes)
+        lp_fbx = _export_combined_lp_fbx(groups, bakes, out_name)
         if lp_fbx:
             log_lines.append(f"✓ {os.path.basename(lp_fbx)} exported")
         else:
@@ -686,7 +822,7 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
         # Copy .spp template if output doesn't exist
         textures_dir = os.path.join(blend_dir, "textures")
         os.makedirs(textures_dir, exist_ok=True)
-        spp_out_path = os.path.join(textures_dir, f"{blend_name}.spp")
+        spp_out_path = os.path.join(textures_dir, f"{out_name}.spp")
 
         if not os.path.isfile(spp_out_path):
             template_path = prefs.spp_template
@@ -755,8 +891,6 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
                 subprocess.Popen(cmd)
                 log_lines.append("✓ Painter launched")
 
-        for line in log_lines:
-            print(f"[mgBaker] {line}")
         _store_log(context, log_lines)
 
         self.report({'INFO'}, f"Exported {len(groups)} group(s) to Painter")
@@ -766,25 +900,34 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
 # ── Delete source files helpers ───────────────────────────────────────────
 
 def _collect_toolbag_files(context) -> list:
-    """Return existing Toolbag source files (per-group FBX + .tbscene)."""
+    """Return existing Toolbag source files for the active project (FBX + .tbscene)."""
     if not bpy.data.filepath:
         return []
+    proj = get_active_project(context.scene)
+    if proj is None:
+        return []
     bakes = _bakes_dir()
-    blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-    candidates = [os.path.join(bakes, f"{g.name}.fbx")
-                  for g in context.scene.mg_export_groups]
-    candidates.append(os.path.join(bakes, f"{blend_name}.tbscene"))
+    out_name = get_project_output_name(proj, context.scene)
+    candidates = [os.path.join(bakes, f"{g.name}.fbx") for g in proj.groups]
+    candidates.append(os.path.join(bakes, f"{out_name}.tbscene"))
     return [p for p in candidates if os.path.isfile(p)]
 
 
 def _collect_painter_files(context) -> list:
-    """Return existing Painter source files (combined LP FBX + per-group HP FBX)."""
+    """Return existing Painter source files for the active project (LP FBX + HP FBX + .spp)."""
     if not bpy.data.filepath:
         return []
+    proj = get_active_project(context.scene)
+    if proj is None:
+        return []
     bakes = _bakes_dir()
-    blend_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
-    candidates = [os.path.join(bakes, f"{blend_name}_lp.fbx")]
-    for g in context.scene.mg_export_groups:
+    out_name = get_project_output_name(proj, context.scene)
+    blend_dir = os.path.dirname(bpy.data.filepath)
+    candidates = [
+        os.path.join(bakes, f"{out_name}_lp.fbx"),
+        os.path.join(blend_dir, "textures", f"{out_name}.spp"),
+    ]
+    for g in proj.groups:
         candidates.append(os.path.join(bakes, f"{get_output_name(g)}_hp.fbx"))
     return [p for p in candidates if os.path.isfile(p)]
 
@@ -886,9 +1029,18 @@ class MG_OT_ExportFBXOnly(bpy.types.Operator):
             self.report({'ERROR'}, "Save the .blend file before exporting.")
             return {'CANCELLED'}
 
-        groups = [g for g in context.scene.mg_export_groups if g.include]
+        proj = get_active_project(context.scene)
+        if proj is None:
+            self.report({'ERROR'}, "No active project.")
+            return {'CANCELLED'}
+        groups = [g for g in proj.groups if g.include]
         if not groups:
             self.report({'ERROR'}, "No groups are checked for export.")
+            return {'CANCELLED'}
+
+        incomplete = _check_groups_complete(groups)
+        if incomplete:
+            self.report({'ERROR'}, "Incomplete groups: " + "; ".join(incomplete))
             return {'CANCELLED'}
 
         count = 0

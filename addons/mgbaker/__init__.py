@@ -44,13 +44,20 @@ _ALL_CLASSES = (
     # PropertyGroup
     baker_props.MG_LogLine,
     baker_props.MG_ExportGroup,
+    baker_props.MG_Project,
     # UIList
+    baker_ops.MG_UL_Projects,
     baker_ops.MG_UL_ExportGroups,
     baker_ops.MG_UL_LogList,
     # Group CRUD operators
     baker_ops.MG_OT_AddGroup,
     baker_ops.MG_OT_RemoveGroup,
     baker_ops.MG_OT_MoveGroup,
+    # Project CRUD operators
+    baker_ops.MG_OT_AddProject,
+    baker_ops.MG_OT_RemoveProject,
+    baker_ops.MG_OT_MoveProject,
+    baker_ops.MG_OT_NavigateProject,
     # Outliner assign operators
     baker_ops.MG_OT_AssignCollectionHP,
     baker_ops.MG_OT_AssignCollectionLP,

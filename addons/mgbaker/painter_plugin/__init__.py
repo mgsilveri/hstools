@@ -10,7 +10,7 @@ Install via the mgBaker Blender addon: Preferences -> Install Painter Plugin.
 
 from __future__ import annotations
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 import json
 import math
@@ -321,8 +321,24 @@ def start_plugin():
 def close_plugin():
     global _watcher
     print(f"[{PLUGIN_NAME}] Plugin unloaded")
-    event.DISPATCHER.disconnect(event.ProjectOpened, _on_project_opened)
-    event.DISPATCHER.disconnect(event.ProjectEditionEntered, _on_edition_entered)
+    try:
+        event.DISPATCHER.disconnect(event.ProjectOpened, _on_project_opened)
+    except Exception:
+        pass
+    try:
+        event.DISPATCHER.disconnect(event.ProjectEditionEntered, _on_edition_entered)
+    except Exception:
+        pass
     if _watcher is not None:
+        try:
+            _watcher.directoryChanged.disconnect(_on_bakes_dir_changed)
+        except Exception:
+            pass
+        try:
+            dirs = _watcher.directories()
+            if dirs:
+                _watcher.removePaths(dirs)
+        except Exception:
+            pass
         _watcher.deleteLater()
         _watcher = None
