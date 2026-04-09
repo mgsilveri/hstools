@@ -26,6 +26,9 @@ _active_transform_mode = None
 # True while Modo Materials mode (key 4) is active.
 _material_mode_active: bool = False
 
+# True while Modo UV Materials mode (key 4 in UV editor) is active.
+_uv_material_mode_active: bool = False
+
 # Per-mesh independent selection memory (Modo: each mode keeps its own selection).
 # Structure: {mesh_data_name: {'VERT': {indices}, 'EDGE': {indices}, 'FACE': {indices}}}
 _selection_memory: dict = {}
@@ -160,6 +163,7 @@ _OUR_IDNAMES = {
     'image.modo_uv_selection_guard',
     'image.modo_uv_stitch',
     'image.modo_uv_component_mode',
+    'image.modo_uv_material_mode',
     'image.modo_uv_paint_selection',
     'image.modo_uv_click_select',
     'image.modo_uv_lasso_select',
@@ -190,6 +194,8 @@ _uv_tool_guardian_running = False
 
 # ── Header patch ─────────────────────────────────────────────────────────────
 _orig_editor_menus_draw_collapsible = None
+_orig_image_ht_header_draw = None
+_orig_view3d_ht_header_draw = None
 
 # ── Mesh modal safety gate ────────────────────────────────────────────────────
 # Set True by _uv_seam_redraw_depsgraph_handler when an operator that modifies

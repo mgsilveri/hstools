@@ -62,6 +62,9 @@ def _draw_uv_overlays_panel(self, context):
     layout.prop(prefs, "uv_overlay_opacity",           text="Opacity")
 
 
+
+
+
 # ============================================================================
 # All operator / panel / menu classes, in registration order
 # ============================================================================
@@ -97,6 +100,7 @@ _ALL_CLASSES = (
     uv_snap.IMAGE_OT_modo_uv_snap_highlight,
     ops_uv.IMAGE_OT_modo_uv_transform,
     ops_uv.IMAGE_OT_modo_uv_component_mode,
+    ops_uv.IMAGE_OT_modo_uv_material_mode,
     ops_uv.IMAGE_OT_modo_uv_drop_transform,
     ops_uv.IMAGE_OT_modo_uv_handle_reposition,
     ops_uv.IMAGE_OT_modo_uv_selection_guard,
@@ -213,6 +217,11 @@ def register():
     # UV Editor Overlays dropdown
     bpy.types.IMAGE_PT_overlay.append(_draw_uv_overlays_panel)
 
+    # UV editor header: replace island button with Material Mode button
+    if state._orig_image_ht_header_draw is None:
+        state._orig_image_ht_header_draw = bpy.types.IMAGE_HT_header.draw
+        bpy.types.IMAGE_HT_header.draw = ops_uv._patched_image_ht_header_draw
+
     # Falloff — View menu Show Falloff toggle
     bpy.types.VIEW3D_MT_view.append(panel_menu._draw_falloff_view_menu)
 
@@ -224,6 +233,11 @@ def register():
         bpy.types.VIEW3D_MT_editor_menus.draw_collapsible = classmethod(
             component_mode._patched_editor_menus_draw_collapsible
         )
+
+    # Patch VIEW3D_HT_header.draw to suppress V/E/F button depress in Material Mode
+    if state._orig_view3d_ht_header_draw is None:
+        state._orig_view3d_ht_header_draw = bpy.types.VIEW3D_HT_header.draw
+        bpy.types.VIEW3D_HT_header.draw = component_mode._patched_view3d_ht_header_draw
 
 
 
@@ -311,6 +325,11 @@ def unregister():
     bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
     bpy.types.VIEW3D_MT_view.remove(panel_menu._draw_falloff_view_menu)
 
+    # Restore original IMAGE_HT_header.draw
+    if state._orig_image_ht_header_draw is not None:
+        bpy.types.IMAGE_HT_header.draw = state._orig_image_ht_header_draw
+        state._orig_image_ht_header_draw = None
+
     # Stop falloff draw handlers if active
     transform_3d._stop_falloff_handles()
     transform_3d._stop_falloff_mesh_overlay()
@@ -333,6 +352,11 @@ def unregister():
             state._orig_editor_menus_draw_collapsible
         )
         state._orig_editor_menus_draw_collapsible = None
+
+    # Restore original VIEW3D_HT_header.draw
+    if state._orig_view3d_ht_header_draw is not None:
+        bpy.types.VIEW3D_HT_header.draw = state._orig_view3d_ht_header_draw
+        state._orig_view3d_ht_header_draw = None
 
     # Close UV debug log file if open
     import time as _time
