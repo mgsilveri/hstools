@@ -950,8 +950,13 @@ def _compute_uv_boundary_cache(context):
         prefs = get_addon_preferences(context)
         if not getattr(prefs, 'enable_uv_boundary_overlay', True):
             return
-        obj = getattr(context, 'edit_object', None)
-        if obj is None or obj.type != 'MESH':
+        edit_objects = getattr(context, 'objects_in_mode_unique_data', None)
+        if edit_objects:
+            edit_objects = [o for o in edit_objects if o and o.type == 'MESH']
+        else:
+            obj = getattr(context, 'edit_object', None)
+            edit_objects = [obj] if obj and obj.type == 'MESH' else []
+        if not edit_objects:
             return
         ts = context.tool_settings
         use_sync = ts.use_uv_select_sync
@@ -973,11 +978,19 @@ def _compute_uv_boundary_cache(context):
 
         if uv_mode == 'VERTEX':
             state._uv_boundary_cache['uv_mode'] = 'VERTEX'
-            state._uv_boundary_cache['points'] = _compute_uv_seam_partner_verts(obj)
-            state._uv_boundary_cache['sel_points'] = _compute_uv_selected_verts(obj)
+            all_points = []
+            all_sel_points = []
+            for obj in edit_objects:
+                all_points.extend(_compute_uv_seam_partner_verts(obj))
+                all_sel_points.extend(_compute_uv_selected_verts(obj))
+            state._uv_boundary_cache['points'] = all_points
+            state._uv_boundary_cache['sel_points'] = all_sel_points
         elif uv_mode == 'EDGE':
             state._uv_boundary_cache['uv_mode'] = 'EDGE'
-            state._uv_boundary_cache['segments'] = _compute_uv_seam_partner_segments(obj)
+            all_segments = []
+            for obj in edit_objects:
+                all_segments.extend(_compute_uv_seam_partner_segments(obj))
+            state._uv_boundary_cache['segments'] = all_segments
         else:
             state._uv_boundary_cache['uv_mode'] = uv_mode
     except Exception as _exc:
