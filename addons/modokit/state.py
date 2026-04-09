@@ -72,6 +72,13 @@ _scale_gizmo_draw_handle = None
 _scale_gizmo_screen_handles: dict = {}
 _scale_gizmo_hover: str = ''       # '' | 'X' | 'Y' | 'Z' | 'XY' | 'XZ' | 'YZ' | 'XYZ'
 
+# ── Linear Falloff ─────────────────────────────────────────────────────────────
+_falloff_draw_handle        = None   # handles + gradient line (POST_PIXEL)
+_falloff_mesh_draw_handle   = None   # per-vertex weight overlay (POST_VIEW)
+_falloff_hover_handle: str  = ''     # 'START' | 'END' | ''
+_falloff_define_active: bool = False  # True while drag-to-define modal is running# Cached per-frame screen-space positions for hit-testing (set by draw callback).
+# Keys: 'START' → (sx, sy), 'END' → (ex, ey) — region pixel coords.
+_falloff_screen_handles: dict = {}
 # ── UV transform ─────────────────────────────────────────────────────────────
 _uv_active_transform_mode = None   # 'TRANSLATE' | 'ROTATE' | 'RESIZE' | None
 _uv_gizmo_center = None            # (u, v) tuple | None
@@ -140,6 +147,9 @@ _OUR_IDNAMES = {
     'view3d.modo_screen_move',
     'view3d.modo_scale_gizmo_hover',
     'view3d.modo_scale_gizmo_drag',
+    'view3d.modo_linear_falloff',
+    'view3d.modo_falloff_handle_hover',
+    'view3d.modo_falloff_handle_drag',
     'view3d.modo_preselect_highlight',
     'image.modo_preselect_highlight',
     'image.modo_uv_snap_highlight',

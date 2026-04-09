@@ -4,6 +4,7 @@
 
 import bpy
 from .utils import _get_prefs
+from . import transform_3d
 
 
 class VIEW3D_PT_modo_selection(bpy.types.Panel):
@@ -41,6 +42,42 @@ class VIEW3D_PT_modo_selection(bpy.types.Panel):
         row.operator("mesh.modo_select_element_under_mouse", text="Remove").mode = 'remove'
         row.operator("mesh.modo_select_element_under_mouse", text="Toggle").mode = 'toggle'
 
+        # ── Falloff ───────────────────────────────────────────────────────────
+        layout.separator()
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        if fp is None:
+            return
+
+        box = layout.box()
+        row = box.row()
+        icon = 'CHECKBOX_HLT' if fp.enabled else 'CHECKBOX_DEHLT'
+        row.operator('view3d.modo_linear_falloff',
+                     text="Linear Falloff",
+                     icon=icon,
+                     depress=fp.enabled)
+
+        if fp.enabled:
+            # Auto-size axis buttons + Reverse
+            row2 = box.row(align=True)
+            row2.label(text="Auto Size:")
+            for ax in ('X', 'Y', 'Z'):
+                op = row2.operator('view3d.modo_falloff_auto_size', text=ax)
+                op.axis = ax
+            row2.operator('view3d.modo_falloff_reverse', text="", icon='ARROW_LEFTRIGHT')
+
+            col = box.column(align=True)
+            col.prop(fp, 'symmetric')
+            col.prop(fp, 'shape_preset', text="Shape")
+            if fp.shape_preset == 'CUSTOM':
+                sub = col.row(align=True)
+                sub.prop(fp, 'curve_in',  text="In")
+                sub.prop(fp, 'curve_out', text="Out")
+            col.separator()
+            col.prop(fp, 'mix_mode')
+            col.prop(fp, 'use_world')
+            col.separator()
+            col.prop(fp, 'show', text="Show Falloff")
+
 
 class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
     """Context menu for Modo-style selection.
@@ -58,3 +95,17 @@ class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
         layout.separator()
         layout.operator("mesh.select_more", text="Grow Selection")
         layout.operator("mesh.select_less", text="Shrink Selection")
+
+
+# ── View menu injection ───────────────────────────────────────────────────────
+
+def _draw_falloff_view_menu(self, context):
+    """Appended to VIEW3D_MT_view — adds the Show Falloff toggle."""
+    fp = getattr(context.scene, 'modokit_falloff', None)
+    if fp is None:
+        return
+    layout = self.layout
+    layout.separator()
+    sub = layout.column()
+    sub.enabled = fp.enabled
+    sub.prop(fp, 'show', text="Show Falloff")

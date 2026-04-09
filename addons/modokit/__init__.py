@@ -67,6 +67,7 @@ def _draw_uv_overlays_panel(self, context):
 # ============================================================================
 
 _ALL_CLASSES = (
+    transform_3d.ModoKitFalloffProps,
     prefs.ModoSelectionPreferences,
     prefs.MODOKIT_OT_perf_report,
     preselect.VIEW3D_OT_modo_preselect_highlight,
@@ -88,6 +89,11 @@ _ALL_CLASSES = (
     transform_3d.VIEW3D_OT_modo_screen_move,
     transform_3d.VIEW3D_OT_modo_scale_gizmo_hover,
     transform_3d.VIEW3D_OT_modo_scale_gizmo_drag,
+    transform_3d.VIEW3D_OT_modo_linear_falloff,
+    transform_3d.VIEW3D_OT_modo_falloff_auto_size,
+    transform_3d.VIEW3D_OT_modo_falloff_reverse,
+    transform_3d.VIEW3D_OT_modo_falloff_handle_hover,
+    transform_3d.VIEW3D_OT_modo_falloff_handle_drag,
     uv_snap.IMAGE_OT_modo_uv_snap_highlight,
     ops_uv.IMAGE_OT_modo_uv_transform,
     ops_uv.IMAGE_OT_modo_uv_component_mode,
@@ -110,6 +116,10 @@ _ALL_CLASSES = (
 def register():
     for cls in _ALL_CLASSES:
         bpy.utils.register_class(cls)
+
+    # Falloff scene property
+    bpy.types.Scene.modokit_falloff = bpy.props.PointerProperty(
+        type=transform_3d.ModoKitFalloffProps)
 
     # Pre-selection highlight handler
     if preselect._preselect_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
@@ -201,6 +211,9 @@ def register():
 
     # UV Editor Overlays dropdown
     bpy.types.IMAGE_PT_overlay.append(_draw_uv_overlays_panel)
+
+    # Falloff — View menu Show Falloff toggle
+    bpy.types.VIEW3D_MT_view.append(panel_menu._draw_falloff_view_menu)
 
     # Patch VIEW3D_MT_editor_menus.draw_collapsible for Material Mode button
     if state._orig_editor_menus_draw_collapsible is None:
@@ -295,6 +308,17 @@ def unregister():
         pass
 
     bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
+    bpy.types.VIEW3D_MT_view.remove(panel_menu._draw_falloff_view_menu)
+
+    # Stop falloff draw handlers if active
+    transform_3d._stop_falloff_handles()
+    transform_3d._stop_falloff_mesh_overlay()
+
+    # Remove scene property
+    try:
+        del bpy.types.Scene.modokit_falloff
+    except Exception:
+        pass
 
     for cls in reversed(_ALL_CLASSES):
         try:

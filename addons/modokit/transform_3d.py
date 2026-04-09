@@ -12,11 +12,94 @@
 import math
 import bpy
 import bmesh
-from bpy.props import EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
 from mathutils import Vector as _Vector, Matrix as _Matrix
 
 from . import state
 from .utils import get_addon_preferences, _diag
+
+
+# ── Falloff PropertyGroup ─────────────────────────────────────────────────────
+
+class ModoKitFalloffProps(bpy.types.PropertyGroup):
+    """Scene-level properties for the Modo-style linear falloff."""
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Falloff is active",
+        default=False,
+    )
+    show: BoolProperty(
+        name="Show Falloff",
+        description="Draw falloff handles and vertex weight overlay",
+        default=False,
+    )
+    start: FloatVectorProperty(
+        name="Start",
+        description="Falloff start position (100% weight)",
+        subtype='XYZ',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+    end: FloatVectorProperty(
+        name="End",
+        description="Falloff end position (0% weight)",
+        subtype='XYZ',
+        size=3,
+        default=(1.0, 0.0, 0.0),
+    )
+    symmetric: EnumProperty(
+        name="Symmetric",
+        description="Symmetry mode",
+        items=[
+            ('NONE',  'None',  'No symmetry'),
+            ('START', 'Start', 'Mirror across the Start position'),
+            ('END',   'End',   'Mirror across the End position'),
+        ],
+        default='NONE',
+    )
+    shape_preset: EnumProperty(
+        name="Shape",
+        description="Falloff shape for weight interpolation",
+        items=[
+            ('LINEAR',   'Linear',   'Linear falloff'),
+            ('EASE_IN',  'Ease In',  'Slow start, fast end'),
+            ('EASE_OUT', 'Ease Out', 'Fast start, slow end'),
+            ('SMOOTH',   'Smooth',   'Smooth S-curve'),
+            ('CUSTOM',   'Custom',   'Custom in/out curve'),
+        ],
+        default='LINEAR',
+    )
+    curve_in: FloatProperty(
+        name="In",
+        description="Custom shape curve-in factor",
+        default=0.0, min=0.0, max=1.0,
+    )
+    curve_out: FloatProperty(
+        name="Out",
+        description="Custom shape curve-out factor",
+        default=0.0, min=0.0, max=1.0,
+    )
+    mix_mode: EnumProperty(
+        name="Mix Mode",
+        description="How the falloff weight is applied",
+        items=[
+            ('MULTIPLY',  'Multiply',  ''),
+            ('ADD',       'Add',       ''),
+            ('SUBTRACT',  'Subtract',  ''),
+            ('MIN',       'Min',       ''),
+            ('MAX',       'Max',       ''),
+            ('REPLACE',   'Replace',   ''),
+        ],
+        default='MULTIPLY',
+    )
+    use_world: BoolProperty(
+        name="Use World Transforms",
+        description=(
+            "ON: treat all selected objects as one unified surface for falloff. "
+            "OFF: evaluate each object independently in its own object space"
+        ),
+        default=True,
+    )
 
 
 # ── Geometry-selection helpers ────────────────────────────────────────────────
@@ -940,6 +1023,655 @@ def _sg_build_scale_matrix(pivot_w, orient_3x3, sx, sy, sz):
     return T_b @ R @ S @ R_inv @ T_f
 
 
+# ── Linear Falloff helpers ─────────────────────────────────────────────────────
+
+_FALLOFF_COL_START = (1.00, 0.83, 0.00, 1.0)   # yellow      = 100%
+_FALLOFF_COL_END   = (0.15, 0.00, 0.35, 1.0)   # dark purple = 0%
+_FALLOFF_HIT_R     = 14.0                        # pixel hit radius for handles
+
+
+def _falloff_weight_color(w):
+    """Linearly interpolate from dark purple (w=0) to yellow (w=1)."""
+    cs, ce = _FALLOFF_COL_START, _FALLOFF_COL_END
+    return (
+        w * cs[0] + (1.0 - w) * ce[0],
+        w * cs[1] + (1.0 - w) * ce[1],
+        w * cs[2] + (1.0 - w) * ce[2],
+        1.0,
+    )
+
+
+def _apply_shape(w, props):
+    """Apply the shape preset to a normalised falloff weight w in [0, 1]."""
+    p = props.shape_preset
+    if p == 'LINEAR':   return w
+    if p == 'EASE_IN':  return w * w * w
+    if p == 'EASE_OUT': return 1.0 - (1.0 - w) ** 3
+    if p == 'SMOOTH':   return w * w * (3.0 - 2.0 * w)
+    if p == 'CUSTOM':
+        ci = props.curve_in
+        co = props.curve_out
+        return w + ci * w * (1.0 - w) - co * (1.0 - w) * w
+    return w
+
+
+def _falloff_linear_weight(world_co, props):
+    """Return a weight in [0, 1] for world_co given the linear falloff props.
+    Returns 1.0 at Start (100% influence) and 0.0 at End (0% influence)."""
+    start  = _Vector(props.start)
+    end    = _Vector(props.end)
+    axis   = end - start
+    length = axis.length
+    if length < 1e-6:
+        return 1.0
+    t = (world_co - start).dot(axis) / (length * length)
+    t = max(0.0, min(1.0, t))
+    w = 1.0 - t   # t=0 at Start → w=1.0 ; t=1 at End → w=0.0
+    sym = props.symmetric
+    if sym == 'START':
+        w = 1.0 - abs(1.0 - w * 2.0)
+    elif sym == 'END':
+        w = 1.0 - abs(w * 2.0 - 1.0)
+    return _apply_shape(max(0.0, min(1.0, w)), props)
+
+
+def _pca_dominant_axis(coords):
+    """Return (centroid, unit_direction) of the dominant principal component
+    of a point cloud, found via power iteration on the 3x3 covariance matrix.
+    The direction points toward the end with the largest projection (i.e. the
+    'positive' extreme). Converges in <20 iterations for any realistic mesh."""
+    n = len(coords)
+    cx = sum(c.x for c in coords) / n
+    cy = sum(c.y for c in coords) / n
+    cz = sum(c.z for c in coords) / n
+    centroid = _Vector((cx, cy, cz))
+
+    # Build symmetric 3x3 covariance matrix
+    cxx = cxy = cxz = cyy = cyz = czz = 0.0
+    for c in coords:
+        dx = c.x - cx; dy = c.y - cy; dz = c.z - cz
+        cxx += dx * dx; cxy += dx * dy; cxz += dx * dz
+        cyy += dy * dy; cyz += dy * dz; czz += dz * dz
+
+    # Initial guess: column of largest diagonal (avoids zero start)
+    diag = (cxx, cyy, czz)
+    mi   = diag.index(max(diag))
+    v    = _Vector((1.0 if mi == 0 else 0.0,
+                    1.0 if mi == 1 else 0.0,
+                    1.0 if mi == 2 else 0.0))
+
+    for _ in range(32):
+        nx = cxx * v.x + cxy * v.y + cxz * v.z
+        ny = cxy * v.x + cyy * v.y + cyz * v.z
+        nz = cxz * v.x + cyz * v.y + czz * v.z
+        nv = _Vector((nx, ny, nz))
+        L  = nv.length
+        if L < 1e-10:
+            break
+        nv /= L
+        if (nv - v).length < 1e-7:
+            v = nv
+            break
+        v = nv
+
+    return centroid, v
+
+
+def _auto_size_falloff(context, axis=None):
+    """Auto-size the falloff handles to the selection.
+    axis=None  → PCA dominant axis (follows geometry inclination, matches Modo).
+    axis='X/Y/Z' → forced world axis; midpoint on the other two axes."""
+    props  = context.scene.modokit_falloff
+    coords = []
+    if context.mode == 'EDIT_MESH':
+        for obj in context.objects_in_mode_unique_data:
+            if obj.type != 'MESH':
+                continue
+            bm_obj = bmesh.from_edit_mesh(obj.data)
+            mx     = obj.matrix_world
+            sel    = [mx @ v.co for v in bm_obj.verts if v.select]
+            coords.extend(sel if sel else [mx @ v.co for v in bm_obj.verts])
+    elif context.mode == 'OBJECT':
+        coords = [obj.matrix_world.translation.copy()
+                  for obj in context.selected_objects]
+    if not coords:
+        return
+
+    if axis is None:
+        if len(coords) < 2:
+            # Single point — nothing to orient
+            props.start = tuple(coords[0])
+            props.end   = tuple(coords[0])
+            return
+
+        centroid, direction = _pca_dominant_axis(coords)
+
+        # Project every point onto the dominant axis to find extent
+        projs  = [(c - centroid).dot(direction) for c in coords]
+        p_min  = min(projs)
+        p_max  = max(projs)
+
+        pt_start = centroid + direction * p_max  # high end
+        pt_end   = centroid + direction * p_min  # low end
+
+        # Start = whichever end is higher in Z (Modo default: top = 100%)
+        if pt_start.z >= pt_end.z:
+            props.start = tuple(pt_start)
+            props.end   = tuple(pt_end)
+        else:
+            props.start = tuple(pt_end)
+            props.end   = tuple(pt_start)
+    else:
+        # Axis-constrained: bbox extreme on chosen axis, midpoint on the others
+        xs = [c.x for c in coords]; ys = [c.y for c in coords]; zs = [c.z for c in coords]
+        min_co = _Vector((min(xs), min(ys), min(zs)))
+        max_co = _Vector((max(xs), max(ys), max(zs)))
+        cx = (min_co.x + max_co.x) * 0.5
+        cy = (min_co.y + max_co.y) * 0.5
+        cz = (min_co.z + max_co.z) * 0.5
+        if axis == 'X':
+            props.start = (max_co.x, cy, cz)
+            props.end   = (min_co.x, cy, cz)
+        elif axis == 'Y':
+            props.start = (cx, max_co.y, cz)
+            props.end   = (cx, min_co.y, cz)
+        else:  # Z
+            props.start = (cx, cy, max_co.z)
+            props.end   = (cx, cy, min_co.z)
+
+
+# ── Falloff draw callbacks ─────────────────────────────────────────────────────
+
+def _falloff_handles_draw_callback():
+    """POST_PIXEL callback — draw the falloff tapered wedge and START/END crosshair handles.
+    Always visible when enabled; 'show' only controls the mesh weight overlay."""
+    try:
+        ctx   = bpy.context
+        props = getattr(ctx.scene, 'modokit_falloff', None)
+        if props is None or not props.enabled:   # no 'show' guard — handles always visible
+            return
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras import view3d_utils
+
+        region = ctx.region
+        rv3d   = ctx.region_data
+        if region is None or rv3d is None:
+            return
+
+        start_s = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, _Vector(props.start))
+        end_s   = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, _Vector(props.end))
+        if start_s is None or end_s is None:
+            return
+
+        sx, sy = start_s.x, start_s.y
+        ex, ey = end_s.x,   end_s.y
+        # Cache for hit-testing by the hover/drag operators
+        state._falloff_screen_handles = {'START': (sx, sy), 'END': (ex, ey)}
+        dx, dy = ex - sx, ey - sy
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len > 0.5:
+            px, py = -dy / seg_len, dx / seg_len   # perpendicular (90° CCW)
+        else:
+            px, py = 0.0, 1.0
+
+        hover = state._falloff_hover_handle
+
+        gpu.state.blend_set('ALPHA')
+        flat = gpu.shader.from_builtin('UNIFORM_COLOR')
+        flat.bind()
+
+        # ── Tapered wedge outline only ─────────────────────────────────────────
+        # Wide at Start (100% influence), tapers to point at End (0%).
+        W = 34.0   # half-width at Start, in pixels
+        w1x = sx + px * W;  w1y = sy + py * W   # Start left edge
+        w2x = sx - px * W;  w2y = sy - py * W   # Start right edge
+        # Desaturated magenta outline
+        flat.uniform_float('color', (0.75, 0.48, 0.82, 0.85))
+        gpu.state.line_width_set(1.5)
+        batch_for_shader(flat, 'LINES', {
+            'pos': [(w1x, w1y), (w2x, w2y),
+                    (w1x, w1y), (ex,  ey),
+                    (w2x, w2y), (ex,  ey)]
+        }).draw(flat)
+        gpu.state.line_width_set(1.0)
+
+        # ── 3-D crosshair handles ──────────────────────────────────────────────
+        # Project RGB XYZ arms from world space so the crosshair looks 3-D.
+        cam_right = _Vector(rv3d.view_matrix.inverted().col[0][:3]).normalized()
+        ref_s_start = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, _Vector(props.start) + cam_right)
+        if ref_s_start is not None:
+            ppu   = math.sqrt((ref_s_start.x - sx)**2 + (ref_s_start.y - sy)**2)
+            arm_w = max(0.001, 20.0 / ppu) if ppu > 0.01 else 0.15
+        else:
+            arm_w = 0.15
+
+        _AX_VECS = (
+            (_Vector((1.0, 0.0, 0.0)), (0.93, 0.21, 0.31, 1.0)),   # X red
+            (_Vector((0.0, 1.0, 0.0)), (0.55, 0.86, 0.00, 1.0)),   # Y green
+            (_Vector((0.0, 0.0, 1.0)), (0.13, 0.55, 0.86, 1.0)),   # Z blue
+        )
+
+        def _draw_handle_crosshair(center_w, dot_col):
+            cs = view3d_utils.location_3d_to_region_2d(region, rv3d, center_w)
+            if cs is None:
+                return
+            cx2, cy2 = cs.x, cs.y
+            for ax, ac in _AX_VECS:
+                p0 = view3d_utils.location_3d_to_region_2d(
+                    region, rv3d, center_w - ax * arm_w)
+                p1 = view3d_utils.location_3d_to_region_2d(
+                    region, rv3d, center_w + ax * arm_w)
+                if p0 is None or p1 is None:
+                    continue
+                # Dark outline
+                flat.uniform_float('color', (ac[0]*0.2, ac[1]*0.2, ac[2]*0.2, 1.0))
+                gpu.state.line_width_set(3.5)
+                batch_for_shader(flat, 'LINES',
+                                 {'pos': [(p0.x, p0.y), (p1.x, p1.y)]}).draw(flat)
+                # Bright arm
+                flat.uniform_float('color', ac)
+                gpu.state.line_width_set(1.8)
+                batch_for_shader(flat, 'LINES',
+                                 {'pos': [(p0.x, p0.y), (p1.x, p1.y)]}).draw(flat)
+            gpu.state.line_width_set(1.0)
+            # Small filled dot at handle centre
+            R = 5.5
+            segs = 16
+            vtri = []
+            for i in range(segs):
+                a0 = math.tau * i / segs
+                a1 = math.tau * (i + 1) / segs
+                vtri += [(cx2, cy2),
+                         (cx2 + R * math.cos(a0), cy2 + R * math.sin(a0)),
+                         (cx2 + R * math.cos(a1), cy2 + R * math.sin(a1))]
+            # White border
+            flat.uniform_float('color', (1.0, 1.0, 1.0, 0.80))
+            Rb = R + 1.5
+            vborder = []
+            for i in range(segs):
+                a0 = math.tau * i / segs
+                a1 = math.tau * (i + 1) / segs
+                vborder += [(cx2, cy2),
+                            (cx2 + Rb * math.cos(a0), cy2 + Rb * math.sin(a0)),
+                            (cx2 + Rb * math.cos(a1), cy2 + Rb * math.sin(a1))]
+            batch_for_shader(flat, 'TRIS', {'pos': vborder}).draw(flat)
+            flat.uniform_float('color', dot_col)
+            batch_for_shader(flat, 'TRIS', {'pos': vtri}).draw(flat)
+
+        start_col = (1.0, 0.95, 0.3, 1.0)  if hover == 'START' else _FALLOFF_COL_START
+        end_col   = (0.6,  0.1, 1.0, 1.0)  if hover == 'END'   else _FALLOFF_COL_END
+        _draw_handle_crosshair(_Vector(props.start), start_col)
+        _draw_handle_crosshair(_Vector(props.end),   end_col)
+
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+
+def _falloff_mesh_overlay_draw_callback():
+    """POST_VIEW callback — draw falloff weight influence as a coloured face overlay.
+    Dark purple = 0 % influence, yellow = 100 %.
+    Controlled exclusively by props.show; the handles are separate."""
+    try:
+        ctx   = bpy.context
+        props = getattr(ctx.scene, 'modokit_falloff', None)
+        if props is None or not props.enabled or not props.show:
+            return
+        if ctx.mode != 'EDIT_MESH':
+            return
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+
+        tri_verts  = []
+        tri_colors = []
+        for obj in ctx.objects_in_mode_unique_data:
+            if obj.type != 'MESH':
+                continue
+            bm_obj = bmesh.from_edit_mesh(obj.data)
+            mx     = obj.matrix_world
+            bm_obj.verts.ensure_lookup_table()
+            bm_obj.faces.ensure_lookup_table()
+            # Precompute per-vertex weights (avoid repeated per-face lookups)
+            vert_w = [_falloff_linear_weight(mx @ v.co, props) for v in bm_obj.verts]
+            # Fan-triangulate every face (does not modify the bmesh)
+            for f in bm_obj.faces:
+                fv = f.verts[:]
+                v0 = fv[0]
+                for i in range(1, len(fv) - 1):
+                    v1, v2 = fv[i], fv[i + 1]
+                    for v in (v0, v1, v2):
+                        tri_verts.append(tuple(mx @ v.co))
+                        w = vert_w[v.index]
+                        # interpolate dark purple (w=0) → yellow (w=1), semi-transparent
+                        tri_colors.append((
+                            w * 1.00 + (1.0 - w) * 0.15,
+                            w * 0.83 + (1.0 - w) * 0.00,
+                            w * 0.00 + (1.0 - w) * 0.35,
+                            0.55,
+                        ))
+
+        if not tri_verts:
+            return
+        shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('LESS_EQUAL')
+        batch_for_shader(shader, 'TRIS',
+                         {'pos': tri_verts, 'color': tri_colors}).draw(shader)
+        gpu.state.depth_test_set('NONE')
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+
+def _start_falloff_handles():
+    """Register the falloff handle draw handler if not already running."""
+    if state._falloff_draw_handle is None:
+        state._falloff_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _falloff_handles_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+
+
+def _stop_falloff_handles():
+    """Remove the falloff handle draw handler."""
+    if state._falloff_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                state._falloff_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._falloff_draw_handle = None
+    state._falloff_screen_handles = {}
+    state._falloff_hover_handle   = ''
+
+
+def _start_falloff_mesh_overlay():
+    """Register the per-vertex weight overlay draw handler if not already running."""
+    if state._falloff_mesh_draw_handle is None:
+        state._falloff_mesh_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _falloff_mesh_overlay_draw_callback, (), 'WINDOW', 'POST_VIEW')
+
+
+def _stop_falloff_mesh_overlay():
+    """Remove the per-vertex weight overlay draw handler."""
+    if state._falloff_mesh_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                state._falloff_mesh_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._falloff_mesh_draw_handle = None
+
+
+def _falloff_hit_test(mx, my):
+    """Return 'START', 'END', or '' for the handle under screen pixel (mx, my)."""
+    h = state._falloff_screen_handles
+    for name in ('START', 'END'):
+        pos = h.get(name)
+        if pos and math.sqrt((mx - pos[0])**2 + (my - pos[1])**2) <= _FALLOFF_HIT_R:
+            return name
+    return ''
+
+
+# ── VIEW3D_OT_modo_falloff_handle_hover  (MOUSEMOVE) ─────────────────────────
+
+class VIEW3D_OT_modo_falloff_handle_hover(bpy.types.Operator):
+    """MOUSEMOVE: highlight the falloff handle under the cursor."""
+    bl_idname  = 'view3d.modo_falloff_handle_hover'
+    bl_label   = 'Falloff Handle Hover'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return (getattr(getattr(context.scene, 'modokit_falloff', None), 'enabled', False)
+                and context.space_data is not None
+                and context.space_data.type == 'VIEW_3D')
+
+    def invoke(self, context, event):
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        props = getattr(context.scene, 'modokit_falloff', None)
+        # Stop if falloff was disabled
+        if props is None or not props.enabled:
+            state._falloff_hover_handle = ''
+            return {'FINISHED'}
+
+        if event.type == 'MOUSEMOVE':
+            hit = _falloff_hit_test(event.mouse_region_x, event.mouse_region_y)
+            if hit != state._falloff_hover_handle:
+                state._falloff_hover_handle = hit
+                if context.area:
+                    context.area.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+
+# ── VIEW3D_OT_modo_falloff_handle_drag  (LMB modal) ──────────────────────────
+
+class VIEW3D_OT_modo_falloff_handle_drag(bpy.types.Operator):
+    """LMB on a falloff handle: drag to reposition it in world space.
+    Respects Blender snap settings; Ctrl toggles snap on/off mid-drag."""
+    bl_idname  = 'view3d.modo_falloff_handle_drag'
+    bl_label   = 'Falloff Handle Drag'
+    bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
+
+    @classmethod
+    def poll(cls, context):
+        return (getattr(getattr(context.scene, 'modokit_falloff', None), 'enabled', False)
+                and context.space_data is not None
+                and context.space_data.type == 'VIEW_3D')
+
+    def invoke(self, context, event):
+        mx, my = event.mouse_region_x, event.mouse_region_y
+        hit = _falloff_hit_test(mx, my)
+        if not hit:
+            return {'PASS_THROUGH'}
+
+        self._handle    = hit   # 'START' or 'END'
+        props           = context.scene.modokit_falloff
+        self._orig_pos  = tuple(props.start if hit == 'START' else props.end)
+
+        rv3d = context.region_data
+        if rv3d is None:
+            return {'CANCELLED'}
+        self._rv3d   = rv3d
+        self._region = context.region
+        self._start_world = _Vector(self._orig_pos)
+        self._depth_co    = self._start_world
+
+        # Snap: Ctrl overrides use_snap just like the Move tool modal
+        self._ctrl_override   = False
+        self._snap_was_on     = False
+        self._snap_hl_owned   = False   # True if we registered the snap highlight handler
+        if state._snap_highlight_draw_handle is None:
+            state._snap_highlight_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+                _snap_highlight_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+            self._snap_hl_owned = True
+        self._apply_ctrl_snap(context, event.ctrl)
+
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    # ── snap helpers ──────────────────────────────────────────────────────────
+
+    def _apply_ctrl_snap(self, context, ctrl_held):
+        ts = context.tool_settings
+        if ctrl_held and not self._ctrl_override:
+            self._snap_was_on   = ts.use_snap
+            ts.use_snap         = True
+            self._ctrl_override = True
+        elif not ctrl_held and self._ctrl_override:
+            ts.use_snap         = self._snap_was_on
+            self._ctrl_override = False
+
+    def _restore_snap(self, context):
+        self._apply_ctrl_snap(context, False)
+        # Clear any leftover snap highlight
+        state._snap_highlight = None
+        # Remove the snap highlight draw handler if we registered it
+        if self._snap_hl_owned and state._snap_highlight_draw_handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    state._snap_highlight_draw_handle, 'WINDOW')
+            except Exception:
+                pass
+            state._snap_highlight_draw_handle = None
+            self._snap_hl_owned = False
+
+    # ── world pos from mouse ──────────────────────────────────────────────────
+
+    def _mouse_to_world(self, mx, my):
+        """Map region pixel coords to world space at the handle's view depth,
+        or use the snap target world pos if snapping is active."""
+        # Try snap first
+        snap = _find_snap_target(bpy.context, mx, my)
+        if snap is not None:
+            state._snap_highlight = snap
+            return _Vector(snap['world_pos'])
+        state._snap_highlight = None
+
+        from bpy_extras import view3d_utils
+        origin = view3d_utils.region_2d_to_origin_3d(self._region, self._rv3d, (mx, my))
+        dir_   = view3d_utils.region_2d_to_vector_3d(self._region, self._rv3d, (mx, my))
+        if origin is None or dir_ is None:
+            return self._start_world.copy()
+        view_normal = _Vector(self._rv3d.view_matrix.row[2][:3]).normalized()
+        denom = view_normal.dot(dir_)
+        if abs(denom) < 1e-8:
+            return self._start_world.copy()
+        t = view_normal.dot(self._depth_co - origin) / denom
+        return origin + dir_ * t
+
+    def modal(self, context, event):
+        props = getattr(context.scene, 'modokit_falloff', None)
+        if props is None:
+            self._restore_snap(context)
+            return {'CANCELLED'}
+
+        if event.type in ('LEFT_CTRL', 'RIGHT_CTRL', 'MOUSEMOVE'):
+            self._apply_ctrl_snap(context, event.ctrl)
+
+        if event.type == 'MOUSEMOVE':
+            new_w = self._mouse_to_world(event.mouse_region_x, event.mouse_region_y)
+            if self._handle == 'START':
+                props.start = tuple(new_w)
+            else:
+                props.end = tuple(new_w)
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            self._restore_snap(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'FINISHED'}
+
+        if event.type in ('RIGHTMOUSE', 'ESC'):
+            if self._handle == 'START':
+                props.start = self._orig_pos
+            else:
+                props.end = self._orig_pos
+            self._restore_snap(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+
+# ── VIEW3D_OT_modo_linear_falloff  (Alt+F) ───────────────────────────────────
+
+class VIEW3D_OT_modo_linear_falloff(bpy.types.Operator):
+    """Toggle Modo-style linear falloff (Alt+F).
+    First press enables falloff and auto-sizes to the selection bounding box.
+    Second press disables falloff."""
+    bl_idname  = 'view3d.modo_linear_falloff'
+    bl_label   = 'Modo Linear Falloff'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.space_data is not None
+                and context.space_data.type == 'VIEW_3D'
+                and context.mode in ('OBJECT', 'EDIT_MESH'))
+
+    def execute(self, context):
+        props = context.scene.modokit_falloff
+        if props.enabled:
+            props.enabled = False
+            _stop_falloff_handles()
+            _stop_falloff_mesh_overlay()
+        else:
+            props.enabled = True
+            _auto_size_falloff(context)
+            _start_falloff_handles()
+            _start_falloff_mesh_overlay()
+            # Start the handle hover modal
+            try:
+                bpy.ops.view3d.modo_falloff_handle_hover('INVOKE_DEFAULT')
+            except Exception:
+                pass
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# ── VIEW3D_OT_modo_falloff_auto_size  (per-axis bbox sizing) ──────────────────
+
+class VIEW3D_OT_modo_falloff_auto_size(bpy.types.Operator):
+    """Auto-size falloff to selection bounding box on a specific axis."""
+    bl_idname  = 'view3d.modo_falloff_auto_size'
+    bl_label   = 'Auto Size Falloff'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    axis: bpy.props.EnumProperty(
+        items=[('X', 'X', 'Size to selection bbox along world X'),
+               ('Y', 'Y', 'Size to selection bbox along world Y'),
+               ('Z', 'Z', 'Size to selection bbox along world Z')],
+        default='X',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        return (fp is not None and fp.enabled
+                and context.mode in ('OBJECT', 'EDIT_MESH'))
+
+    def execute(self, context):
+        _auto_size_falloff(context, axis=self.axis)
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# ── VIEW3D_OT_modo_falloff_reverse  (swap start ↔ end) ───────────────────────
+
+class VIEW3D_OT_modo_falloff_reverse(bpy.types.Operator):
+    """Swap falloff Start and End positions (flips 100% ↔ 0% influence)."""
+    bl_idname  = 'view3d.modo_falloff_reverse'
+    bl_label   = 'Reverse Falloff'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        return fp is not None and fp.enabled
+
+    def execute(self, context):
+        props = context.scene.modokit_falloff
+        old_start = tuple(props.start)
+        props.start = tuple(props.end)
+        props.end   = old_start
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
 # ── Scale gizmo shaders (matrix-free, pixel coords → NDC directly) ────────────
 # These shaders do NOT use ModelViewProjectionMatrix at all — they compute NDC
 # from pixel coordinates using uwidth/uheight uniforms.  This makes them immune
@@ -1545,6 +2277,8 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
     def _apply_live(self, context, s):
         sv = self._sv(s)
         M  = _sg_build_scale_matrix(self._pivot_w, self._orient, *sv)
+        falloff_props = getattr(context.scene, 'modokit_falloff', None)
+        use_falloff   = (falloff_props is not None and falloff_props.enabled)
         if context.mode == 'EDIT_MESH':
             for obj in context.objects_in_mode_unique_data:
                 if obj.type != 'MESH':
@@ -1554,7 +2288,12 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
                 inv = obj.matrix_world.inverted()
                 for vi, orig_w in self._orig_verts.get(obj.name, {}).items():
                     if vi < len(bm.verts):
-                        bm.verts[vi].co = inv @ (M @ orig_w)
+                        scaled_w = M @ orig_w
+                        if use_falloff:
+                            w = _falloff_linear_weight(orig_w, falloff_props)
+                            bm.verts[vi].co = inv @ orig_w.lerp(scaled_w, w)
+                        else:
+                            bm.verts[vi].co = inv @ scaled_w
                 bmesh.update_edit_mesh(obj.data, destructive=False)
         elif context.mode == 'OBJECT':
             for obj in context.selected_objects:

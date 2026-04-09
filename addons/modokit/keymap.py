@@ -578,6 +578,21 @@ def register_keymaps():
             )
             state.addon_keymaps.append((km_nav, kmi))
 
+            # Linear falloff: Alt+F — register across all 3D-view keymaps
+            for target_km in (km_nav, km_obj, km):
+                kmi = target_km.keymap_items.new(
+                    'view3d.modo_linear_falloff',
+                    type='F', value='PRESS', alt=True, head=True,
+                )
+                state.addon_keymaps.append((target_km, kmi))
+
+            # Falloff handle drag (LMB — head=True so it intercepts before selection)
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_falloff_handle_drag',
+                type='LEFTMOUSE', value='PRESS', head=True,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
     # Build identity tuples for all registered items
     state._registered_kmi_ids.clear()
     for km, kmi in state.addon_keymaps:
