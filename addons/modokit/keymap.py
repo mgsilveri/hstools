@@ -634,6 +634,19 @@ def register_keymaps():
             )
             state.addon_keymaps.append((km_nav, kmi))
 
+            # Move gizmo: hover highlight + LMB drag (active when TRANSLATE tool on)
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_move_gizmo_hover',
+                type='MOUSEMOVE', value='ANY', any=True, head=True,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
+            kmi = km_nav.keymap_items.new(
+                'view3d.modo_move_gizmo_drag',
+                type='LEFTMOUSE', value='PRESS', head=True,
+            )
+            state.addon_keymaps.append((km_nav, kmi))
+
             # Linear falloff: Alt+F — register across all 3D-view keymaps
             for target_km in (km_nav, km_obj, km):
                 kmi = target_km.keymap_items.new(

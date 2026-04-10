@@ -75,6 +75,12 @@ _scale_gizmo_draw_handle = None
 _scale_gizmo_screen_handles: dict = {}
 _scale_gizmo_hover: str = ''       # '' | 'X' | 'Y' | 'Z' | 'XY' | 'XZ' | 'YZ' | 'XYZ'
 
+# ── Move gizmo (3D viewport W tool) ───────────────────────────────────────────
+_move_gizmo_draw_handle = None
+_move_gizmo_screen_handles: dict = {}
+_move_gizmo_hover: str = ''        # '' | 'X' | 'Y' | 'Z' | 'XY' | 'XZ' | 'YZ' | 'XYZ'
+_move_gizmo_saved_translate: bool = True   # saved show_gizmo_object_translate value
+
 # ── Linear Falloff ─────────────────────────────────────────────────────────────
 _falloff_draw_handle        = None   # handles + gradient line (POST_PIXEL)
 _falloff_mesh_draw_handle   = None   # per-vertex weight overlay (POST_VIEW)
@@ -151,6 +157,8 @@ _OUR_IDNAMES = {
     'view3d.modo_screen_move',
     'view3d.modo_scale_gizmo_hover',
     'view3d.modo_scale_gizmo_drag',
+    'view3d.modo_move_gizmo_hover',
+    'view3d.modo_move_gizmo_drag',
     'view3d.modo_linear_falloff',
     'view3d.modo_falloff_handle_hover',
     'view3d.modo_falloff_handle_drag',

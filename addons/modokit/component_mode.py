@@ -568,6 +568,18 @@ def _patched_view3d_ht_header_draw(self, context):
     else:
         # Transform settings depending on tool header visibility
         bpy.types.VIEW3D_HT_header.draw_xform_template(layout, context)
+        # ── Falloff type button  (right of proportional editing falloff) ─────
+        if mode_string in {'OBJECT', 'EDIT_MESH'}:
+            fp = getattr(context.scene, 'modokit_falloff', None)
+            if fp is not None:
+                text = "Linear" if fp.enabled else "Falloff"
+                op = layout.operator(
+                    'wm.call_menu',
+                    text=text,
+                    icon='PROP_ON',
+                    depress=fp.enabled,
+                )
+                op.name = 'VIEW3D_MT_modo_falloff_picker'
 
     layout.separator_spacer()
 

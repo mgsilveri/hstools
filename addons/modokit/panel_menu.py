@@ -79,6 +79,30 @@ class VIEW3D_PT_modo_selection(bpy.types.Panel):
             col.prop(fp, 'show', text="Show Falloff")
 
 
+class VIEW3D_MT_modo_falloff_picker(bpy.types.Menu):
+    """Modo-style falloff type picker — shown in the 3D view header."""
+    bl_label  = "Falloff"
+    bl_idname = "VIEW3D_MT_modo_falloff_picker"
+
+    def draw(self, context):
+        layout = self.layout
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        active = fp is not None and fp.enabled
+
+        # (none) — grayed out when falloff is already off
+        col = layout.column()
+        col.enabled = active
+        col.operator('view3d.modo_falloff_disable', text="(none)")
+
+        layout.separator()
+
+        layout.operator(
+            'view3d.modo_linear_falloff',
+            text="Linear",
+            depress=active,
+        )
+
+
 class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
     """Context menu for Modo-style selection.
     Appears on right-click when 2+ elements selected.
