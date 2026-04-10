@@ -628,7 +628,7 @@ def _collect_uv_hits(context, mx, my):
     if sima is None:
         return []
 
-    from .uv_overlays import _uv_view_to_region
+    from .uv_overlays import _uv_view_to_region, _circle_touches_polygon
     sm        = ts.mesh_select_mode
     # UV material mode always highlights faces regardless of the active select mode.
     _uv_mat = state._uv_material_mode_active
@@ -671,24 +671,23 @@ def _collect_uv_hits(context, mx, my):
                     screen_pts.append(sc)
                 if not ok or len(screen_pts) < 3:
                     continue
-                # Highlight if cursor is inside the polygon OR near any UV vertex
-                # (mirrors 3D view face mode which uses vertex proximity).
-                near = (
-                    _point_in_polygon_2d((mx, my), screen_pts)
-                    or any(math.hypot(sc[0] - mx, sc[1] - my) <= _EDGE_PIXEL_THRESHOLD
-                           for sc in screen_pts)
-                )
-                if near:
-                    coords = [tuple(mx_w @ v.co) for v in face.verts]
-                    uv_coords = [tuple(loop[uv_layer].uv) for loop in face.loops]
-                    hits.append({
-                        'type':       'FACE',
-                        'coords':     coords,
-                        'selected':   face.select,
-                        'obj':        obj,
-                        'face_index': face.index,
-                        '_uv': {'type': 'FACE', 'coords': uv_coords, 'selected': face.select},
-                    })
+                # Highlight if the click-select brush circle would touch this face.
+                # Uses the same radius formula as IMAGE_OT_modo_uv_paint_selection._paint
+                # so the highlight exactly matches what a click will select.
+                prefs = get_addon_preferences(context)
+                _face_radius = (prefs.paint_selection_size if prefs else 50) / 4
+                if not _circle_touches_polygon(mx, my, _face_radius, screen_pts):
+                    continue
+                coords = [tuple(mx_w @ v.co) for v in face.verts]
+                uv_coords = [tuple(loop[uv_layer].uv) for loop in face.loops]
+                hits.append({
+                    'type':       'FACE',
+                    'coords':     coords,
+                    'selected':   face.select,
+                    'obj':        obj,
+                    'face_index': face.index,
+                    '_uv': {'type': 'FACE', 'coords': uv_coords, 'selected': face.select},
+                })
 
         elif edge_mode:
             class _V:  # lightweight vec2 duck-type for _point_to_segment_2d

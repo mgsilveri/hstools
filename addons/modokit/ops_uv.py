@@ -1007,13 +1007,26 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
             self._eff_mx = float(mx); self._eff_my = float(my)
             self._prev_real_mx = float(mx); self._prev_real_my = float(my)
             self._snap_ctrl = event.ctrl
+            self._detach_on_drag = event.shift
+            self._suppress_slow_rate = event.shift
 
             self._restore_uv_selection(context)
             state._uv_handle_modal_active = True
             context.window_manager.modal_handler_add(self)
             return {'RUNNING_MODAL'}
 
-        # Click away — reposition gizmo
+        # Click away — reposition gizmo pivot. Guard against clicks that land
+        # outside the WINDOW region (header, toolbar, N-panel, menus, etc.).
+        area = context.area
+        if area:
+            abs_mx, abs_my = event.mouse_x, event.mouse_y
+            win_region = next(
+                (r for r in area.regions if r.type == 'WINDOW'), None)
+            if win_region is None:
+                return {'PASS_THROUGH'}
+            if not (win_region.x <= abs_mx < win_region.x + win_region.width and
+                    win_region.y <= abs_my < win_region.y + win_region.height):
+                return {'PASS_THROUGH'}
         if state._uv_snap_highlight is not None:
             uv_point = state._uv_snap_highlight['uv_pos']
         else:
@@ -1068,7 +1081,7 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
         if event.type == 'MOUSEMOVE':
             mx = event.mouse_region_x; my = event.mouse_region_y
             self._snap_ctrl  = event.ctrl
-            _rate = 0.1 if event.shift else 1.0
+            _rate = 0.1 if (event.shift and not self._suppress_slow_rate) else 1.0
             self._eff_mx += (mx - self._prev_real_mx) * _rate
             self._eff_my += (my - self._prev_real_my) * _rate
             self._prev_real_mx = mx; self._prev_real_my = my
@@ -1079,6 +1092,17 @@ class IMAGE_OT_modo_uv_handle_reposition(bpy.types.Operator):
                     return {'RUNNING_MODAL'}
                 self._dragging = True
                 self._restore_uv_selection(context)
+                if self._detach_on_drag:
+                    # Use non-sticky targets so co-located sticky neighbours
+                    # are seen as "outside" the selection and get ripped away.
+                    rip_src = state._uv_sel_targets or self._uv_info
+                    result = _do_uv_rip_from_targets(context, rip_src)
+                    self._detach_on_drag = False
+                    state._uv_transform_targets = _collect_uv_transform_targets(context)
+                    state._uv_sel_targets = _collect_uv_transform_targets(
+                        context, override_sticky='DISABLED')
+                    self._uv_info = self._refresh_uv_positions(
+                        context, state._uv_transform_targets)
 
             cx, cy = self._center_start
             eff_uv = _uv_region_to_view(region, sima,
@@ -1335,34 +1359,16 @@ class IMAGE_OT_modo_uv_selection_guard(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
 
-class IMAGE_OT_modo_uv_rip(bpy.types.Operator):
-    """Rip (Unstitch) UV connectivity along the selection.
-Vertex: detach the selected UV vertices from unselected neighbours.
-Edge: tear along selected UV edges.
-Face: tear the outer boundary of the selected face(s)."""
-    bl_idname  = 'image.modo_uv_rip'
-    bl_label   = 'Modo UV Rip'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    # UV positions matching within this many decimal places are considered co-located.
-    _TOL = 6
-    # Tiny UV offset applied to the ripped (unselected) side so Blender treats
-    # them as separate islands.  1e-5 is invisible at normal zoom levels.
+def _do_uv_rip(context):
+    """Core UV rip logic, callable without an operator instance.
+    Returns True if any loops were ripped, False otherwise."""
+    _TOL    = 6
     _OFFSET = 1e-5
 
-    @classmethod
-    def poll(cls, context):
-        return (context.area is not None
-                and context.area.type == 'IMAGE_EDITOR'
-                and context.edit_object is not None
-                and context.edit_object.type == 'MESH')
+    def _uv_key(uv):
+        return (round(uv.x, _TOL), round(uv.y, _TOL))
 
-    # -- helpers --------------------------------------------------------------
-
-    def _uv_key(self, uv):
-        return (round(uv.x, self._TOL), round(uv.y, self._TOL))
-
-    def _loop_edge_sel(self, loop, uv_layer):
+    def _loop_edge_sel(loop, uv_layer):
         try:
             return loop.uv_select_edge
         except AttributeError:
@@ -1371,11 +1377,7 @@ Face: tear the outer boundary of the selected face(s)."""
             except (AttributeError, KeyError):
                 return False
 
-    # -- per-mode target collection -------------------------------------------
-
-    def _fan_group_of(self, seed_loop, sel_eids):
-        """Return all loops at seed_loop.vert reachable via face-fan traversal
-        without crossing any edge whose index is in sel_eids."""
+    def _fan_group_of(seed_loop, sel_eids):
         v = seed_loop.vert
         visited_id = set()
         queue = [seed_loop]
@@ -1388,30 +1390,26 @@ Face: tear the outer boundary of the selected face(s)."""
                 continue
             visited_id.add(id(l))
             group.append(l)
-            # Try to cross to adjacent faces via the two edges incident to V
             for e_loop in (l, l.link_loop_prev):
                 if e_loop.edge.index in sel_eids:
-                    continue  # selected edge — stop traversal here
+                    continue
                 rad = e_loop.link_loop_radial_next
                 if rad is e_loop:
-                    continue  # boundary edge
+                    continue
                 for candidate in rad.face.loops:
                     if candidate.vert == v and id(candidate) not in visited_id:
                         queue.append(candidate)
                         break
         return group
 
-    def _targets_vertex(self, bm, uv_layer, sync):
-        # Collect all loops at each selected UV vertex position.
-        # If more than one loop shares that position, offset all but the first
-        # — this performs a full fan-split at the selected UV vertex.
+    def _targets_vertex(bm, uv_layer, sync):
         groups = defaultdict(list)
         for face in bm.faces:
             for loop in face.loops:
                 is_sel = loop.vert.select if sync else loop.uv_select_vert
                 if not is_sel:
                     continue
-                k = (loop.vert.index, self._uv_key(loop[uv_layer].uv))
+                k = (loop.vert.index, _uv_key(loop[uv_layer].uv))
                 groups[k].append(loop)
         targets = set()
         for loops in groups.values():
@@ -1419,8 +1417,7 @@ Face: tear the outer boundary of the selected face(s)."""
                 targets.update(loops[1:])
         return targets
 
-    def _targets_edge(self, bm, uv_layer, sync):
-        # ── Phase 1: collect the immediate partner loops for each torn edge ──
+    def _targets_edge(bm, uv_layer, sync):
         targets = set()
         visited = set()
         for face in bm.faces:
@@ -1431,54 +1428,44 @@ Face: tear the outer boundary of the selected face(s)."""
                 visited.add(eid)
                 partner = loop.link_loop_radial_next
                 if partner is loop:
-                    continue  # boundary mesh edge — nothing to split
+                    continue
                 if sync:
                     if not loop.edge.select:
                         continue
                     targets.add(partner)
                     targets.add(partner.link_loop_next)
                 else:
-                    a_sel = self._loop_edge_sel(loop, uv_layer)
-                    b_sel = self._loop_edge_sel(partner, uv_layer)
+                    a_sel = _loop_edge_sel(loop, uv_layer)
+                    b_sel = _loop_edge_sel(partner, uv_layer)
                     if a_sel == b_sel:
                         continue
                     unsel = partner if a_sel else loop
                     targets.add(unsel)
                     targets.add(unsel.link_loop_next)
-
-        # ── Phase 2: fan-expand at each torn vertex ───────────────────────────
-        # At each endpoint vertex of a torn edge, find all loops that are
-        # UV-co-located with the initial target AND reachable via the same
-        # face-fan arc (not crossing any selected edge).  This ensures that
-        # faces that wrap around the corner vertex — part of the same island as
-        # the partner side — are also offset, giving truly separate islands.
         if sync:
             sel_eids = frozenset(
                 l.edge.index for f in bm.faces for l in f.loops if l.edge.select)
         else:
             sel_eids = frozenset(
                 l.edge.index for f in bm.faces for l in f.loops
-                if self._loop_edge_sel(l, uv_layer))
-
+                if _loop_edge_sel(l, uv_layer))
         extra = set()
         seen_keys = set()
         for init in list(targets):
-            uv_k = self._uv_key(init[uv_layer].uv)
+            uv_k = _uv_key(init[uv_layer].uv)
             k = (init.vert.index, uv_k)
             if k in seen_keys:
                 continue
             seen_keys.add(k)
-            for loop in self._fan_group_of(init, sel_eids):
-                if loop not in targets and self._uv_key(loop[uv_layer].uv) == uv_k:
+            for loop in _fan_group_of(init, sel_eids):
+                if loop not in targets and _uv_key(loop[uv_layer].uv) == uv_k:
                     extra.add(loop)
         targets.update(extra)
         return targets
 
-    def _targets_face(self, bm, uv_layer, sync):
-        """Endpoint UV loops on the unselected side of a selected-face boundary."""
+    def _targets_face(bm, uv_layer, sync):
         def is_face_sel(f):
             return f.select if sync else all(l.uv_select_vert for l in f.loops)
-
         targets = set()
         visited = set()
         for face in bm.faces:
@@ -1499,49 +1486,152 @@ Face: tear the outer boundary of the selected face(s)."""
                 targets.add(unsel.link_loop_next)
         return targets
 
+    obj = context.edit_object
+    if obj is None or obj.type != 'MESH':
+        return False
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        return False
+    ts   = context.tool_settings
+    sync = ts.use_uv_select_sync
+    if sync:
+        sm      = ts.mesh_select_mode
+        uv_mode = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
+    else:
+        uv_mode = ts.uv_select_mode
+    if uv_mode == 'VERTEX':
+        targets = _targets_vertex(bm, uv_layer, sync)
+    elif uv_mode == 'EDGE':
+        targets = _targets_edge(bm, uv_layer, sync)
+    else:
+        targets = _targets_face(bm, uv_layer, sync)
+    if not targets:
+        return False
+    off = _OFFSET
+    for loop in targets:
+        loop[uv_layer].uv.x += off
+        loop[uv_layer].uv.y += off
+    bmesh.update_edit_mesh(obj.data, destructive=False)
+    if context.area:
+        context.area.tag_redraw()
+    return True
+
+
+class IMAGE_OT_modo_uv_rip(bpy.types.Operator):
+    """Rip (Unstitch) UV connectivity along the selection.
+Vertex: detach the selected UV vertices from unselected neighbours.
+Edge: tear along selected UV edges.
+Face: tear the outer boundary of the selected face(s)."""
+    bl_idname  = 'image.modo_uv_rip'
+    bl_label   = 'Modo UV Rip'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area is not None
+                and context.area.type == 'IMAGE_EDITOR'
+                and context.edit_object is not None
+                and context.edit_object.type == 'MESH')
+
     # -- execute ---------------------------------------------------------------
 
     def execute(self, context):
-        obj = context.edit_object
-        if obj is None or obj.type != 'MESH':
-            return {'CANCELLED'}
+        if _do_uv_rip(context):
+            self.report({'INFO'}, "Ripped UV loop(s)")
+            return {'FINISHED'}
+        self.report({'INFO'}, "Nothing to rip — select elements along a UV seam")
+        return {'CANCELLED'}
 
-        bm = bmesh.from_edit_mesh(obj.data)
+
+def _do_uv_rip_from_targets(context, uv_targets):
+    """Rip UV connectivity using the explicit transform-target list.
+
+    More reliable than _do_uv_rip inside a running modal because it never
+    reads the BMesh UV selection state — it uses the known (oname, fi, li, u, v)
+    targets directly.
+
+    For each selected loop in uv_targets, walks link_loops at that vertex and
+    offsets any co-located loop that is NOT itself in the selected set, thereby
+    splitting the UV connection.
+
+    Returns True if any loops were ripped.
+    """
+    _TOL    = 6
+    _OFFSET = 1e-5
+
+    if not uv_targets:
+        return False
+
+    try:
+        obj_by_name = {o.name: o for o in context.objects_in_mode_unique_data
+                       if o.type == 'MESH'}
+    except AttributeError:
+        obj = context.edit_object
+        obj_by_name = {obj.name: obj} if obj and obj.type == 'MESH' else {}
+    if not obj_by_name:
+        return False
+
+    # Group targets by object name
+    by_obj = {}
+    for oname, fi, li, u, v in uv_targets:
+        by_obj.setdefault(oname, []).append((fi, li, u, v))
+
+    ripped_any = False
+    for oname, items in by_obj.items():
+        if oname not in obj_by_name:
+            continue
+        bm = bmesh.from_edit_mesh(obj_by_name[oname].data)
         bm.faces.ensure_lookup_table()
         uv_layer = bm.loops.layers.uv.active
         if uv_layer is None:
-            self.report({'WARNING'}, "No active UV layer")
-            return {'CANCELLED'}
+            continue
 
-        ts   = context.tool_settings
-        sync = ts.use_uv_select_sync
-        if sync:
-            sm      = ts.mesh_select_mode
-            uv_mode = 'VERTEX' if sm[0] else ('EDGE' if sm[1] else 'FACE')
-        else:
-            uv_mode = ts.uv_select_mode
+        # Build a set of the actual BMLoop objects that belong to the selection
+        # so we can exclude them quickly when walking link_loops.
+        sel_loops = set()
+        for fi, li, _u, _v in items:
+            if fi < len(bm.faces):
+                fls = list(bm.faces[fi].loops)
+                if li < len(fls):
+                    sel_loops.add(fls[li])
 
-        if uv_mode == 'VERTEX':
-            targets = self._targets_vertex(bm, uv_layer, sync)
-        elif uv_mode == 'EDGE':
-            targets = self._targets_edge(bm, uv_layer, sync)
-        else:
-            targets = self._targets_face(bm, uv_layer, sync)
+        offsets = []
+        seen_ids = set()
+        for fi, li, u, v in items:
+            if fi >= len(bm.faces):
+                continue
+            fls = list(bm.faces[fi].loops)
+            if li >= len(fls):
+                continue
+            sel_loop = fls[li]
+            uv_key   = (round(u, _TOL), round(v, _TOL))
 
-        if not targets:
-            self.report({'INFO'}, "Nothing to rip — select elements along a UV seam")
-            return {'CANCELLED'}
+            # Walk every loop at this mesh vertex and collect those that are
+            #  (a) not in the selected set, and
+            #  (b) UV-co-located with the selected loop.
+            for other in sel_loop.vert.link_loops:
+                if other in sel_loops:
+                    continue
+                oid = id(other)
+                if oid in seen_ids:
+                    continue
+                ouv = other[uv_layer].uv
+                if (round(ouv.x, _TOL), round(ouv.y, _TOL)) == uv_key:
+                    offsets.append(other)
+                    seen_ids.add(oid)
 
-        off = self._OFFSET
-        for loop in targets:
-            loop[uv_layer].uv.x += off
-            loop[uv_layer].uv.y += off
+        if offsets:
+            for loop in offsets:
+                loop[uv_layer].uv.x += _OFFSET
+                loop[uv_layer].uv.y += _OFFSET
+            bmesh.update_edit_mesh(obj_by_name[oname].data, destructive=False)
+            ripped_any = True
 
-        bmesh.update_edit_mesh(obj.data, destructive=False)
-        if context.area:
-            context.area.tag_redraw()
-        self.report({'INFO'}, f"Ripped {len(targets)} UV loop(s)")
-        return {'FINISHED'}
+    if ripped_any and context.area:
+        context.area.tag_redraw()
+    return ripped_any
 
 
 # ── UV header patch ───────────────────────────────────────────────────────────
