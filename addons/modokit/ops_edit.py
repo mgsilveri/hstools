@@ -1064,3 +1064,74 @@ class MESH_OT_modo_lasso_select(bpy.types.Operator):
 
             bmesh.update_edit_mesh(obj.data)
         return {'FINISHED'}
+
+
+# ── Smooth by UV ────────────────────────────────────────────────────────────
+
+def _apply_smooth_by_uv(bm):
+    """Set smooth shading on all faces, clear all sharp marks, then mark edges
+    as sharp at every UV island boundary using the per-vertex radial loop check.
+
+    For each edge loop L on face F1:
+      - L[uv].uv           = UV of L's start-vertex on F1.
+      - L.link_loop_radial_next.link_loop_next[uv].uv
+                           = UV of the *same* vertex on the adjacent face F2.
+    If either vertex of the edge has a different UV on the two sides, the edge
+    sits on a UV island boundary and is marked sharp.
+    """
+    uv_layer = bm.loops.layers.uv.active
+
+    # Step 1: shade all faces smooth and clear all existing sharp marks.
+    for face in bm.faces:
+        face.smooth = True
+    for edge in bm.edges:
+        edge.smooth = True
+
+    if uv_layer is None:
+        return
+
+    # Step 2: mark UV-border edges as sharp.
+    # Boundary edges (only 1 face) are skipped — they need no sharp mark for
+    # baking because there's no adjacent polygon to create a normal seam.
+    faces = [f for f in bm.faces if not f.hide]
+    edge_set = {edge for face in faces for edge in face.edges if edge.link_loops}
+    for edge in edge_set:
+        loops = edge.link_loops
+        # link_loops[0] starts at V_a on F1; radial_next is on F2, pointing
+        # from V_b to V_a, so .link_loop_next brings us to V_a on F2.
+        l0 = loops[0]
+        uv_a_f1 = l0[uv_layer].uv
+        uv_a_f2 = l0.link_loop_radial_next.link_loop_next[uv_layer].uv
+
+        # loops[-1] starts at V_b on F2 (or another face); same trick gives V_b on F1.
+        l1 = loops[-1]
+        uv_b_f2 = l1[uv_layer].uv
+        uv_b_f1 = l1.link_loop_radial_next.link_loop_next[uv_layer].uv
+
+        if uv_a_f1 != uv_a_f2 or uv_b_f2 != uv_b_f1:
+            edge.smooth = False
+
+
+class MESH_OT_smooth_by_uv(bpy.types.Operator):
+    """Set smooth shading and mark edges as sharp at every UV island boundary.
+    All faces become smooth-shaded; only UV seam edges are left sharp,
+    giving clean normal map bakes with no shading discontinuities."""
+    bl_idname  = "mesh.smooth_by_uv"
+    bl_label   = "Smooth by UV"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        for obj in context.objects_in_mode:
+            if obj.type != 'MESH':
+                continue
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            _apply_smooth_by_uv(bm)
+            bmesh.update_edit_mesh(me)
+        return {'FINISHED'}

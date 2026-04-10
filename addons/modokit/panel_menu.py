@@ -109,3 +109,19 @@ def _draw_falloff_view_menu(self, context):
     sub = layout.column()
     sub.enabled = fp.enabled
     sub.prop(fp, 'show', text="Show Falloff")
+
+
+def _draw_smooth_by_uv_edit_menu(self, context):
+    """Appended to VIEW3D_MT_edit_mesh — Smooth by UV under the Mesh menu."""
+    if context.mode != 'EDIT_MESH':
+        return
+    self.layout.separator()
+    self.layout.operator("mesh.smooth_by_uv", text="Smooth by UV")
+
+
+def _draw_smooth_by_uv_object_menu(self, context):
+    """Appended to VIEW3D_MT_object — Smooth by UV under the Object menu."""
+    if context.mode != 'OBJECT':
+        return
+    self.layout.separator()
+    self.layout.operator("object.smooth_by_uv", text="Smooth by UV")

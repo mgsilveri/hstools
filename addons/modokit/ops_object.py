@@ -378,3 +378,37 @@ class OBJECT_OT_modo_lasso_select(bpy.types.Operator):
                 context.area.tag_redraw()
             return {'CANCELLED'}
         return {'RUNNING_MODAL'}
+
+
+# ── Smooth by UV ────────────────────────────────────────────────────────────
+
+class OBJECT_OT_smooth_by_uv(bpy.types.Operator):
+    """Set smooth shading and mark edges as sharp at every UV island boundary.
+    All faces become smooth-shaded; only UV seam edges are left sharp,
+    giving clean normal map bakes with no shading discontinuities."""
+    bl_idname  = "object.smooth_by_uv"
+    bl_label   = "Smooth by UV"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'OBJECT'
+                and any(o.type == 'MESH' for o in context.selected_objects))
+
+    def execute(self, context):
+        import bmesh
+        from .ops_edit import _apply_smooth_by_uv
+        processed = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            me = obj.data
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            _apply_smooth_by_uv(bm)
+            bm.to_mesh(me)
+            bm.free()
+            me.update()
+            processed += 1
+        self.report({'INFO'}, f"Sharp by UV applied to {processed} object(s).")
+        return {'FINISHED'}

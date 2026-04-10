@@ -79,8 +79,10 @@ _ALL_CLASSES = (
     ops_edit.MESH_OT_modo_select_element_under_mouse,
     ops_edit.MESH_OT_modo_select_shortest_path,
     ops_edit.MESH_OT_modo_lasso_select,
+    ops_edit.MESH_OT_smooth_by_uv,
     ops_object.OBJECT_OT_modo_click_select,
     ops_object.OBJECT_OT_modo_lasso_select,
+    ops_object.OBJECT_OT_smooth_by_uv,
     panel_menu.VIEW3D_PT_modo_selection,
     panel_menu.MESH_MT_modo_selection_context_menu,
     component_mode.VIEW3D_OT_modo_component_mode,
@@ -225,6 +227,10 @@ def register():
     # Falloff — View menu Show Falloff toggle
     bpy.types.VIEW3D_MT_view.append(panel_menu._draw_falloff_view_menu)
 
+    # Sharp by UV — Mesh and Object menus
+    bpy.types.VIEW3D_MT_edit_mesh.append(panel_menu._draw_smooth_by_uv_edit_menu)
+    bpy.types.VIEW3D_MT_object.append(panel_menu._draw_smooth_by_uv_object_menu)
+
     # Patch VIEW3D_MT_editor_menus.draw_collapsible for Material Mode button
     if state._orig_editor_menus_draw_collapsible is None:
         state._orig_editor_menus_draw_collapsible = (
@@ -324,6 +330,8 @@ def unregister():
 
     bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
     bpy.types.VIEW3D_MT_view.remove(panel_menu._draw_falloff_view_menu)
+    bpy.types.VIEW3D_MT_edit_mesh.remove(panel_menu._draw_smooth_by_uv_edit_menu)
+    bpy.types.VIEW3D_MT_object.remove(panel_menu._draw_smooth_by_uv_object_menu)
 
     # Restore original IMAGE_HT_header.draw
     if state._orig_image_ht_header_draw is not None:
