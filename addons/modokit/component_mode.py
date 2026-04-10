@@ -620,8 +620,18 @@ def _patched_view3d_ht_header_draw(self, context):
 
     row = layout.row()
     row.active = (object_mode == 'EDIT') or (shading.type in {'WIREFRAME', 'SOLID'})
-    from bl_ui.space_view3d import _toggle_xray_operator
-    _toggle_xray_operator(row, context, text="")
+    try:
+        from bl_ui.space_view3d import _toggle_xray_operator
+        _toggle_xray_operator(row, context, text="")
+    except ImportError:
+        # Blender 5.0+: helper was removed, inline the xray toggle directly.
+        if has_pose_mode:
+            draw_depressed = overlay.show_xray_bone
+        elif shading.type == 'WIREFRAME':
+            draw_depressed = shading.show_xray_wireframe
+        else:
+            draw_depressed = shading.show_xray
+        row.operator("view3d.toggle_xray", text="", icon='XRAY', depress=draw_depressed)
 
     row = layout.row(align=True)
     row.prop(shading, "type", text="", expand=True)

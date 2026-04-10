@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 import bpy
 import bmesh
-from bpy.props import EnumProperty, FloatProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
 from . import state
 from .utils import get_addon_preferences, _uv_debug_log
@@ -159,6 +159,12 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
         default='VERTEX',
     )
 
+    convert: BoolProperty(
+        name='Convert Selection',
+        description='Convert current UV selection to the target component type (Alt+mode key)',
+        default=False,
+    )
+
     @classmethod
     def poll(cls, context):
         return (context.space_data is not None
@@ -175,6 +181,207 @@ class IMAGE_OT_modo_uv_component_mode(bpy.types.Operator):
         _was_material = state._uv_material_mode_active
         state._uv_material_mode_active = False
         tgt_mode = self.mode
+
+        # ── Convert selection (Alt+1/2/3) ────────────────────────────────────
+        if self.convert:
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+
+            if ts.use_uv_select_sync:
+                cur_v, cur_e, cur_f = ts.mesh_select_mode
+                cur_key = 'FACE' if cur_f else ('EDGE' if cur_e else 'VERT')
+                comp_map = {'VERTEX': 'VERT', 'EDGE': 'EDGE', 'FACE': 'FACE'}
+                tgt_key  = comp_map[tgt_mode]
+                mode_map = {'VERT': (True, False, False),
+                            'EDGE': (False, True,  False),
+                            'FACE': (False, False, True)}
+
+                if cur_key == tgt_key and not _was_material:
+                    return {'FINISHED'}
+
+                if cur_key == 'FACE' and tgt_key == 'EDGE':
+                    sel = {e.index for f in bm.faces if f.select for e in f.edges}
+                elif cur_key == 'FACE' and tgt_key == 'VERT':
+                    sel = {v.index for f in bm.faces if f.select for v in f.verts}
+                elif cur_key == 'EDGE' and tgt_key == 'VERT':
+                    sel = {v.index for e in bm.edges if e.select for v in e.verts}
+                elif cur_key == 'EDGE' and tgt_key == 'FACE':
+                    sel = {f.index for f in bm.faces
+                           if sum(1 for e in f.edges if e.select) >= 2}
+                    if not sel:
+                        sel = {f.index for f in bm.faces
+                               if any(e.select for e in f.edges)}
+                elif cur_key == 'VERT' and tgt_key == 'EDGE':
+                    sel = {e.index for e in bm.edges
+                           if all(v.select for v in e.verts)}
+                elif cur_key == 'VERT' and tgt_key == 'FACE':
+                    sel = {f.index for f in bm.faces
+                           if all(v.select for v in f.verts)}
+                else:
+                    sel = set()
+
+                for v in bm.verts: v.select = False
+                for e in bm.edges: e.select = False
+                for f in bm.faces: f.select = False
+                bm.select_history.clear()
+                ts.mesh_select_mode = mode_map[tgt_key]
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+
+                if tgt_key == 'VERT':
+                    for i in sel:
+                        if i < len(bm.verts): bm.verts[i].select = True
+                elif tgt_key == 'EDGE':
+                    for i in sel:
+                        if i < len(bm.edges):
+                            bm.edges[i].select = True
+                            for v in bm.edges[i].verts: v.select = True
+                else:
+                    for i in sel:
+                        if i < len(bm.faces):
+                            f = bm.faces[i]
+                            f.select = True
+                            for v in f.verts: v.select = True
+                            for e in f.edges: e.select = True
+
+                bm.select_flush_mode()
+                uv_layer = bm.loops.layers.uv.active
+                if uv_layer is not None:
+                    if tgt_key == 'VERT':
+                        for face in bm.faces:
+                            for loop in face.loops:
+                                loop.uv_select_vert = loop.vert.select
+                                loop.uv_select_edge = False
+                    elif tgt_key == 'EDGE':
+                        for face in bm.faces:
+                            for loop in face.loops:
+                                loop.uv_select_edge = loop.edge.select
+                                loop.uv_select_vert = loop.vert.select
+                    else:
+                        for face in bm.faces:
+                            s = face.select
+                            for loop in face.loops:
+                                loop.uv_select_vert = s
+                                loop.uv_select_edge = s
+                bmesh.update_edit_mesh(obj.data)
+
+            else:  # Sync OFF
+                uv_layer = bm.loops.layers.uv.active
+                cur_mode = ts.uv_select_mode
+
+                if cur_mode == tgt_mode and not _was_material:
+                    return {'FINISHED'}
+
+                if uv_layer is not None:
+                    if cur_mode == 'FACE' and tgt_mode == 'VERTEX':
+                        sel_faces = {f.index for f in bm.faces
+                                     if f.loops
+                                     and all(l.uv_select_vert for l in f.loops)}
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'VERTEX'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            if f.index in sel_faces:
+                                for loop in f.loops:
+                                    loop.uv_select_vert = True
+
+                    elif cur_mode == 'FACE' and tgt_mode == 'EDGE':
+                        sel_faces = {f.index for f in bm.faces
+                                     if f.loops
+                                     and all(l.uv_select_vert for l in f.loops)}
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'EDGE'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            if f.index in sel_faces:
+                                for loop in f.loops:
+                                    loop.uv_select_edge = True
+                                    loop.uv_select_vert = True
+
+                    elif cur_mode == 'EDGE' and tgt_mode == 'VERTEX':
+                        sel_verts = set()
+                        for f in bm.faces:
+                            fi = f.index
+                            loops = list(f.loops)
+                            n = len(loops)
+                            for li, loop in enumerate(loops):
+                                if loop.uv_select_edge:
+                                    sel_verts.add((fi, li))
+                                    sel_verts.add((fi, (li + 1) % n))
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'VERTEX'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            fi = f.index
+                            for li, loop in enumerate(f.loops):
+                                if (fi, li) in sel_verts:
+                                    loop.uv_select_vert = True
+
+                    elif cur_mode == 'EDGE' and tgt_mode == 'FACE':
+                        edge_counts = {f.index: sum(1 for l in f.loops
+                                                    if l.uv_select_edge)
+                                       for f in bm.faces}
+                        sel_faces = {fi for fi, c in edge_counts.items() if c >= 2}
+                        if not sel_faces:
+                            sel_faces = {fi for fi, c in edge_counts.items() if c >= 1}
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'FACE'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            if f.index in sel_faces:
+                                for loop in f.loops:
+                                    loop.uv_select_vert = True
+                                    loop.uv_select_edge = True
+
+                    elif cur_mode == 'VERTEX' and tgt_mode == 'EDGE':
+                        sel_vert_loops = {(f.index, li)
+                                          for f in bm.faces
+                                          for li, loop in enumerate(f.loops)
+                                          if loop.uv_select_vert}
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'EDGE'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            fi = f.index
+                            loops = list(f.loops)
+                            n = len(loops)
+                            for li, loop in enumerate(loops):
+                                next_li = (li + 1) % n
+                                if (fi, li) in sel_vert_loops and (fi, next_li) in sel_vert_loops:
+                                    loop.uv_select_edge = True
+                                    loop.uv_select_vert = True
+                                    loops[next_li].uv_select_vert = True
+
+                    elif cur_mode == 'VERTEX' and tgt_mode == 'FACE':
+                        sel_faces = {f.index for f in bm.faces
+                                     if f.loops
+                                     and all(l.uv_select_vert for l in f.loops)}
+                        bpy.ops.uv.select_all(action='DESELECT')
+                        ts.uv_select_mode = 'FACE'
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        bm.faces.ensure_lookup_table()
+                        for f in bm.faces:
+                            if f.index in sel_faces:
+                                for loop in f.loops:
+                                    loop.uv_select_vert = True
+                                    loop.uv_select_edge = True
+
+                    bmesh.update_edit_mesh(obj.data)
+
+            for win in context.window_manager.windows:
+                for a in win.screen.areas:
+                    a.tag_redraw()
+            return {'FINISHED'}
+        # ────────────────────────────────────────────────────────────────────
 
         if ts.use_uv_select_sync:
             comp_map = {'VERTEX': 'VERT', 'EDGE': 'EDGE', 'FACE': 'FACE'}

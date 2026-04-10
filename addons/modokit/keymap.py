@@ -392,6 +392,19 @@ def register_keymaps():
                 kmi.properties.mode = uv_mode
                 state.addon_keymaps.append((km_uv, kmi))
 
+            # Alt+1/2/3 — UV convert selection
+            for key, uv_mode in (('ONE', 'VERTEX'), ('TWO', 'EDGE'), ('THREE', 'FACE')):
+                kmi = km_uv.keymap_items.new(
+                    'image.modo_uv_component_mode',
+                    type=key,
+                    value='PRESS',
+                    alt=True,
+                    head=True,
+                )
+                kmi.properties.mode = uv_mode
+                kmi.properties.convert = True
+                state.addon_keymaps.append((km_uv, kmi))
+
             # 4 — UV material mode
             kmi = km_uv.keymap_items.new(
                 'image.modo_uv_material_mode',
