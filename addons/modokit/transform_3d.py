@@ -3042,12 +3042,16 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             for obj in context.selected_objects:
                 self._orig_matrices[obj.name] = obj.matrix_world.copy()
 
+        # Ctrl-to-snap state
+        self._ctrl_snap_on  = False
+        self._snap_was_on   = False
+
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     # ── delta computation ─────────────────────────────────────────────────────
 
-    def _compute_delta(self, mx, my, context):
+    def _compute_delta(self, mx, my, context, snap=None):
         from bpy_extras import view3d_utils
         region = context.region
         rv3d   = context.region_data
@@ -3059,7 +3063,12 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             region, rv3d, (mx, my), self._pivot_w)
         if start_3d is None or cur_3d is None:
             return _Vector((0.0, 0.0, 0.0))
-        raw = cur_3d - start_3d
+        if snap is not None:
+            # Compute delta as pivot → snap target world position.
+            # Axis/plane constraints below project this onto their subspace.
+            raw = snap['world_pos'] - self._pivot_w
+        else:
+            raw = cur_3d - start_3d
         orient = self._orient
         xu = _Vector(orient.col[0]).normalized()
         yv = _Vector(orient.col[1]).normalized()
@@ -3159,10 +3168,39 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
 
     # ── modal ─────────────────────────────────────────────────────────────────
 
+    def _release_ctrl_snap(self, context):
+        """Restore use_snap if we temporarily enabled it via Ctrl."""
+        if self._ctrl_snap_on:
+            try:
+                context.tool_settings.use_snap = self._snap_was_on
+            except Exception:
+                pass
+            self._ctrl_snap_on = False
+
     def modal(self, context, event):
+        # Ctrl held during drag temporarily enables snapping (same as the
+        # snap highlight operator behaviour during gizmo placement).
+        if event.type in ('LEFT_CTRL', 'RIGHT_CTRL'):
+            ts = context.tool_settings
+            if event.value == 'PRESS' and not self._ctrl_snap_on:
+                self._snap_was_on  = ts.use_snap
+                ts.use_snap        = True
+                self._ctrl_snap_on = True
+            elif event.value == 'RELEASE' and self._ctrl_snap_on:
+                ts.use_snap        = self._snap_was_on
+                self._ctrl_snap_on = False
+
         if event.type == 'MOUSEMOVE':
-            delta = self._compute_delta(
-                event.mouse_region_x, event.mouse_region_y, context)
+            mx, my = event.mouse_region_x, event.mouse_region_y
+            snap = None
+            if context.tool_settings.use_snap:
+                # Restore geometry to original positions before searching so
+                # that moved vertices don't become self-referencing snap targets
+                # (which causes oscillation that looks like grid snapping).
+                self._restore(context)
+                snap = _find_snap_target(context, mx, my)
+            state._snap_highlight = snap
+            delta = self._compute_delta(mx, my, context, snap)
             self._last_delta = delta
             self._apply_live(context, delta)
             if context.area:
@@ -3170,12 +3208,16 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            self._release_ctrl_snap(context)
+            state._snap_highlight = None
             result = self._commit(context, self._last_delta)
             if context.area:
                 context.area.tag_redraw()
             return result
 
         if event.type in ('RIGHTMOUSE', 'ESC'):
+            self._release_ctrl_snap(context)
+            state._snap_highlight = None
             self._restore(context)
             if context.area:
                 context.area.tag_redraw()
