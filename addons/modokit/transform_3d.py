@@ -167,6 +167,7 @@ def _drop_transform(context):
             setattr(sv3d, attr, False)
     _stop_snap_highlight()
     _stop_anchor_timer()
+    _stop_move_gizmo()
     _stop_scale_gizmo()   # also restores show_gizmo_tool = True
     _stop_pivot_crosshair()
     try:
@@ -746,9 +747,9 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
         attr = self._GIZMO_ATTRS[self.transform_type]
         other_attrs   = [a for a in self._GIZMO_ATTRS.values() if a != attr]
 
-        # For RESIZE we own the tool state ourselves; for W/E use the active tool id.
-        if self.transform_type == 'RESIZE':
-            already_on = (state._active_transform_mode == 'RESIZE')
+        # For RESIZE and TRANSLATE we own the gizmo; use state to detect toggle.
+        if self.transform_type in ('RESIZE', 'TRANSLATE'):
+            already_on = (state._active_transform_mode == self.transform_type)
         else:
             active_tool = self._active_tool_id(context)
             already_on  = (active_tool == self._TOOL_IDS[self.transform_type])
@@ -759,6 +760,9 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
             if self.transform_type == 'RESIZE':
                 sv3d.show_gizmo_tool = True
                 _stop_scale_gizmo()
+            elif self.transform_type == 'TRANSLATE':
+                sv3d.show_gizmo_tool = True
+                _stop_move_gizmo()
             try:
                 bpy.ops.wm.tool_set_by_id(name='builtin.select_box')
             except Exception:
@@ -796,6 +800,7 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
                 _stop_snap_highlight()
                 if state._active_transform_mode == 'TRANSLATE':
                     _stop_anchor_timer()
+                    _stop_move_gizmo()
                 if state._active_transform_mode == 'RESIZE':
                     _stop_scale_gizmo()
             for a in other_attrs:
@@ -809,6 +814,20 @@ class VIEW3D_OT_modo_transform(bpy.types.Operator):
                     pass
                 sv3d.show_gizmo_tool = False
                 _start_scale_gizmo()
+            elif self.transform_type == 'TRANSLATE':
+                # Activate builtin.move (exits extrude/bevel) but suppress its
+                # native gizmo so only our custom one draws.  This is the same
+                # pattern as RESIZE/builtin.scale: the tool must be active so
+                # km_nav head=True entries can intercept LMB before select_box.
+                try:
+                    bpy.ops.wm.tool_set_by_id(name='builtin.move')
+                except Exception:
+                    pass
+                state._move_gizmo_saved_translate = getattr(
+                    sv3d, 'show_gizmo_object_translate', True)
+                sv3d.show_gizmo_object_translate = False
+                sv3d.show_gizmo_tool = False
+                _start_move_gizmo()
             else:
                 setattr(sv3d, attr, True)
                 if not sv3d.show_gizmo:
@@ -1078,8 +1097,9 @@ def _falloff_linear_weight(world_co, props):
 def _pca_dominant_axis(coords):
     """Return (centroid, unit_direction) of the dominant principal component
     of a point cloud, found via power iteration on the 3x3 covariance matrix.
-    The direction points toward the end with the largest projection (i.e. the
-    'positive' extreme). Converges in <20 iterations for any realistic mesh."""
+    Uses multiple starting vectors and keeps the highest Rayleigh quotient so
+    it correctly breaks ties when two diagonal entries are equal (e.g. cyy==czz
+    for a symmetric face), which single-start iteration would miss."""
     n = len(coords)
     cx = sum(c.x for c in coords) / n
     cy = sum(c.y for c in coords) / n
@@ -1093,28 +1113,81 @@ def _pca_dominant_axis(coords):
         cxx += dx * dx; cxy += dx * dy; cxz += dx * dz
         cyy += dy * dy; cyz += dy * dz; czz += dz * dz
 
-    # Initial guess: column of largest diagonal (avoids zero start)
-    diag = (cxx, cyy, czz)
-    mi   = diag.index(max(diag))
-    v    = _Vector((1.0 if mi == 0 else 0.0,
-                    1.0 if mi == 1 else 0.0,
-                    1.0 if mi == 2 else 0.0))
+    def _mv(v):
+        return _Vector((cxx * v.x + cxy * v.y + cxz * v.z,
+                        cxy * v.x + cyy * v.y + cyz * v.z,
+                        cxz * v.x + cyz * v.y + czz * v.z))
 
-    for _ in range(32):
-        nx = cxx * v.x + cxy * v.y + cxz * v.z
-        ny = cxy * v.x + cyy * v.y + cyz * v.z
-        nz = cxz * v.x + cyz * v.y + czz * v.z
-        nv = _Vector((nx, ny, nz))
-        L  = nv.length
-        if L < 1e-10:
-            break
-        nv /= L
-        if (nv - v).length < 1e-7:
+    def _iterate(v0):
+        v = v0
+        for _ in range(32):
+            nv = _mv(v)
+            L  = nv.length
+            if L < 1e-10:
+                return None, -1.0
+            nv /= L
+            if (nv - v).length < 1e-7:
+                v = nv
+                break
             v = nv
-            break
-        v = nv
+        mv = _mv(v)
+        return v, v.dot(mv)   # rayleigh quotient ≈ eigenvalue
 
-    return centroid, v
+    # Try all three cardinal axes plus four face-diagonals so that we find
+    # the true dominant eigenvector even when two diagonal entries are equal.
+    best_v, best_q = None, -1.0
+    seeds = [
+        _Vector((1.0, 0.0, 0.0)), _Vector((0.0, 1.0, 0.0)), _Vector((0.0, 0.0, 1.0)),
+        _Vector(( 1.0,  1.0, 0.0)).normalized(), _Vector((1.0, 0.0,  1.0)).normalized(),
+        _Vector((0.0,  1.0, 1.0)).normalized(), _Vector((1.0, 1.0,  1.0)).normalized(),
+    ]
+    for s in seeds:
+        v, q = _iterate(s)
+        if v is not None and q > best_q:
+            best_q, best_v = q, v
+
+    if best_v is None:
+        best_v = _Vector((0.0, 0.0, 1.0))
+
+    return centroid, best_v
+
+
+def _half_centroids(coords, direction, push_to_extreme=False):
+    """Return (pt_start, pt_end) for the two falloff handles along *direction*.
+
+    Vertices are sorted by projection onto *direction* and split into equal
+    top/bottom halves by count.  Each handle is the 3-D centroid of its half.
+
+    push_to_extreme=True  — also shifts the along-direction component of each
+        centroid to the actual max/min projection.  Safe ONLY when *direction*
+        is a world axis (X/Y/Z); for diagonal PCA directions this would push
+        the handle outside the mesh bounding box, so leave it False there.
+    """
+    sorted_coords = sorted(coords, key=lambda c: c.dot(direction), reverse=True)
+    n    = len(sorted_coords)
+    half = max(1, n // 2)
+    high = sorted_coords[:half]
+    low  = sorted_coords[n - half:]
+
+    def _cen(verts):
+        nv = len(verts)
+        return _Vector((sum(v.x for v in verts) / nv,
+                        sum(v.y for v in verts) / nv,
+                        sum(v.z for v in verts) / nv))
+
+    high_c = _cen(high)
+    low_c  = _cen(low)
+
+    if push_to_extreme:
+        max_p    = sorted_coords[0].dot(direction)
+        min_p    = sorted_coords[-1].dot(direction)
+        pt_start = high_c + direction * (max_p - high_c.dot(direction))
+        pt_end   = low_c  + direction * (min_p - low_c.dot(direction))
+    else:
+        pt_start = high_c
+        pt_end   = low_c
+
+    return pt_start, pt_end
 
 
 def _auto_size_falloff(context, axis=None):
@@ -1139,60 +1212,73 @@ def _auto_size_falloff(context, axis=None):
 
     if axis is None:
         if len(coords) < 2:
-            # Single point — nothing to orient
             props.start = tuple(coords[0])
             props.end   = tuple(coords[0])
             return
 
         centroid, direction = _pca_dominant_axis(coords)
 
-        # Project every point onto the dominant axis to find extent
-        projs  = [(c - centroid).dot(direction) for c in coords]
-        p_min  = min(projs)
-        p_max  = max(projs)
+        # If PCA direction is within ~25° of a world axis, use world-axis
+        # placement.  Within that snap zone, pick the axis with the LARGEST
+        # bounding-box span — that is the "longer axis" the user sees, even
+        # when PCA variance happens to peak along a different axis.
+        _SNAP_COS = 0.90   # cos(~26°)
+        world_axes = (
+            (_Vector((1.0, 0.0, 0.0)), 'X'),
+            (_Vector((0.0, 1.0, 0.0)), 'Y'),
+            (_Vector((0.0, 0.0, 1.0)), 'Z'),
+        )
+        best_dot, best_ax_name = 0.0, None
+        for wa, name in world_axes:
+            d = abs(direction.dot(wa))
+            if d > best_dot:
+                best_dot, best_ax_name = d, name
 
-        pt_start = centroid + direction * p_max  # high end
-        pt_end   = centroid + direction * p_min  # low end
-
-        # Start = whichever end is higher in Z (Modo default: top = 100%)
-        if pt_start.z >= pt_end.z:
+        if best_dot >= _SNAP_COS:
+            # Axis-aligned geometry — snap to the world axis most aligned with
+            # the PCA direction (which correctly identifies the face's long axis
+            # via the Rayleigh-quotient multi-start fix in _pca_dominant_axis).
+            ax_dir = {'X': _Vector((1.0, 0.0, 0.0)),
+                      'Y': _Vector((0.0, 1.0, 0.0)),
+                      'Z': _Vector((0.0, 0.0, 1.0))}[best_ax_name]
+            pt_start, pt_end = _half_centroids(coords, ax_dir, push_to_extreme=True)
             props.start = tuple(pt_start)
             props.end   = tuple(pt_end)
         else:
-            props.start = tuple(pt_end)
-            props.end   = tuple(pt_start)
+            # Genuinely off-axis — follow PCA direction, NO push (pushing along
+            # a diagonal would move handles outside the mesh bounding box).
+            pt_start, pt_end = _half_centroids(coords, direction, push_to_extreme=False)
+            if pt_start.z >= pt_end.z:
+                props.start = tuple(pt_start)
+                props.end   = tuple(pt_end)
+            else:
+                props.start = tuple(pt_end)
+                props.end   = tuple(pt_start)
     else:
-        # Axis-constrained: bbox extreme on chosen axis, midpoint on the others
-        xs = [c.x for c in coords]; ys = [c.y for c in coords]; zs = [c.z for c in coords]
-        min_co = _Vector((min(xs), min(ys), min(zs)))
-        max_co = _Vector((max(xs), max(ys), max(zs)))
-        cx = (min_co.x + max_co.x) * 0.5
-        cy = (min_co.y + max_co.y) * 0.5
-        cz = (min_co.z + max_co.z) * 0.5
-        if axis == 'X':
-            props.start = (max_co.x, cy, cz)
-            props.end   = (min_co.x, cy, cz)
-        elif axis == 'Y':
-            props.start = (cx, max_co.y, cz)
-            props.end   = (cx, min_co.y, cz)
-        else:  # Z
-            props.start = (cx, cy, max_co.z)
-            props.end   = (cx, cy, min_co.z)
+        # Axis-constrained: half-centroid + push to exact extreme so handles
+        # sit at the selection boundary, centred on the perpendicular axes.
+        ax_dir = {'X': _Vector((1.0, 0.0, 0.0)),
+                  'Y': _Vector((0.0, 1.0, 0.0)),
+                  'Z': _Vector((0.0, 0.0, 1.0))}[axis]
+        pt_start, pt_end = _half_centroids(coords, ax_dir, push_to_extreme=True)
+        props.start = tuple(pt_start)
+        props.end   = tuple(pt_end)
 
 
 # ── Falloff draw callbacks ─────────────────────────────────────────────────────
 
 def _falloff_handles_draw_callback():
-    """POST_PIXEL callback — draw the falloff tapered wedge and START/END crosshair handles.
+    """POST_PIXEL callback — draw the falloff connector line and START/END handles.
     Always visible when enabled; 'show' only controls the mesh weight overlay."""
     try:
         ctx   = bpy.context
         props = getattr(ctx.scene, 'modokit_falloff', None)
-        if props is None or not props.enabled:   # no 'show' guard — handles always visible
+        if props is None or not props.enabled:
             return
         import gpu
         from gpu_extras.batch import batch_for_shader
         from bpy_extras import view3d_utils
+        from .uv_overlays import _get_aa_line_shader, _aa_line_quads, _get_dot_shader
 
         region = ctx.region
         rv3d   = ctx.region_data
@@ -1210,49 +1296,85 @@ def _falloff_handles_draw_callback():
         ex, ey = end_s.x,   end_s.y
         # Cache for hit-testing by the hover/drag operators
         state._falloff_screen_handles = {'START': (sx, sy), 'END': (ex, ey)}
-        dx, dy = ex - sx, ey - sy
-        seg_len = math.sqrt(dx * dx + dy * dy)
-        if seg_len > 0.5:
-            px, py = -dy / seg_len, dx / seg_len   # perpendicular (90° CCW)
-        else:
-            px, py = 0.0, 1.0
 
         hover = state._falloff_hover_handle
 
         gpu.state.blend_set('ALPHA')
+        aa   = _get_aa_line_shader()
         flat = gpu.shader.from_builtin('UNIFORM_COLOR')
-        flat.bind()
+        sdot = _get_dot_shader()
 
-        # ── Tapered wedge outline only ─────────────────────────────────────────
-        # Wide at Start (100% influence), tapers to point at End (0%).
-        W = 34.0   # half-width at Start, in pixels
-        w1x = sx + px * W;  w1y = sy + py * W   # Start left edge
-        w2x = sx - px * W;  w2y = sy - py * W   # Start right edge
-        # Desaturated magenta outline
-        flat.uniform_float('color', (0.75, 0.48, 0.82, 0.85))
-        gpu.state.line_width_set(1.5)
-        batch_for_shader(flat, 'LINES', {
-            'pos': [(w1x, w1y), (w2x, w2y),
-                    (w1x, w1y), (ex,  ey),
-                    (w2x, w2y), (ex,  ey)]
-        }).draw(flat)
-        gpu.state.line_width_set(1.0)
+        def _draw_aa(segs, color, half_w):
+            if aa:
+                pos, tvs = _aa_line_quads(segs, half_w)
+                if not pos:
+                    return
+                b = batch_for_shader(aa, 'TRIS', {'pos': pos, 't': tvs})
+                aa.bind()
+                aa.uniform_float('ucolor',  color)
+                aa.uniform_float('uhalf_w', half_w)
+                b.draw(aa)
+            else:
+                pts = [p for seg in segs for p in seg]
+                flat.bind()
+                flat.uniform_float('color', color)
+                gpu.state.line_width_set((half_w - 0.5) * 2)
+                batch_for_shader(flat, 'LINES', {'pos': pts}).draw(flat)
+                gpu.state.line_width_set(1.0)
+
+        def _draw_dot(cx2, cy2, color, radius):
+            if sdot:
+                hw = radius + 2.0
+                dq = [(cx2-hw, cy2-hw), (cx2+hw, cy2-hw), (cx2+hw, cy2+hw),
+                      (cx2-hw, cy2-hw), (cx2+hw, cy2+hw), (cx2-hw, cy2+hw)]
+                b = batch_for_shader(sdot, 'TRIS', {'pos': dq})
+                sdot.bind()
+                sdot.uniform_float('ucolor',  color)
+                sdot.uniform_float('ucenter', (cx2, cy2))
+                sdot.uniform_float('uradius', radius)
+                b.draw(sdot)
+            else:
+                flat.bind()
+                flat.uniform_float('color', color)
+                segs = 16
+                vtri = []
+                for i in range(segs):
+                    a0 = math.tau * i / segs
+                    a1 = math.tau * (i + 1) / segs
+                    vtri += [(cx2, cy2),
+                             (cx2 + radius * math.cos(a0), cy2 + radius * math.sin(a0)),
+                             (cx2 + radius * math.cos(a1), cy2 + radius * math.sin(a1))]
+                batch_for_shader(flat, 'TRIS', {'pos': vtri}).draw(flat)
+
+        # ── Tapered wedge outline (wide at Start, tapers to End) ─────────────
+        dx, dy = ex - sx, ey - sy
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len > 0.5:
+            px2, py2 = -dy / seg_len, dx / seg_len   # perpendicular (90° CCW)
+        else:
+            px2, py2 = 0.0, 1.0
+        W = 34.0
+        w1x = sx + px2 * W;  w1y = sy + py2 * W
+        w2x = sx - px2 * W;  w2y = sy - py2 * W
+        wedge_col = (0.75, 0.48, 0.82, 0.85)
+        _draw_aa([((w1x, w1y), (w2x, w2y))], wedge_col, 1.5)   # base
+        _draw_aa([((w1x, w1y), (ex,  ey))],  wedge_col, 1.5)   # left side
+        _draw_aa([((w2x, w2y), (ex,  ey))],  wedge_col, 1.5)   # right side
 
         # ── 3-D crosshair handles ──────────────────────────────────────────────
-        # Project RGB XYZ arms from world space so the crosshair looks 3-D.
         cam_right = _Vector(rv3d.view_matrix.inverted().col[0][:3]).normalized()
         ref_s_start = view3d_utils.location_3d_to_region_2d(
             region, rv3d, _Vector(props.start) + cam_right)
         if ref_s_start is not None:
             ppu   = math.sqrt((ref_s_start.x - sx)**2 + (ref_s_start.y - sy)**2)
-            arm_w = max(0.001, 20.0 / ppu) if ppu > 0.01 else 0.15
+            arm_w = max(0.001, 28.0 / ppu) if ppu > 0.01 else 0.22
         else:
-            arm_w = 0.15
+            arm_w = 0.22
 
         _AX_VECS = (
-            (_Vector((1.0, 0.0, 0.0)), (0.93, 0.21, 0.31, 1.0)),   # X red
-            (_Vector((0.0, 1.0, 0.0)), (0.55, 0.86, 0.00, 1.0)),   # Y green
-            (_Vector((0.0, 0.0, 1.0)), (0.13, 0.55, 0.86, 1.0)),   # Z blue
+            (_Vector((1.0, 0.0, 0.0)), _SCALE_COL_X),
+            (_Vector((0.0, 1.0, 0.0)), _SCALE_COL_Y),
+            (_Vector((0.0, 0.0, 1.0)), _SCALE_COL_Z),
         )
 
         def _draw_handle_crosshair(center_w, dot_col):
@@ -1267,43 +1389,16 @@ def _falloff_handles_draw_callback():
                     region, rv3d, center_w + ax * arm_w)
                 if p0 is None or p1 is None:
                     continue
-                # Dark outline
-                flat.uniform_float('color', (ac[0]*0.2, ac[1]*0.2, ac[2]*0.2, 1.0))
-                gpu.state.line_width_set(3.5)
-                batch_for_shader(flat, 'LINES',
-                                 {'pos': [(p0.x, p0.y), (p1.x, p1.y)]}).draw(flat)
-                # Bright arm
-                flat.uniform_float('color', ac)
-                gpu.state.line_width_set(1.8)
-                batch_for_shader(flat, 'LINES',
-                                 {'pos': [(p0.x, p0.y), (p1.x, p1.y)]}).draw(flat)
-            gpu.state.line_width_set(1.0)
-            # Small filled dot at handle centre
-            R = 5.5
-            segs = 16
-            vtri = []
-            for i in range(segs):
-                a0 = math.tau * i / segs
-                a1 = math.tau * (i + 1) / segs
-                vtri += [(cx2, cy2),
-                         (cx2 + R * math.cos(a0), cy2 + R * math.sin(a0)),
-                         (cx2 + R * math.cos(a1), cy2 + R * math.sin(a1))]
-            # White border
-            flat.uniform_float('color', (1.0, 1.0, 1.0, 0.80))
-            Rb = R + 1.5
-            vborder = []
-            for i in range(segs):
-                a0 = math.tau * i / segs
-                a1 = math.tau * (i + 1) / segs
-                vborder += [(cx2, cy2),
-                            (cx2 + Rb * math.cos(a0), cy2 + Rb * math.sin(a0)),
-                            (cx2 + Rb * math.cos(a1), cy2 + Rb * math.sin(a1))]
-            batch_for_shader(flat, 'TRIS', {'pos': vborder}).draw(flat)
-            flat.uniform_float('color', dot_col)
-            batch_for_shader(flat, 'TRIS', {'pos': vtri}).draw(flat)
+                is_hl = (dot_col == _SCALE_COL_HL)
+                arm_col    = _SCALE_COL_HL if is_hl else ac
+                shaft_hw   = 1.5 if is_hl else 0.9
+                _draw_aa([((p0.x, p0.y), (p1.x, p1.y))], arm_col, shaft_hw * 0.5 + 1.0)
+            # Center dot — white normally, yellow when hovered
+            dot_r = _SCALE_DOT_R * 1.3 if dot_col == _SCALE_COL_HL else _SCALE_DOT_R
+            _draw_dot(cx2, cy2, dot_col, dot_r)
 
-        start_col = (1.0, 0.95, 0.3, 1.0)  if hover == 'START' else _FALLOFF_COL_START
-        end_col   = (0.6,  0.1, 1.0, 1.0)  if hover == 'END'   else _FALLOFF_COL_END
+        start_col = _SCALE_COL_HL if hover == 'START' else _SCALE_COL_WHITE
+        end_col   = _SCALE_COL_HL if hover == 'END'   else _SCALE_COL_WHITE
         _draw_handle_crosshair(_Vector(props.start), start_col)
         _draw_handle_crosshair(_Vector(props.end),   end_col)
 
@@ -1671,6 +1766,31 @@ class VIEW3D_OT_modo_falloff_reverse(bpy.types.Operator):
         props.end   = old_start
         if context.area:
             context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# ── VIEW3D_OT_modo_falloff_disable  (set falloff to none) ─────────────────────
+
+class VIEW3D_OT_modo_falloff_disable(bpy.types.Operator):
+    """Set falloff to (none) — turns off Modo-style linear falloff."""
+    bl_idname  = 'view3d.modo_falloff_disable'
+    bl_label   = 'Disable Falloff'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.space_data is not None
+                and context.space_data.type == 'VIEW_3D'
+                and context.mode in ('OBJECT', 'EDIT_MESH'))
+
+    def execute(self, context):
+        props = context.scene.modokit_falloff
+        if props.enabled:
+            props.enabled = False
+            _stop_falloff_handles()
+            _stop_falloff_mesh_overlay()
+            if context.area:
+                context.area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -2335,8 +2455,21 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
 
     def execute(self, context):
         """Apply the scale — called on first finish (from modal) and on redo."""
+        falloff_props = getattr(context.scene, 'modokit_falloff', None)
+        use_falloff   = (falloff_props is not None and falloff_props.enabled)
+        has_live_data = hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices')
+
+        if has_live_data and use_falloff:
+            # Falloff active: live preview already has the correct weighted
+            # state.  Re-apply once to be safe then confirm directly —
+            # restore + resize would overwrite the falloff-weighted result.
+            self._apply_live(context, self._last_s)
+            self._orig_verts    = {}
+            self._orig_matrices = {}
+            return {'FINISHED'}
+
         # On first call from modal the mesh is still in preview state; restore first.
-        if hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices'):
+        if has_live_data:
             self._restore(context)
         sv = (self.scale_x / 100.0, self.scale_y / 100.0, self.scale_z / 100.0)
         if all(abs(v - 1.0) < 1e-9 for v in sv):
@@ -2398,6 +2531,646 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
 
         if event.type == 'V' and event.value == 'PRESS':
             result = self._commit(context, -1.0)
+            if context.area:
+                context.area.tag_redraw()
+            return result
+
+        if event.type in ('RIGHTMOUSE', 'ESC'):
+            self._restore(context)
+            if context.area:
+                context.area.tag_redraw()
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+
+# ── Move Gizmo ────────────────────────────────────────────────────────────────
+# Custom POST_PIXEL 3-D move gizmo that mirrors the scale gizmo's visual style.
+#
+# Handles:  X / Y / Z axis arrows  ·  XY / XZ / YZ plane squares  ·  XYZ dot
+# Draw:     same AA-line + SDF-dot shaders as the scale gizmo
+# Drag:     live bmesh / matrix preview → confirms via transform.translate (undo)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MOVE_ARM_PX     = 118.0  # arm length in region pixels
+_MOVE_GAP_PX     = 21.0   # gap at pivot before arm starts
+_MOVE_CONE_H_FRAC = 0.18  # cone height as fraction of arm (world space)
+_MOVE_CONE_R_FRAC = 0.065 # cone base radius as fraction of arm (world space)
+_MOVE_CONE_SEGS   = 12    # segments for cone base circle
+_MOVE_PLANE_FRAC  = 0.54  # plane handles at this fraction of arm length
+_MOVE_PLANE_SZ  = 8.0    # half-size of plane square side
+_MOVE_DOT_R     = 6.0    # radius of XYZ dot
+_MOVE_HIT_R     = 20.0   # pixel hit radius for axis tips and plane centers
+_MOVE_DOT_HIT_R = 12.0   # pixel hit radius for center dot
+
+
+def _move_gizmo_draw_callback():
+    """POST_PIXEL callback — Blender-style move gizmo drawn as 2-D screen overlay."""
+    if state._active_transform_mode != 'TRANSLATE':
+        return
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        from bpy_extras import view3d_utils
+
+        from .uv_overlays import _get_aa_line_shader, _aa_line_quads, _get_dot_shader
+
+        ctx    = bpy.context
+        region = ctx.region
+        rv3d   = ctx.region_data
+        if region is None or rv3d is None:
+            return
+
+        pivot_w = _sg_get_pivot_world(ctx)
+        if pivot_w is None:
+            return
+
+        orient = _sg_get_orient_matrix_3x3(ctx)
+
+        pivot_s = view3d_utils.location_3d_to_region_2d(region, rv3d, pivot_w)
+        if pivot_s is None:
+            return
+        px, py = pivot_s.x, pivot_s.y
+
+        ARM  = _MOVE_ARM_PX
+        GAP  = _MOVE_GAP_PX
+        PF   = _MOVE_PLANE_FRAC
+        PSZ  = _MOVE_PLANE_SZ
+        DOTR = _MOVE_DOT_R
+
+        axis_vecs = {
+            'X': _Vector(orient.col[0]).normalized(),
+            'Y': _Vector(orient.col[1]).normalized(),
+            'Z': _Vector(orient.col[2]).normalized(),
+        }
+
+        cam_right = _Vector(rv3d.view_matrix.inverted().col[0][:3]).normalized()
+        cam_pos_w = _Vector(rv3d.view_matrix.inverted().col[3][:3])
+        ref_s = view3d_utils.location_3d_to_region_2d(
+            region, rv3d, pivot_w + cam_right)
+        if ref_s is not None:
+            ppu = math.sqrt((ref_s.x - px)**2 + (ref_s.y - py)**2)
+            arm_world = ARM / ppu if ppu > 0.1 else ARM / 100.0
+        else:
+            arm_world = ARM / 100.0
+        sz_world  = arm_world * PSZ / ARM
+        gap_world = arm_world * GAP / ARM
+
+        xu = axis_vecs['X'];  yv = axis_vecs['Y'];  zw = axis_vecs['Z']
+
+        view_fwd = _Vector(rv3d.view_matrix.row[2][:3]).normalized()
+        if rv3d.is_perspective:
+            cam_to_pivot = (pivot_w - cam_pos_w).normalized()
+        else:
+            cam_to_pivot = view_fwd
+
+        screen_dirs = {}
+        arm_ends    = {}
+        axis_fades  = {}
+        for name, ax in axis_vecs.items():
+            dot = abs(cam_to_pivot.dot(ax))
+            FADE_START, FADE_END = 0.88, 0.98
+            if dot >= FADE_END:
+                axis_fades[name] = 0.0
+                screen_dirs[name] = arm_ends[name] = None
+                continue
+            elif dot > FADE_START:
+                axis_fades[name] = 1.0 - (dot - FADE_START) / (FADE_END - FADE_START)
+            else:
+                axis_fades[name] = 1.0
+            end_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, pivot_w + ax * arm_world)
+            if end_s is None:
+                screen_dirs[name] = arm_ends[name] = None
+                continue
+            dx = end_s.x - px;  dy = end_s.y - py
+            dl = math.sqrt(dx * dx + dy * dy)
+            if dl < 1.0:
+                screen_dirs[name] = arm_ends[name] = None
+                continue
+            screen_dirs[name] = (dx / dl, dy / dl)
+            arm_ends[name]    = (end_s.x, end_s.y)
+
+        plane_centers = {}
+        plane_corners = {}
+        for pa, pb in (('X', 'Y'), ('X', 'Z'), ('Y', 'Z')):
+            da = screen_dirs.get(pa);  db = screen_dirs.get(pb)
+            if da is None or db is None:
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
+                continue
+            cross = abs(da[0]*db[1] - da[1]*db[0])
+            if cross < 0.22:
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
+                continue
+            ax_a = axis_vecs[pa];  ax_b = axis_vecs[pb]
+            ctr_w = pivot_w + (ax_a + ax_b) * (arm_world * PF)
+            ctr_s = view3d_utils.location_3d_to_region_2d(region, rv3d, ctr_w)
+            if ctr_s is None:
+                plane_centers[pa+pb] = plane_corners[pa+pb] = None
+                continue
+            plane_centers[pa+pb] = (ctr_s.x, ctr_s.y)
+            c1_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w + ax_a * sz_world + ax_b * sz_world)
+            c2_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w - ax_a * sz_world + ax_b * sz_world)
+            c3_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w - ax_a * sz_world - ax_b * sz_world)
+            c4_s = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, ctr_w + ax_a * sz_world - ax_b * sz_world)
+            if None in (c1_s, c2_s, c3_s, c4_s):
+                plane_corners[pa+pb] = None
+            else:
+                plane_corners[pa+pb] = (
+                    (c1_s.x, c1_s.y), (c2_s.x, c2_s.y),
+                    (c3_s.x, c3_s.y), (c4_s.x, c4_s.y),
+                )
+
+        # Cache screen positions for hit testing
+        state._move_gizmo_screen_handles = {
+            'pivot': (px, py),
+            'X': arm_ends.get('X'), 'Y': arm_ends.get('Y'), 'Z': arm_ends.get('Z'),
+            'XY': plane_centers.get('XY'),
+            'XZ': plane_centers.get('XZ'),
+            'YZ': plane_centers.get('YZ'),
+            'X_dir': screen_dirs.get('X'),
+            'Y_dir': screen_dirs.get('Y'),
+            'Z_dir': screen_dirs.get('Z'),
+        }
+
+        hover   = state._move_gizmo_hover
+        aa      = _get_aa_line_shader()
+        flat    = gpu.shader.from_builtin('UNIFORM_COLOR')
+        sdot    = _get_dot_shader()
+        gpu.state.blend_set('ALPHA')
+
+        def _draw_aa(segs, color, half_w):
+            if aa:
+                pos, tvs = _aa_line_quads(segs, half_w)
+                if not pos:
+                    return
+                b = batch_for_shader(aa, 'TRIS', {'pos': pos, 't': tvs})
+                aa.bind()
+                aa.uniform_float('ucolor',  color)
+                aa.uniform_float('uhalf_w', half_w)
+                b.draw(aa)
+            else:
+                pts = [p for seg in segs for p in seg]
+                flat.bind()
+                flat.uniform_float('color', color)
+                gpu.state.line_width_set((half_w - 0.5) * 2)
+                batch_for_shader(flat, 'LINES', {'pos': pts}).draw(flat)
+                gpu.state.line_width_set(1.0)
+
+        def _draw_flat(verts, color):
+            flat.bind()
+            flat.uniform_float('color', color)
+            batch_for_shader(flat, 'TRIS', {'pos': verts}).draw(flat)
+
+        # ── Axis arms + arrow-head handles ───────────────────────────────────
+        axis_colors = {'X': _SCALE_COL_X, 'Y': _SCALE_COL_Y, 'Z': _SCALE_COL_Z}
+        for aname, base_col in axis_colors.items():
+            end = arm_ends.get(aname)
+            if end is None:
+                continue
+            ex, ey = end
+            sd = screen_dirs.get(aname)
+            fade = axis_fades.get(aname, 1.0)
+
+            hover_hit = (hover == aname
+                         or (len(hover) == 2 and aname in hover)
+                         or hover == 'XYZ')
+            if hover_hit:
+                color = _SCALE_COL_HL
+            else:
+                color = (base_col[0], base_col[1], base_col[2], base_col[3] * fade)
+            shaft_hw = 1.5 if hover_hit else 0.9
+
+            # Build 3D cone geometry for this axis
+            ax_v         = axis_vecs[aname]
+            cone_h_world = arm_world * _MOVE_CONE_H_FRAC
+            cone_r_world = arm_world * _MOVE_CONE_R_FRAC
+            base_ctr_w   = pivot_w + ax_v * (arm_world - cone_h_world)
+            apex_w       = pivot_w + ax_v * arm_world
+
+            # Shaft: gap → cone base (world-space projected)
+            shaft_start_w = pivot_w + ax_v * gap_world
+            ss_s = view3d_utils.location_3d_to_region_2d(region, rv3d, shaft_start_w)
+            sc_s = view3d_utils.location_3d_to_region_2d(region, rv3d, base_ctr_w)
+            if ss_s is not None and sc_s is not None:
+                _draw_aa([((ss_s.x, ss_s.y), (sc_s.x, sc_s.y))], color, shaft_hw * 0.5 + 1.0)
+
+            # ── 3-D cone (world-space verts projected to screen) ──────────────
+            if abs(ax_v.x) < 0.9:
+                perp1 = ax_v.cross(_Vector((1.0, 0.0, 0.0))).normalized()
+            else:
+                perp1 = ax_v.cross(_Vector((0.0, 1.0, 0.0))).normalized()
+            perp2 = ax_v.cross(perp1).normalized()
+
+            base_vw = []
+            base_vs = []
+            for ci in range(_MOVE_CONE_SEGS):
+                ang  = math.tau * ci / _MOVE_CONE_SEGS
+                bp_w = base_ctr_w + cone_r_world * (
+                    math.cos(ang) * perp1 + math.sin(ang) * perp2)
+                bp_s = view3d_utils.location_3d_to_region_2d(region, rv3d, bp_w)
+                base_vw.append(bp_w)
+                base_vs.append(bp_s)
+
+            apex_ss = view3d_utils.location_3d_to_region_2d(region, rv3d, apex_w)
+            if apex_ss is not None and all(p is not None for p in base_vs):
+                base_ctr_ss = view3d_utils.location_3d_to_region_2d(
+                    region, rv3d, base_ctr_w)
+                cap_ndot = (cam_pos_w - base_ctr_w).normalized().dot(-ax_v)
+                cap_facing = (base_ctr_ss is not None and cap_ndot > 0)
+
+                # Pre-compute per-side visibility and shading
+                side_shade  = []   # ndot for each side face (0 = back-facing)
+                side_facing = []
+                for ci in range(_MOVE_CONE_SEGS):
+                    cj  = (ci + 1) % _MOVE_CONE_SEGS
+                    e0  = base_vw[ci] - apex_w
+                    e1  = base_vw[cj] - apex_w
+                    nm  = e0.cross(e1)
+                    nl  = nm.length
+                    if nl < 1e-10:
+                        side_shade.append(0.0); side_facing.append(False); continue
+                    nn  = nm / nl
+                    fctr = (apex_w + base_vw[ci] + base_vw[cj]) * (1.0 / 3.0)
+                    nd  = (cam_pos_w - fctr).normalized().dot(nn)
+                    side_shade.append(max(0.0, nd))
+                    side_facing.append(nd > 0.0)
+
+                # ── Cap fill (no edges) ───────────────────────────────────────
+                if cap_facing and base_ctr_ss is not None:
+                    cap_shade = 0.3 + 0.7 * cap_ndot
+                    cap_col   = (color[0], color[1], color[2], color[3] * cap_shade)
+                    cap = []
+                    for ci in range(_MOVE_CONE_SEGS):
+                        cj = (ci + 1) % _MOVE_CONE_SEGS
+                        bsi, bsj = base_vs[ci], base_vs[cj]
+                        cap += [(base_ctr_ss.x, base_ctr_ss.y),
+                                (bsi.x, bsi.y), (bsj.x, bsj.y)]
+                    _draw_flat(cap, cap_col)
+
+                # ── Side fills (no edges) ─────────────────────────────────────
+                for ci in range(_MOVE_CONE_SEGS):
+                    if not side_facing[ci]:
+                        continue
+                    cj = (ci + 1) % _MOVE_CONE_SEGS
+                    bsi, bsj = base_vs[ci], base_vs[cj]
+                    face_col = (color[0], color[1], color[2],
+                                color[3] * (0.3 + 0.7 * side_shade[ci]))
+                    _draw_flat([(apex_ss.x, apex_ss.y),
+                                (bsi.x, bsi.y), (bsj.x, bsj.y)], face_col)
+
+                # ── Silhouette edges only: draw where visibility changes ───────
+                sil = []
+                for ci in range(_MOVE_CONE_SEGS):
+                    cj = (ci + 1) % _MOVE_CONE_SEGS
+                    # Lateral edge apex→base[ci]: shared by face[ci-1] and face[ci]
+                    ci_prev = (ci - 1) % _MOVE_CONE_SEGS
+                    if side_facing[ci] != side_facing[ci_prev]:
+                        bsi = base_vs[ci]
+                        sil.append(((apex_ss.x, apex_ss.y), (bsi.x, bsi.y)))
+                    # Base ring edge base[ci]→base[ci+1]: shared by side[ci] and cap
+                    if side_facing[ci] != cap_facing:
+                        bsi, bsj = base_vs[ci], base_vs[cj]
+                        sil.append(((bsi.x, bsi.y), (bsj.x, bsj.y)))
+                if sil:
+                    _draw_aa(sil, color, 1.5)
+
+        # ── Plane handles ─────────────────────────────────────────────────────
+        plane_axis_cols = {
+            'XY': (_SCALE_COL_X, _SCALE_COL_Y),
+            'XZ': (_SCALE_COL_X, _SCALE_COL_Z),
+            'YZ': (_SCALE_COL_Y, _SCALE_COL_Z),
+        }
+        for pname, (col_a, col_b) in plane_axis_cols.items():
+            corners = plane_corners.get(pname)
+            if corners is None:
+                continue
+            is_hl = (hover == pname)
+            fa = axis_fades.get(pname[0], 1.0)
+            fb = axis_fades.get(pname[1], 1.0)
+            plane_fade = fa * fb
+            if plane_fade <= 0.0:
+                continue
+            blend_r = (col_a[0] + col_b[0]) * 0.5
+            blend_g = (col_a[1] + col_b[1]) * 0.5
+            blend_b = (col_a[2] + col_b[2]) * 0.5
+            fill_col   = (blend_r, blend_g, blend_b, (0.35 if is_hl else 0.18) * plane_fade)
+            border_col = _SCALE_COL_HL if is_hl else (blend_r, blend_g, blend_b, 0.85 * plane_fade)
+            c1, c2, c3, c4 = corners
+            _draw_flat([c1, c2, c3, c1, c3, c4], fill_col)
+            _draw_aa([(c1, c2), (c2, c3), (c3, c4), (c4, c1)], border_col, 1.5)
+
+        # ── Centre dot (XYZ screen-space move) ───────────────────────────────
+        dot_col = _SCALE_COL_HL if hover == 'XYZ' else _SCALE_COL_WHITE
+        dot_r   = DOTR * 1.3   if hover == 'XYZ' else DOTR
+        if sdot:
+            hw = dot_r + 2.0
+            dq = [(px-hw, py-hw), (px+hw, py-hw), (px+hw, py+hw),
+                  (px-hw, py-hw), (px+hw, py+hw), (px-hw, py+hw)]
+            b = batch_for_shader(sdot, 'TRIS', {'pos': dq})
+            sdot.bind()
+            sdot.uniform_float('ucolor',   dot_col)
+            sdot.uniform_float('ucenter',  (px, py))
+            sdot.uniform_float('uradius',  dot_r)
+            b.draw(sdot)
+
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+
+def _start_move_gizmo():
+    if state._move_gizmo_draw_handle is None:
+        state._move_gizmo_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _move_gizmo_draw_callback, (), 'WINDOW', 'POST_PIXEL')
+
+
+def _stop_move_gizmo():
+    if state._move_gizmo_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                state._move_gizmo_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._move_gizmo_draw_handle = None
+    state._move_gizmo_screen_handles = {}
+    state._move_gizmo_hover = ''
+    try:
+        sv3d = bpy.context.space_data
+        if sv3d and sv3d.type == 'VIEW_3D':
+            sv3d.show_gizmo_tool = True
+            sv3d.show_gizmo_object_translate = state._move_gizmo_saved_translate
+    except Exception:
+        pass
+    try:
+        if bpy.context.area:
+            bpy.context.area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _mg_hit_test(mx, my):
+    """Return the handle name at screen pos (mx, my), or '' if none."""
+    h = state._move_gizmo_screen_handles
+    if not h:
+        return ''
+
+    pivot = h.get('pivot')
+    if pivot:
+        if math.sqrt((mx-pivot[0])**2 + (my-pivot[1])**2) <= _MOVE_DOT_HIT_R:
+            return 'XYZ'
+
+    _SHAFT_HIT_R = 8.0
+
+    def _seg_dist(ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        lsq = dx*dx + dy*dy
+        if lsq < 1e-6:
+            return math.sqrt((mx-ax)**2 + (my-ay)**2)
+        t = max(0.0, min(1.0, ((mx-ax)*dx + (my-ay)*dy) / lsq))
+        return math.sqrt((mx - ax - t*dx)**2 + (my - ay - t*dy)**2)
+
+    best, best_d = '', float('inf')
+    px2, py2 = pivot if pivot else (mx, my)
+
+    for name in ('X', 'Y', 'Z'):
+        pos = h.get(name)
+        if pos is None:
+            continue
+        d_tip   = math.sqrt((mx-pos[0])**2 + (my-pos[1])**2)
+        d_shaft = _seg_dist(px2, py2, pos[0], pos[1])
+        if d_tip <= _MOVE_HIT_R and d_tip < best_d:
+            best_d, best = d_tip, name
+        elif d_shaft <= _SHAFT_HIT_R and d_shaft < best_d:
+            best_d, best = d_shaft, name
+
+    for name in ('XY', 'XZ', 'YZ'):
+        pos = h.get(name)
+        if pos is None:
+            continue
+        d = math.sqrt((mx-pos[0])**2 + (my-pos[1])**2)
+        if d <= _MOVE_HIT_R and d < best_d:
+            best_d, best = d, name
+    return best
+
+
+# ── VIEW3D_OT_modo_move_gizmo_hover  (MOUSEMOVE) ─────────────────────────────
+
+class VIEW3D_OT_modo_move_gizmo_hover(bpy.types.Operator):
+    """MOUSEMOVE: update move gizmo hover highlight."""
+    bl_idname  = 'view3d.modo_move_gizmo_hover'
+    bl_label   = 'Move Gizmo Hover'
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return (state._active_transform_mode == 'TRANSLATE'
+                and context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
+                and context.space_data.type == 'VIEW_3D')
+
+    def invoke(self, context, event):
+        hit = _mg_hit_test(event.mouse_region_x, event.mouse_region_y)
+        if hit != state._move_gizmo_hover:
+            state._move_gizmo_hover = hit
+            if context.area:
+                context.area.tag_redraw()
+        return {'PASS_THROUGH'}
+
+
+# ── VIEW3D_OT_modo_move_gizmo_drag  (LMB modal) ──────────────────────────────
+
+class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
+    """LMB on a move gizmo handle: drag to translate."""
+    bl_idname  = 'view3d.modo_move_gizmo_drag'
+    bl_label   = 'Move Gizmo Drag'
+    bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
+
+    delta_x:     FloatProperty(name="X",  default=0.0, options={'HIDDEN'})
+    delta_y:     FloatProperty(name="Y",  default=0.0, options={'HIDDEN'})
+    delta_z:     FloatProperty(name="Z",  default=0.0, options={'HIDDEN'})
+    orient_type: StringProperty(name="Orientation", default="GLOBAL",
+                                options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return (state._active_transform_mode == 'TRANSLATE'
+                and context.region is not None
+                and context.region.type == 'WINDOW'
+                and context.space_data is not None
+                and context.space_data.type == 'VIEW_3D'
+                and context.mode in ('OBJECT', 'EDIT_MESH'))
+
+    def invoke(self, context, event):
+        mx, my = event.mouse_region_x, event.mouse_region_y
+        hit = _mg_hit_test(mx, my)
+        if not hit:
+            return {'PASS_THROUGH'}
+
+        self._axis     = hit
+        self._start_mx = mx
+        self._start_my = my
+        self._last_delta = _Vector((0.0, 0.0, 0.0))
+
+        pivot = _sg_get_pivot_world(context)
+        if pivot is None:
+            return {'CANCELLED'}
+        self._pivot_w  = pivot
+        self._orient   = _sg_get_orient_matrix_3x3(context)
+        self._orient_t = context.scene.transform_orientation_slots[0].type
+
+        # Capture originals for live preview and restore
+        self._orig_verts    = {}
+        self._orig_matrices = {}
+        if context.mode == 'EDIT_MESH':
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                mx_w = obj.matrix_world
+                self._orig_verts[obj.name] = {
+                    v.index: (mx_w @ v.co).copy()
+                    for v in bm.verts if v.select
+                }
+        elif context.mode == 'OBJECT':
+            for obj in context.selected_objects:
+                self._orig_matrices[obj.name] = obj.matrix_world.copy()
+
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    # ── delta computation ─────────────────────────────────────────────────────
+
+    def _compute_delta(self, mx, my, context):
+        from bpy_extras import view3d_utils
+        region = context.region
+        rv3d   = context.region_data
+        if region is None or rv3d is None:
+            return _Vector((0.0, 0.0, 0.0))
+        start_3d = view3d_utils.region_2d_to_location_3d(
+            region, rv3d, (self._start_mx, self._start_my), self._pivot_w)
+        cur_3d   = view3d_utils.region_2d_to_location_3d(
+            region, rv3d, (mx, my), self._pivot_w)
+        if start_3d is None or cur_3d is None:
+            return _Vector((0.0, 0.0, 0.0))
+        raw = cur_3d - start_3d
+        orient = self._orient
+        xu = _Vector(orient.col[0]).normalized()
+        yv = _Vector(orient.col[1]).normalized()
+        zw = _Vector(orient.col[2]).normalized()
+        a = self._axis
+        if a == 'X':   return raw.dot(xu) * xu
+        if a == 'Y':   return raw.dot(yv) * yv
+        if a == 'Z':   return raw.dot(zw) * zw
+        if a == 'XY':  return raw.dot(xu) * xu + raw.dot(yv) * yv
+        if a == 'XZ':  return raw.dot(xu) * xu + raw.dot(zw) * zw
+        if a == 'YZ':  return raw.dot(yv) * yv + raw.dot(zw) * zw
+        return raw   # XYZ — screen-space move
+
+    # ── apply / restore ───────────────────────────────────────────────────────
+
+    def _apply_live(self, context, delta):
+        falloff_props = getattr(context.scene, 'modokit_falloff', None)
+        use_falloff   = (falloff_props is not None and falloff_props.enabled)
+        if context.mode == 'EDIT_MESH':
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                inv = obj.matrix_world.inverted()
+                for vi, orig_w in self._orig_verts.get(obj.name, {}).items():
+                    if vi < len(bm.verts):
+                        new_w = orig_w + delta
+                        if use_falloff:
+                            w = _falloff_linear_weight(orig_w, falloff_props)
+                            bm.verts[vi].co = inv @ orig_w.lerp(new_w, w)
+                        else:
+                            bm.verts[vi].co = inv @ new_w
+                bmesh.update_edit_mesh(obj.data, destructive=False)
+        elif context.mode == 'OBJECT':
+            for obj in context.selected_objects:
+                orig = self._orig_matrices.get(obj.name)
+                if orig is not None:
+                    new_mx = orig.copy()
+                    new_mx.translation = orig.translation + delta
+                    obj.matrix_world = new_mx
+
+    def _restore(self, context):
+        if context.mode == 'EDIT_MESH':
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                inv = obj.matrix_world.inverted()
+                for vi, orig_w in self._orig_verts.get(obj.name, {}).items():
+                    if vi < len(bm.verts):
+                        bm.verts[vi].co = inv @ orig_w
+                bmesh.update_edit_mesh(obj.data, destructive=False)
+        elif context.mode == 'OBJECT':
+            for obj in context.selected_objects:
+                orig = self._orig_matrices.get(obj.name)
+                if orig is not None:
+                    obj.matrix_world = orig
+
+    def execute(self, context):
+        """Apply the translation — called on commit and on redo."""
+        falloff_props = getattr(context.scene, 'modokit_falloff', None)
+        use_falloff   = (falloff_props is not None and falloff_props.enabled)
+        has_live_data = hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices')
+
+        if has_live_data and use_falloff:
+            # Falloff active: re-apply the final delta once and confirm
+            # directly — restore + translate would lose the falloff weighting.
+            self._apply_live(context, self._last_delta)
+            self._orig_verts    = {}
+            self._orig_matrices = {}
+            return {'FINISHED'}
+
+        if has_live_data:
+            self._restore(context)
+        delta = _Vector((self.delta_x, self.delta_y, self.delta_z))
+        if delta.length < 1e-9:
+            return {'FINISHED'}
+        try:
+            bpy.ops.transform.translate(
+                'EXEC_DEFAULT',
+                value=delta,
+                orient_type='GLOBAL',
+                constraint_axis=(False, False, False),
+            )
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+    def _commit(self, context, delta):
+        self.delta_x     = delta.x
+        self.delta_y     = delta.y
+        self.delta_z     = delta.z
+        self.orient_type = self._orient_t
+        return self.execute(context)
+
+    # ── modal ─────────────────────────────────────────────────────────────────
+
+    def modal(self, context, event):
+        if event.type == 'MOUSEMOVE':
+            delta = self._compute_delta(
+                event.mouse_region_x, event.mouse_region_y, context)
+            self._last_delta = delta
+            self._apply_live(context, delta)
+            if context.area:
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            result = self._commit(context, self._last_delta)
             if context.area:
                 context.area.tag_redraw()
             return result
