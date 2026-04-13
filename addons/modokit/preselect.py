@@ -1057,7 +1057,9 @@ def _preselect_draw_uv_inner():
     except Exception:
         return
 
-    if _is_transforming(context) or state._uv_lmb_down or state._uv_active_transform_mode is not None:
+    if (_is_transforming(context) or state._uv_lmb_down
+            or state._uv_active_transform_mode is not None
+            or state._active_transform_mode is not None):
         if state._preselect_hits:
             state._preselect_hits = []
         return
