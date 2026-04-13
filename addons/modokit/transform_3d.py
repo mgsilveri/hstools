@@ -2991,9 +2991,9 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
     bl_label   = 'Move Gizmo Drag'
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    delta_x:     FloatProperty(name="X",  default=0.0, options={'HIDDEN'})
-    delta_y:     FloatProperty(name="Y",  default=0.0, options={'HIDDEN'})
-    delta_z:     FloatProperty(name="Z",  default=0.0, options={'HIDDEN'})
+    delta_x:     FloatProperty(name="X",  default=0.0, subtype='DISTANCE', unit='LENGTH')
+    delta_y:     FloatProperty(name="Y",  default=0.0, subtype='DISTANCE', unit='LENGTH')
+    delta_z:     FloatProperty(name="Z",  default=0.0, subtype='DISTANCE', unit='LENGTH')
     orient_type: StringProperty(name="Orientation", default="GLOBAL",
                                 options={'HIDDEN'})
 
@@ -3152,12 +3152,20 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             bpy.ops.transform.translate(
                 'EXEC_DEFAULT',
                 value=delta,
-                orient_type='GLOBAL',
+                orient_type=self.orient_type,
                 constraint_axis=(False, False, False),
             )
         except Exception:
             pass
         return {'FINISHED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        col = layout.column(align=True)
+        col.prop(self, 'delta_x', text="Move X")
+        col.prop(self, 'delta_y', text="Y")
+        col.prop(self, 'delta_z', text="Z")
 
     def _commit(self, context, delta):
         self.delta_x     = delta.x
