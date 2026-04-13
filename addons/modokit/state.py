@@ -84,6 +84,13 @@ _move_gizmo_saved_translate: bool = True   # saved show_gizmo_object_translate v
 # ── Linear Falloff ─────────────────────────────────────────────────────────────
 _falloff_draw_handle        = None   # handles + gradient line (POST_PIXEL)
 _falloff_mesh_draw_handle   = None   # per-vertex weight overlay (POST_VIEW)
+
+# ── Workplane ─────────────────────────────────────────────────────────────────
+_workplane_draw_handle      = None   # grid overlay (POST_VIEW)
+# Saved show_floor / show_axis_x / show_axis_y per SpaceView3D (by id).
+_workplane_saved_overlays: dict = {}
+# Saved transform orientation slot type (and custom name) before workplane activated.
+_workplane_saved_orientation: dict = {}   # e.g. {'type': 'GLOBAL'} or {'type': 'CUSTOM', 'name': 'MyOrient'}
 _falloff_hover_handle: str  = ''     # 'START' | 'END' | ''
 _falloff_define_active: bool = False  # True while drag-to-define modal is running# Cached per-frame screen-space positions for hit-testing (set by draw callback).
 # Keys: 'START' → (sx, sy), 'END' → (ex, ey) — region pixel coords.
@@ -143,6 +150,14 @@ _registered_kmi_ids = []
 _disabled_kmi_ids = []
 _saved_rmb_menus = {}
 
+# Operators the user may assign manual shortcuts to but that the addon never
+# programmatically registers via keymap_items.new.  These must be excluded from
+# all purge / adoption loops so user-defined bindings (e.g. Alt+D → workplane
+# toggle) survive addon restarts.
+_NEVER_AUTO_REGISTER_IDNAMES = {
+    'view3d.modo_workplane',
+}
+
 _OUR_IDNAMES = {
     'mesh.modo_select_element_under_mouse',
     'mesh.modo_select_shortest_path',
@@ -161,6 +176,8 @@ _OUR_IDNAMES = {
     'view3d.modo_move_gizmo_drag',
     'view3d.modo_linear_falloff',
     'view3d.modo_falloff_handle_hover',
+    'view3d.modo_workplane',
+    'view3d.modo_workplane_home',
     'view3d.modo_falloff_handle_drag',
     'view3d.modo_preselect_highlight',
     'image.modo_preselect_highlight',

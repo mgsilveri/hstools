@@ -71,6 +71,7 @@ def _draw_uv_overlays_panel(self, context):
 
 _ALL_CLASSES = (
     transform_3d.ModoKitFalloffProps,
+    transform_3d.ModoKitWorkplaneProps,
     prefs.ModoSelectionPreferences,
     prefs.MODOKIT_OT_perf_report,
     preselect.VIEW3D_OT_modo_preselect_highlight,
@@ -105,6 +106,8 @@ _ALL_CLASSES = (
     transform_3d.VIEW3D_OT_modo_falloff_disable,
     transform_3d.VIEW3D_OT_modo_falloff_handle_hover,
     transform_3d.VIEW3D_OT_modo_falloff_handle_drag,
+    transform_3d.VIEW3D_OT_modo_workplane,
+    transform_3d.VIEW3D_OT_modo_workplane_home,
     uv_snap.IMAGE_OT_modo_uv_snap_highlight,
     ops_uv.IMAGE_OT_modo_uv_transform,
     ops_uv.IMAGE_OT_modo_uv_component_mode,
@@ -133,6 +136,10 @@ def register():
     # Falloff scene property
     bpy.types.Scene.modokit_falloff = bpy.props.PointerProperty(
         type=transform_3d.ModoKitFalloffProps)
+
+    # Workplane scene property
+    bpy.types.Scene.modokit_workplane = bpy.props.PointerProperty(
+        type=transform_3d.ModoKitWorkplaneProps)
 
     # Pre-selection highlight handler
     if preselect._preselect_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
@@ -350,9 +357,17 @@ def unregister():
     transform_3d._stop_falloff_handles()
     transform_3d._stop_falloff_mesh_overlay()
 
-    # Remove scene property
+    # Stop workplane grid overlay
+    transform_3d._stop_workplane_overlay()
+    transform_3d._workplane_restore_floor()
+
+    # Remove scene properties
     try:
         del bpy.types.Scene.modokit_falloff
+    except Exception:
+        pass
+    try:
+        del bpy.types.Scene.modokit_workplane
     except Exception:
         pass
 

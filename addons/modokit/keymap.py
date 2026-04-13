@@ -119,11 +119,15 @@ def register_keymaps():
     prefs = get_addon_preferences(bpy.context)
 
     # Purge stale entries for OUR operators saved from a previous session.
+    # Skip operators in _NEVER_AUTO_REGISTER_IDNAMES — those are never
+    # programmatically registered so any existing entry is user-defined and
+    # must be preserved (e.g. a user-assigned Alt+D → workplane toggle).
     kc_purge = wm.keyconfigs.user
     if kc_purge:
         for _km in kc_purge.keymaps:
             _stale = [_kmi for _kmi in _km.keymap_items
-                      if _kmi.idname in state._OUR_IDNAMES]
+                      if (_kmi.idname in state._OUR_IDNAMES
+                          and _kmi.idname not in state._NEVER_AUTO_REGISTER_IDNAMES)]
             for _kmi in _stale:
                 try:
                     _km.keymap_items.remove(_kmi)
@@ -679,6 +683,14 @@ def register_keymaps():
             )
             state.addon_keymaps.append((km_nav, kmi))
 
+            # Home — snap workplane to geometry under mouse (all 3D-view keymaps)
+            for target_km in (km_nav, km_obj, km):
+                kmi = target_km.keymap_items.new(
+                    'view3d.modo_workplane_home',
+                    type='HOME', value='PRESS', head=True,
+                )
+                state.addon_keymaps.append((target_km, kmi))
+
     # Build identity tuples for all registered items
     state._registered_kmi_ids.clear()
     for km, kmi in state.addon_keymaps:
@@ -894,7 +906,8 @@ def unregister_keymaps():
 
         for km in kc_user.keymaps:
             stale = [kmi for kmi in km.keymap_items
-                     if kmi.idname in state._OUR_IDNAMES]
+                     if (kmi.idname in state._OUR_IDNAMES
+                         and kmi.idname not in state._NEVER_AUTO_REGISTER_IDNAMES)]
             for kmi in stale:
                 try:
                     km.keymap_items.remove(kmi)
@@ -935,7 +948,8 @@ def _deferred_keymap_setup():
                     (km, kmi)
                     for km in kc_user.keymaps
                     for kmi in km.keymap_items
-                    if kmi.idname in state._OUR_IDNAMES
+                    if (kmi.idname in state._OUR_IDNAMES
+                        and kmi.idname not in state._NEVER_AUTO_REGISTER_IDNAMES)
                 ]
                 if saved:
                     state.addon_keymaps.clear()

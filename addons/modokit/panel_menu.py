@@ -178,7 +178,7 @@ class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
 # ── View menu injection ───────────────────────────────────────────────────────
 
 def _draw_falloff_header_button(self, context):
-    """Appended to VIEW3D_HT_header — Falloff toggle + settings popover."""
+    """Appended to VIEW3D_HT_header — Falloff toggle + settings popover + Workplane toggle."""
     if context.mode not in ('OBJECT', 'EDIT_MESH'):
         return
     fp = getattr(context.scene, 'modokit_falloff', None)
@@ -190,6 +190,12 @@ def _draw_falloff_header_button(self, context):
                  text="", icon='LINCURVE', depress=fp.enabled)
     row.popover(panel='VIEW3D_PT_modo_falloff_header',
                 text="", icon='DOWNARROW_HLT')
+
+    wp = getattr(context.scene, 'modokit_workplane', None)
+    if wp is not None:
+        row.separator(factor=1.0)
+        row.operator('view3d.modo_workplane',
+                     text="Work Plane", icon='MESH_GRID', depress=wp.active)
 
 
 def _draw_falloff_view_menu(self, context):

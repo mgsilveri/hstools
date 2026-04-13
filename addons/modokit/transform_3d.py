@@ -102,6 +102,38 @@ class ModoKitFalloffProps(bpy.types.PropertyGroup):
     )
 
 
+# ── Workplane PropertyGroup ───────────────────────────────────────────────────
+
+class ModoKitWorkplaneProps(bpy.types.PropertyGroup):
+    """Scene-level properties for the Modo-style workplane."""
+    active: BoolProperty(
+        name="Active",
+        description="Workplane is locked to a specific position and orientation",
+        default=False,
+    )
+    origin: FloatVectorProperty(
+        name="Origin",
+        description="Workplane centre (world space)",
+        subtype='XYZ',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+    u_axis: FloatVectorProperty(
+        name="U Axis",
+        description="First grid direction (world space)",
+        subtype='XYZ',
+        size=3,
+        default=(1.0, 0.0, 0.0),
+    )
+    v_axis: FloatVectorProperty(
+        name="V Axis",
+        description="Second grid direction (world space)",
+        subtype='XYZ',
+        size=3,
+        default=(0.0, 0.0, 1.0),
+    )
+
+
 # ── Geometry-selection helpers ────────────────────────────────────────────────
 
 def _has_any_selection(context):
@@ -1007,7 +1039,17 @@ def _sg_get_pivot_world(context):
 
 
 def _sg_get_orient_matrix_3x3(context):
-    """Return 3×3 rotation matrix for the current transform orientation."""
+    """Return 3×3 rotation matrix for the current transform orientation.
+    When the workplane is active its axes take priority over the slot setting."""
+    try:
+        wp = getattr(context.scene, 'modokit_workplane', None)
+        if wp is not None and wp.active:
+            u = _Vector(wp.u_axis).normalized()
+            v = _Vector(wp.v_axis).normalized()
+            n = u.cross(v).normalized()
+            return _Matrix((tuple(u), tuple(v), tuple(n))).transposed()
+    except Exception:
+        pass
     try:
         slot  = context.scene.transform_orientation_slots[0]
         otype = slot.type
@@ -3155,6 +3197,9 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
     delta_z:     FloatProperty(name="Z",  default=0.0, subtype='DISTANCE', unit='LENGTH')
     orient_type: StringProperty(name="Orientation", default="GLOBAL",
                                 options={'HIDDEN'})
+    orient_mat:  FloatVectorProperty(size=9,
+                                     default=(1, 0, 0,  0, 1, 0,  0, 0, 1),
+                                     options={'HIDDEN'})
     # Falloff snapshot (enables redo-panel tweaking)
     use_falloff:       BoolProperty(name="Falloff", default=False, options={'HIDDEN'})
     falloff_start:     FloatVectorProperty(name="Start", size=3, options={'HIDDEN'})
@@ -3318,6 +3363,17 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             self._orig_verts    = {}
             self._orig_matrices = {}
 
+        # delta_x/y/z are stored in orientation space; reconstruct world-space
+        # delta using the snapshotted orientation matrix so the redo panel
+        # shows axis-relative values regardless of orientation.
+        flat = list(self.orient_mat)
+        orient_3x3 = _Matrix((
+            (flat[0], flat[1], flat[2]),
+            (flat[3], flat[4], flat[5]),
+            (flat[6], flat[7], flat[8]),
+        ))
+        delta = orient_3x3 @ _Vector((self.delta_x, self.delta_y, self.delta_z))
+
         if self.use_falloff:
             if self.falloff_auto_size != 'NONE':
                 coords = self._collect_coords(context)
@@ -3325,7 +3381,6 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
                     s, e = _compute_falloff_start_end(coords, self.falloff_auto_size)
                     self.falloff_start = s
                     self.falloff_end   = e
-            delta = _Vector((self.delta_x, self.delta_y, self.delta_z))
             fp = self._make_redo_falloff_props()
             if context.mode == 'EDIT_MESH':
                 for obj in context.objects_in_mode_unique_data:
@@ -3343,14 +3398,13 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             self._sync_falloff_to_scene(context)
             return {'FINISHED'}
 
-        delta = _Vector((self.delta_x, self.delta_y, self.delta_z))
         if delta.length < 1e-9:
             return {'FINISHED'}
         try:
             bpy.ops.transform.translate(
                 'EXEC_DEFAULT',
                 value=delta,
-                orient_type=self.orient_type,
+                orient_type='GLOBAL',
                 constraint_axis=(False, False, False),
             )
         except Exception:
@@ -3437,9 +3491,16 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
                 sub.prop(self, 'falloff_curve_out', text="Out")
 
     def _commit(self, context, delta):
-        self.delta_x     = delta.x
-        self.delta_y     = delta.y
-        self.delta_z     = delta.z
+        # Project world-space delta into orientation space so the redo panel
+        # shows values relative to the dragged axis, not global XYZ.
+        try:
+            orient_delta = self._orient.inverted() @ delta
+        except Exception:
+            orient_delta = delta
+        self.delta_x     = orient_delta.x
+        self.delta_y     = orient_delta.y
+        self.delta_z     = orient_delta.z
+        self.orient_mat  = [v for row in self._orient for v in row]
         self.orient_type = self._orient_t
         # Snapshot falloff
         fp = getattr(context.scene, 'modokit_falloff', None)
@@ -3537,3 +3598,468 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             return {'CANCELLED'}
 
         return {'RUNNING_MODAL'}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Workplane
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Workplane grid draw callback ──────────────────────────────────────────────
+
+def _workplane_grid_draw_callback():
+    """POST_VIEW callback: draw the workplane grid with AA lines, zoom-adaptive
+    density, and a radial vignette (brightest at origin, fades in all directions).
+    Draws two passes: major grid at step, minor (fine) grid at step/4."""
+    import gpu
+    import math
+    from gpu_extras.batch import batch_for_shader
+
+    context = bpy.context
+    wp = getattr(context.scene, 'modokit_workplane', None)
+    if wp is None or not wp.active:
+        return
+    if context.area is None or context.area.type != 'VIEW_3D':
+        return
+
+    region  = context.region
+    rv3d    = context.region_data
+    if region is None or rv3d is None:
+        return
+
+    vp_size = (float(region.width), float(region.height))
+
+    origin = _Vector(wp.origin)
+    u = _Vector(wp.u_axis).normalized()
+    v = _Vector(wp.v_axis).normalized()
+
+    # ── Extent and zoom-adaptive major step ──────────────────────────────────
+    view_dist = max(rv3d.view_distance, 1e-6)
+    half_ext  = view_dist * 0.75   # compact extent, fades before viewport edges
+
+    step_raw = half_ext / 5.0
+    log10    = math.floor(math.log10(max(step_raw, 1e-9)))
+    base     = 10.0 ** log10
+    frac     = step_raw / base
+    if frac < 2.0:
+        step = base
+    elif frac < 5.0:
+        step = 2.0 * base
+    else:
+        step = 5.0 * base
+
+    minor_step = step / 4.0
+    divisions       = max(4, min(24, int(half_ext / step)))
+    minor_divisions = max(4, min(60, int(half_ext / minor_step)))
+
+    # ── Radial vignette ───────────────────────────────────────────────────────
+    ALPHA_MAJOR = 0.14
+    ALPHA_MINOR = 0.07   # thinner and less opaque
+    VPOWER      = 0.2    # gentler falloff → grid stays visible further out
+
+    def vig(pt, base_a):
+        dist = (pt - origin).length
+        n    = min(dist / half_ext, 1.0)
+        return base_a * max(0.0, 1.0 - n ** VPOWER)
+
+    # ── Helper: build subdivided line geometry ────────────────────────────────
+    SEGS     = 6
+    GRID_RGB = (1.0, 1.0, 1.0)
+    seg_offsets = [-half_ext + k * (2.0 * half_ext / SEGS) for k in range(SEGS + 1)]
+
+    def build_lines(step_v, divs, base_a):
+        pos = []
+        col = []
+        for i in range(-divs, divs + 1):
+            t = i * step_v
+            pts_u = [origin + t * v + s * u for s in seg_offsets]
+            pts_vv = [origin + t * u + s * v for s in seg_offsets]
+            for k in range(SEGS):
+                for pts in (pts_u, pts_vv):
+                    p0, p1 = pts[k], pts[k + 1]
+                    pos += [p0[:], p1[:]]
+                    col += [(*GRID_RGB, vig(p0, base_a)),
+                            (*GRID_RGB, vig(p1, base_a))]
+        return pos, col
+
+    major_pos, major_col = build_lines(step,       divisions,       ALPHA_MAJOR)
+    minor_pos, minor_col = build_lines(minor_step, minor_divisions, ALPHA_MINOR)
+
+    # Remove minor lines that land exactly on a major line (avoid overdraw)
+    # They share the same t values when i is a multiple of 4, so filter them out.
+    filtered_minor_pos = []
+    filtered_minor_col = []
+    seg_count = SEGS * 2  # U + V per i
+    for idx in range(minor_divisions * 2 + 1):
+        i_minor = idx - minor_divisions
+        if i_minor % 4 == 0:
+            continue   # this minor line coincides with a major line — skip
+        start = idx * seg_count * 2
+        end   = start + seg_count * 2
+        filtered_minor_pos.extend(minor_pos[start:end])
+        filtered_minor_col.extend(minor_col[start:end])
+
+    shader = gpu.shader.from_builtin('POLYLINE_SMOOTH_COLOR')
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_mask_set(False)
+    shader.bind()
+    shader.uniform_float('viewportSize', vp_size)
+
+    # Minor grid first (drawn below major)
+    if filtered_minor_pos:
+        shader.uniform_float('lineWidth', 0.75)
+        batch_for_shader(shader, 'LINES',
+                         {'pos': filtered_minor_pos,
+                          'color': filtered_minor_col}).draw(shader)
+
+    # Major grid on top
+    shader.uniform_float('lineWidth', 1.0)
+    batch_for_shader(shader, 'LINES',
+                     {'pos': major_pos, 'color': major_col}).draw(shader)
+
+    gpu.state.blend_set('NONE')
+    gpu.state.depth_mask_set(True)
+    gpu.state.depth_test_set('NONE')
+
+
+def _start_workplane_overlay():
+    if state._workplane_draw_handle is None:
+        state._workplane_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _workplane_grid_draw_callback, (), 'WINDOW', 'POST_VIEW')
+
+
+def _stop_workplane_overlay():
+    if state._workplane_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                state._workplane_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        state._workplane_draw_handle = None
+
+
+# ── Workplane helpers ─────────────────────────────────────────────────────────
+
+def _workplane_axes_from_normal(n_w):
+    """Return (u_w, v_w) for a face with the given world-space normal.
+
+    Uses world X projected onto the face plane (falls back to Y, then Z) so
+    the result depends ONLY on the normal — not on face winding, vertex order,
+    or bmesh vs evaluated-mesh iteration.  Both the toggle button and the HOME
+    operator call this helper, guaranteeing identical output for the same face."""
+    n = _Vector(n_w).normalized()
+    for ref in (_Vector((1.0, 0.0, 0.0)),
+                _Vector((0.0, 1.0, 0.0)),
+                _Vector((0.0, 0.0, 1.0))):
+        candidate = ref - ref.dot(n) * n
+        if candidate.length > 1e-4:
+            u_w = candidate.normalized()
+            v_w = n.cross(u_w).normalized()
+            return tuple(u_w), tuple(v_w)
+    u_w = n.orthogonal().normalized()
+    return tuple(u_w), tuple(n.cross(u_w).normalized())
+
+
+def _workplane_from_object(obj):
+    """Return (origin, u_axis, v_axis) derived from an object's world matrix."""
+    mw = obj.matrix_world
+    u_w = mw.col[0].xyz.normalized()
+    v_w = mw.col[1].xyz.normalized()
+    return tuple(mw.translation), tuple(u_w), tuple(v_w)
+
+
+def _compute_workplane_from_context(context):
+    """Return (origin, u_axis, v_axis) in world space.
+
+    In EDIT_MESH mode reads the current mesh selection (face / edge / vert).
+    Falls back to the active object's orientation when nothing is selected or
+    when in OBJECT mode.
+    """
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+
+    if context.mode == 'OBJECT':
+        return _workplane_from_object(obj)
+
+    # ── EDIT_MESH ─────────────────────────────────────────────────────────────
+    mw  = obj.matrix_world
+    mw3 = mw.to_3x3().normalized()
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    sel_faces = [f for f in bm.faces if f.select]
+    sel_edges = [e for e in bm.edges if e.select]
+    sel_verts = [v for v in bm.verts if v.select]
+
+    if sel_faces:
+        origin_l = (
+            sum((f.calc_center_median() for f in sel_faces), _Vector((0, 0, 0)))
+            / len(sel_faces)
+        )
+        normal_l = sum(
+            (f.normal.copy() for f in sel_faces), _Vector((0, 0, 0))
+        ).normalized()
+        origin_w = mw @ origin_l
+        n_w = (mw3 @ normal_l).normalized()
+        u_w, v_w = _workplane_axes_from_normal(n_w)
+        return tuple(origin_w), tuple(u_w), tuple(v_w)
+
+    elif sel_edges:
+        origin_l = (
+            sum(((e.verts[0].co + e.verts[1].co) * 0.5 for e in sel_edges),
+                _Vector((0, 0, 0)))
+            / len(sel_edges)
+        )
+        e0  = sel_edges[0]
+        u_l = (e0.verts[1].co - e0.verts[0].co).normalized()
+        adj = [lf.normal.copy() for e in sel_edges for lf in e.link_faces]
+        if adj:
+            normal_l = (sum(adj, _Vector((0, 0, 0))) / len(adj)).normalized()
+        else:
+            normal_l = _Vector((0.0, 0.0, 1.0))
+        u_l = (u_l - u_l.dot(normal_l) * normal_l).normalized()
+        if u_l.length < 1e-4:
+            u_l = normal_l.orthogonal().normalized()
+
+    elif sel_verts:
+        origin_l = (
+            sum((v.co.copy() for v in sel_verts), _Vector((0, 0, 0)))
+            / len(sel_verts)
+        )
+        normal_l = sum(
+            (v.normal.copy() for v in sel_verts), _Vector((0, 0, 0))
+        ).normalized()
+        u_l = normal_l.orthogonal().normalized()
+
+    else:
+        # No selection — fall back to object orientation
+        return _workplane_from_object(obj)
+
+    # World-space conversion
+    origin_w = mw @ origin_l
+    u_w = (mw3 @ u_l).normalized()
+    n_w = (mw3 @ normal_l).normalized()
+    # convention: normal = u × v  →  v = normal × u  (in-plane, perpendicular to u)
+    v_w = n_w.cross(u_w).normalized()
+
+    return tuple(origin_w), tuple(u_w), tuple(v_w)
+
+
+def _workplane_hide_floor():
+    """Save and hide the floor grid overlay in all open 3D viewports."""
+    state._workplane_saved_overlays.clear()
+    saved_list = []
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                for space in area.spaces:
+                    if space.type != 'VIEW_3D':
+                        continue
+                    ov = space.overlay
+                    saved_list.append({
+                        'show_floor':  ov.show_floor,
+                        'show_axis_x': ov.show_axis_x,
+                        'show_axis_y': ov.show_axis_y,
+                    })
+                    ov.show_floor  = False
+                    ov.show_axis_x = False
+                    ov.show_axis_y = False
+    except Exception:
+        pass
+    state._workplane_saved_overlays['list'] = saved_list
+
+
+def _workplane_restore_floor():
+    """Restore floor grid overlay settings saved by _workplane_hide_floor."""
+    try:
+        saved_list = state._workplane_saved_overlays.get('list', [])
+        idx = 0
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                for space in area.spaces:
+                    if space.type != 'VIEW_3D':
+                        continue
+                    if idx < len(saved_list):
+                        saved = saved_list[idx]
+                        ov = space.overlay
+                        ov.show_floor  = saved['show_floor']
+                        ov.show_axis_x = saved['show_axis_x']
+                        ov.show_axis_y = saved['show_axis_y']
+                        idx += 1
+    except Exception:
+        pass
+    state._workplane_saved_overlays.clear()
+
+
+def _apply_workplane_orientation(context, u_axis, v_axis):
+    """Create / update a 'Workplane' custom transform orientation from the given
+    axes and switch the active slot to use it.  Fails silently if unavailable."""
+    try:
+        u = _Vector(u_axis).normalized()
+        v = _Vector(v_axis).normalized()
+        n = u.cross(v).normalized()
+        # Column-major 3×3: col[0]=u, col[1]=v, col[2]=n
+        mx = _Matrix((tuple(u), tuple(v), tuple(n))).transposed()
+
+        # Save slot[0] type before applying (only on first call).
+        if not state._workplane_saved_orientation:
+            try:
+                slot0 = context.scene.transform_orientation_slots[0]
+                if not (slot0.type == 'CUSTOM' and
+                        getattr(slot0, 'custom_orientation', None) is not None and
+                        slot0.custom_orientation.name == 'Workplane'):
+                    entry = {'type': slot0.type}
+                    state._workplane_saved_orientation.update(entry)
+            except Exception:
+                pass
+
+        # Reuse an existing 'Workplane' orientation when possible.
+        for slot in context.scene.transform_orientation_slots:
+            co = getattr(slot, 'custom_orientation', None)
+            if co is not None and co.name == 'Workplane':
+                co.matrix = mx
+                slot.type = 'CUSTOM'
+                return
+
+        # Create a new one (reads current selection; we overwrite the matrix).
+        bpy.ops.transform.create_orientation(name='Workplane', use=True, overwrite=True)
+        for slot in context.scene.transform_orientation_slots:
+            co = getattr(slot, 'custom_orientation', None)
+            if co is not None and co.name == 'Workplane':
+                co.matrix = mx
+                break
+    except Exception:
+        pass
+
+
+def _reset_workplane_orientation(context):
+    """Delete the 'Workplane' custom orientation and restore the previous one."""
+    restore_type = state._workplane_saved_orientation.get('type', 'GLOBAL')
+
+    # Delete the 'Workplane' custom orientation while it is still the active slot
+    try:
+        slot = context.scene.transform_orientation_slots[0]
+        slot.type = 'Workplane'  # ensure the custom orientation is selected
+        bpy.ops.transform.delete_orientation()
+    except Exception:
+        pass
+
+    # Restore the previously active orientation
+    try:
+        context.scene.transform_orientation_slots[0].type = restore_type
+    except Exception:
+        try:
+            context.scene.transform_orientation_slots[0].type = 'GLOBAL'
+        except Exception:
+            pass
+    state._workplane_saved_orientation.clear()
+
+
+# ── VIEW3D_OT_modo_workplane  (header button toggle) ─────────────────────────
+
+class VIEW3D_OT_modo_workplane(bpy.types.Operator):
+    """Toggle the Modo workplane.
+Click: align workplane to selection and lock it (button turns orange).
+Click again: reset workplane to default (button turns gray)."""
+    bl_idname  = 'view3d.modo_workplane'
+    bl_label   = 'Toggle Workplane'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in ('OBJECT', 'EDIT_MESH')
+
+    def execute(self, context):
+        wp = getattr(context.scene, 'modokit_workplane', None)
+        if wp is None:
+            return {'CANCELLED'}
+
+        if wp.active:
+            # ── Reset ────────────────────────────────────────────────────────
+            wp.active = False
+            wp.origin = (0.0, 0.0, 0.0)
+            wp.u_axis = (1.0, 0.0, 0.0)
+            wp.v_axis = (0.0, 0.0, 1.0)
+            _stop_workplane_overlay()
+            _workplane_restore_floor()
+            _reset_workplane_orientation(context)
+        else:
+            # ── Align to selection ────────────────────────────────────────────
+            origin, u_axis, v_axis = _compute_workplane_from_context(context)
+            wp.origin = origin
+            wp.u_axis = u_axis
+            wp.v_axis = v_axis
+            wp.active = True
+            _start_workplane_overlay()
+            _workplane_hide_floor()
+            _apply_workplane_orientation(context, u_axis, v_axis)
+
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# ── VIEW3D_OT_modo_workplane_home  (HOME — snap workplane to poly under mouse) ─
+
+class VIEW3D_OT_modo_workplane_home(bpy.types.Operator):
+    """Snap the workplane to the polygon directly under the mouse pointer.
+(Modo Home key behaviour: centres on the intersection point and aligns to
+the polygon's normal, without changing the selection.)"""
+    bl_idname  = 'view3d.modo_workplane_home'
+    bl_label   = 'Snap Workplane to Mouse'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area is not None
+                and context.area.type == 'VIEW_3D'
+                and context.mode in ('OBJECT', 'EDIT_MESH'))
+
+    def invoke(self, context, event):
+        from bpy_extras import view3d_utils
+
+        region = context.region
+        rv3d   = context.region_data
+        if region is None or rv3d is None:
+            return {'CANCELLED'}
+
+        co = (event.mouse_region_x, event.mouse_region_y)
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, co)
+        ray_dir    = view3d_utils.region_2d_to_vector_3d(region, rv3d, co)
+        if ray_origin is None or ray_dir is None:
+            return {'CANCELLED'}
+
+        hit, location, normal, _fi, _obj, _mx = context.scene.ray_cast(
+            context.view_layer.depsgraph, ray_origin, ray_dir.normalized())
+        if not hit:
+            self.report({'INFO'}, "Workplane Home: no geometry under mouse")
+            return {'CANCELLED'}
+
+        wp = getattr(context.scene, 'modokit_workplane', None)
+        if wp is None:
+            return {'CANCELLED'}
+
+        n_w = _Vector(normal).normalized()
+        u_w, v_w = _workplane_axes_from_normal(n_w)
+
+        wp.origin = tuple(_Vector(location))
+        wp.u_axis = tuple(u_w)
+        wp.v_axis = tuple(v_w)
+        was_active = wp.active
+        wp.active = True
+        _start_workplane_overlay()
+        if not was_active:
+            _workplane_hide_floor()
+        _apply_workplane_orientation(context, u_w, v_w)
+
+        if context.area:
+            context.area.tag_redraw()
+        return {'FINISHED'}
