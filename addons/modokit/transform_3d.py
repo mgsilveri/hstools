@@ -1190,6 +1190,16 @@ def _half_centroids(coords, direction, push_to_extreme=False):
     return pt_start, pt_end
 
 
+def _compute_falloff_start_end(coords, axis):
+    """Return (start_tuple, end_tuple) for falloff handles from world coords.
+    axis must be 'X', 'Y', or 'Z'."""
+    ax_dir = {'X': _Vector((1.0, 0.0, 0.0)),
+              'Y': _Vector((0.0, 1.0, 0.0)),
+              'Z': _Vector((0.0, 0.0, 1.0))}[axis]
+    pt_start, pt_end = _half_centroids(coords, ax_dir, push_to_extreme=True)
+    return tuple(pt_start), tuple(pt_end)
+
+
 def _auto_size_falloff(context, axis=None):
     """Auto-size the falloff handles to the selection.
     axis=None  → PCA dominant axis (follows geometry inclination, matches Modo).
@@ -1218,11 +1228,7 @@ def _auto_size_falloff(context, axis=None):
 
         centroid, direction = _pca_dominant_axis(coords)
 
-        # If PCA direction is within ~25° of a world axis, use world-axis
-        # placement.  Within that snap zone, pick the axis with the LARGEST
-        # bounding-box span — that is the "longer axis" the user sees, even
-        # when PCA variance happens to peak along a different axis.
-        _SNAP_COS = 0.90   # cos(~26°)
+        _SNAP_COS = 0.90
         world_axes = (
             (_Vector((1.0, 0.0, 0.0)), 'X'),
             (_Vector((0.0, 1.0, 0.0)), 'Y'),
@@ -1235,9 +1241,6 @@ def _auto_size_falloff(context, axis=None):
                 best_dot, best_ax_name = d, name
 
         if best_dot >= _SNAP_COS:
-            # Axis-aligned geometry — snap to the world axis most aligned with
-            # the PCA direction (which correctly identifies the face's long axis
-            # via the Rayleigh-quotient multi-start fix in _pca_dominant_axis).
             ax_dir = {'X': _Vector((1.0, 0.0, 0.0)),
                       'Y': _Vector((0.0, 1.0, 0.0)),
                       'Z': _Vector((0.0, 0.0, 1.0))}[best_ax_name]
@@ -1245,8 +1248,6 @@ def _auto_size_falloff(context, axis=None):
             props.start = tuple(pt_start)
             props.end   = tuple(pt_end)
         else:
-            # Genuinely off-axis — follow PCA direction, NO push (pushing along
-            # a diagonal would move handles outside the mesh bounding box).
             pt_start, pt_end = _half_centroids(coords, direction, push_to_extreme=False)
             if pt_start.z >= pt_end.z:
                 props.start = tuple(pt_start)
@@ -1255,14 +1256,7 @@ def _auto_size_falloff(context, axis=None):
                 props.start = tuple(pt_end)
                 props.end   = tuple(pt_start)
     else:
-        # Axis-constrained: half-centroid + push to exact extreme so handles
-        # sit at the selection boundary, centred on the perpendicular axes.
-        ax_dir = {'X': _Vector((1.0, 0.0, 0.0)),
-                  'Y': _Vector((0.0, 1.0, 0.0)),
-                  'Z': _Vector((0.0, 0.0, 1.0))}[axis]
-        pt_start, pt_end = _half_centroids(coords, ax_dir, push_to_extreme=True)
-        props.start = tuple(pt_start)
-        props.end   = tuple(pt_end)
+        props.start, props.end = _compute_falloff_start_end(coords, axis)
 
 
 # ── Falloff draw callbacks ─────────────────────────────────────────────────────
@@ -1354,12 +1348,27 @@ def _falloff_handles_draw_callback():
         else:
             px2, py2 = 0.0, 1.0
         W = 34.0
-        w1x = sx + px2 * W;  w1y = sy + py2 * W
-        w2x = sx - px2 * W;  w2y = sy - py2 * W
         wedge_col = (0.75, 0.48, 0.82, 0.85)
-        _draw_aa([((w1x, w1y), (w2x, w2y))], wedge_col, 1.5)   # base
-        _draw_aa([((w1x, w1y), (ex,  ey))],  wedge_col, 1.5)   # left side
-        _draw_aa([((w2x, w2y), (ex,  ey))],  wedge_col, 1.5)   # right side
+
+        # Tessellate both sides using the shape curve so the wedge
+        # visually matches the falloff profile (24 segments is plenty).
+        SEGS = 24
+        left_pts  = []
+        right_pts = []
+        for i in range(SEGS + 1):
+            t = i / SEGS          # 0 = Start, 1 = End
+            w = _apply_shape(1.0 - t, props)   # weight at this position
+            half = W * w
+            px_i = sx + (ex - sx) * t
+            py_i = sy + (ey - sy) * t
+            left_pts.append( (px_i + px2 * half, py_i + py2 * half) )
+            right_pts.append((px_i - px2 * half, py_i - py2 * half) )
+
+        # Base line at Start
+        _draw_aa([(left_pts[0], right_pts[0])], wedge_col, 1.5)
+        # Left and right side polylines
+        _draw_aa(list(zip(left_pts,  left_pts[1:])),  wedge_col, 1.5)
+        _draw_aa(list(zip(right_pts, right_pts[1:])), wedge_col, 1.5)
 
         # ── 3-D crosshair handles ──────────────────────────────────────────────
         cam_right = _Vector(rv3d.view_matrix.inverted().col[0][:3]).normalized()
@@ -2318,6 +2327,25 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
                                      size=3, options={'HIDDEN'})
     orient_type: StringProperty(name="Orientation", default="GLOBAL",
                                 options={'HIDDEN'})
+    # Falloff snapshot (enables redo-panel tweaking)
+    use_falloff:      BoolProperty(name="Falloff", default=False, options={'HIDDEN'})
+    falloff_start:    FloatVectorProperty(name="Start", size=3, options={'HIDDEN'})
+    falloff_end:      FloatVectorProperty(name="End",   size=3, options={'HIDDEN'})
+    falloff_symmetric: EnumProperty(name="Symmetric",
+                            items=[('NONE','None',''),('START','Start',''),('END','End','')],
+                            default='NONE')
+    falloff_shape:    EnumProperty(name="Shape",
+                            items=[('LINEAR','Linear',''),('EASE_IN','Ease In',''),
+                                   ('EASE_OUT','Ease Out',''),('SMOOTH','Smooth',''),
+                                   ('CUSTOM','Custom','')],
+                            default='LINEAR')
+    falloff_curve_in:  FloatProperty(name="In",  default=0.0, min=0.0, max=1.0)
+    falloff_curve_out: FloatProperty(name="Out", default=0.0, min=0.0, max=1.0)
+    falloff_auto_size: EnumProperty(name="Auto Size",
+                            items=[('NONE','None',''),
+                                   ('X','X',''),('Y','Y',''),('Z','Z','')],
+                            default='NONE')
+    falloff_reversed:  BoolProperty(name="Reversed", default=False)
 
     @classmethod
     def poll(cls, context):
@@ -2449,28 +2477,104 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
         layout = self.layout
         layout.use_property_split = True
         col = layout.column(align=True)
+        col.use_property_decorate = False
         col.prop(self, 'scale_x', text="Scale X %", slider=False)
         col.prop(self, 'scale_y', text="Y %",       slider=False)
         col.prop(self, 'scale_z', text="Z %",       slider=False)
+        if self.use_falloff:
+            col.separator()
+            col.use_property_split = False
+            split = col.split(factor=0.4)
+            lbl = split.row()
+            lbl.alignment = 'RIGHT'
+            lbl.label(text="Auto Size")
+            row = split.row(align=True)
+            for ax in ('X', 'Y', 'Z'):
+                row.prop_enum(self, 'falloff_auto_size', ax)
+            row.prop(self, 'falloff_reversed', text="", icon='ARROW_LEFTRIGHT', toggle=True)
+            col.separator(factor=1.0)
+            split = col.split(factor=0.4)
+            lbl = split.row(); lbl.alignment = 'RIGHT'; lbl.label(text="Falloff Shape")
+            split.prop(self, 'falloff_shape', text="")
+            split = col.split(factor=0.4)
+            lbl = split.row(); lbl.alignment = 'RIGHT'; lbl.label(text="Symmetric")
+            split.prop(self, 'falloff_symmetric', text="")
+            if self.falloff_shape == 'CUSTOM':
+                split = col.split(factor=0.4)
+                split.row()  # empty label cell
+                sub = split.row(align=True)
+                sub.prop(self, 'falloff_curve_in',  text="In")
+                sub.prop(self, 'falloff_curve_out', text="Out")
+
+    def _make_redo_falloff_props(self):
+        """Build a lightweight namespace that mimics ModoKitFalloffProps for
+        _falloff_linear_weight / _apply_shape on the redo path."""
+        import types
+        fp = types.SimpleNamespace()
+        if self.falloff_reversed:
+            fp.start = tuple(self.falloff_end)
+            fp.end   = tuple(self.falloff_start)
+        else:
+            fp.start = tuple(self.falloff_start)
+            fp.end   = tuple(self.falloff_end)
+        fp.symmetric    = self.falloff_symmetric
+        fp.shape_preset = self.falloff_shape
+        fp.curve_in     = self.falloff_curve_in
+        fp.curve_out    = self.falloff_curve_out
+        return fp
+
+    def _collect_coords(self, context):
+        """Gather world-space selected vertex coords for auto-size on redo."""
+        coords = []
+        if context.mode == 'EDIT_MESH':
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                bm = bmesh.from_edit_mesh(obj.data)
+                mx = obj.matrix_world
+                sel = [mx @ v.co for v in bm.verts if v.select]
+                coords.extend(sel if sel else [mx @ v.co for v in bm.verts])
+        return coords
 
     def execute(self, context):
         """Apply the scale — called on first finish (from modal) and on redo."""
-        falloff_props = getattr(context.scene, 'modokit_falloff', None)
-        use_falloff   = (falloff_props is not None and falloff_props.enabled)
         has_live_data = hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices')
 
-        if has_live_data and use_falloff:
-            # Falloff active: live preview already has the correct weighted
-            # state.  Re-apply once to be safe then confirm directly —
-            # restore + resize would overwrite the falloff-weighted result.
-            self._apply_live(context, self._last_s)
-            self._orig_verts    = {}
-            self._orig_matrices = {}
-            return {'FINISHED'}
-
-        # On first call from modal the mesh is still in preview state; restore first.
+        # Always restore to original first so the apply step is idempotent
+        # (same code path for first execution and F9 redo).
         if has_live_data:
             self._restore(context)
+            self._orig_verts    = {}
+            self._orig_matrices = {}
+
+        if self.use_falloff:
+            if self.falloff_auto_size != 'NONE':
+                coords = self._collect_coords(context)
+                if coords:
+                    s, e = _compute_falloff_start_end(coords, self.falloff_auto_size)
+                    self.falloff_start = s
+                    self.falloff_end   = e
+            sv = self._sv_from_props()
+            M  = _sg_build_scale_matrix(_Vector(self.pivot_loc),
+                                        _sg_get_orient_matrix_3x3(context), *sv)
+            fp = self._make_redo_falloff_props()
+            if context.mode == 'EDIT_MESH':
+                for obj in context.objects_in_mode_unique_data:
+                    if obj.type != 'MESH':
+                        continue
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    bm.verts.ensure_lookup_table()
+                    inv = obj.matrix_world.inverted()
+                    for v in bm.verts:
+                        if v.select:
+                            orig_w = obj.matrix_world @ v.co
+                            scaled_w = M @ orig_w
+                            w = _falloff_linear_weight(orig_w, fp)
+                            v.co = inv @ orig_w.lerp(scaled_w, w)
+                    bmesh.update_edit_mesh(obj.data, destructive=False)
+            self._sync_falloff_to_scene(context)
+            return {'FINISHED'}
+
         sv = (self.scale_x / 100.0, self.scale_y / 100.0, self.scale_z / 100.0)
         if all(abs(v - 1.0) < 1e-9 for v in sv):
             return {'FINISHED'}
@@ -2496,14 +2600,47 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
             context.scene.cursor.location = old_cursor
         return {'FINISHED'}
 
+    def _sv_from_props(self):
+        return (self.scale_x / 100.0, self.scale_y / 100.0, self.scale_z / 100.0)
+
+    def _sync_falloff_to_scene(self, context):
+        """Write operator falloff snapshot back into scene.modokit_falloff so
+        the wedge draw callback reflects the current redo-panel values."""
+        scene_fp = getattr(context.scene, 'modokit_falloff', None)
+        if scene_fp is None:
+            return
+        fp = self._make_redo_falloff_props()
+        scene_fp.start        = fp.start
+        scene_fp.end          = fp.end
+        scene_fp.symmetric    = self.falloff_symmetric
+        scene_fp.shape_preset = self.falloff_shape
+        scene_fp.curve_in     = self.falloff_curve_in
+        scene_fp.curve_out    = self.falloff_curve_out
+        if context.area:
+            context.area.tag_redraw()
+
     def _commit(self, context, s):
-        """Snapshot sv as percentages into operator properties (enables redo panel)."""
+        """Snapshot sv + falloff into operator properties (enables redo panel)."""
         sv = self._sv(s)
         self.scale_x     = sv[0] * 100.0
         self.scale_y     = sv[1] * 100.0
         self.scale_z     = sv[2] * 100.0
         self.pivot_loc   = self._pivot_w.to_tuple()
         self.orient_type = self._orient_t
+        # Snapshot falloff
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        if fp is not None and fp.enabled:
+            self.use_falloff       = True
+            self.falloff_start     = tuple(fp.start)
+            self.falloff_end       = tuple(fp.end)
+            self.falloff_symmetric = fp.symmetric
+            self.falloff_shape     = fp.shape_preset
+            self.falloff_curve_in  = fp.curve_in
+            self.falloff_curve_out = fp.curve_out
+            self.falloff_auto_size = 'NONE'
+            self.falloff_reversed  = False
+        else:
+            self.use_falloff = False
         return self.execute(context)
 
     # ── modal ────────────────────────────────────────────────────────────────
@@ -2534,6 +2671,28 @@ class VIEW3D_OT_modo_scale_gizmo_drag(bpy.types.Operator):
             if context.area:
                 context.area.tag_redraw()
             return result
+
+        if event.type == 'S' and event.value == 'PRESS':
+            fp = getattr(context.scene, 'modokit_falloff', None)
+            if fp is not None and fp.enabled:
+                _SHAPES = ('LINEAR', 'EASE_IN', 'EASE_OUT', 'SMOOTH', 'CUSTOM')
+                idx = _SHAPES.index(fp.shape_preset) if fp.shape_preset in _SHAPES else 0
+                fp.shape_preset = _SHAPES[(idx + 1) % len(_SHAPES)]
+                self._apply_live(context, self._last_s)
+                if context.area:
+                    context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'D' and event.value == 'PRESS':
+            fp = getattr(context.scene, 'modokit_falloff', None)
+            if fp is not None and fp.enabled:
+                old_start = tuple(fp.start)
+                fp.start = tuple(fp.end)
+                fp.end   = old_start
+                self._apply_live(context, self._last_s)
+                if context.area:
+                    context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         if event.type in ('RIGHTMOUSE', 'ESC'):
             self._restore(context)
@@ -2996,6 +3155,25 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
     delta_z:     FloatProperty(name="Z",  default=0.0, subtype='DISTANCE', unit='LENGTH')
     orient_type: StringProperty(name="Orientation", default="GLOBAL",
                                 options={'HIDDEN'})
+    # Falloff snapshot (enables redo-panel tweaking)
+    use_falloff:       BoolProperty(name="Falloff", default=False, options={'HIDDEN'})
+    falloff_start:     FloatVectorProperty(name="Start", size=3, options={'HIDDEN'})
+    falloff_end:       FloatVectorProperty(name="End",   size=3, options={'HIDDEN'})
+    falloff_symmetric: EnumProperty(name="Symmetric",
+                            items=[('NONE','None',''),('START','Start',''),('END','End','')],
+                            default='NONE')
+    falloff_shape:     EnumProperty(name="Shape",
+                            items=[('LINEAR','Linear',''),('EASE_IN','Ease In',''),
+                                   ('EASE_OUT','Ease Out',''),('SMOOTH','Smooth',''),
+                                   ('CUSTOM','Custom','')],
+                            default='LINEAR')
+    falloff_curve_in:  FloatProperty(name="In",  default=0.0, min=0.0, max=1.0)
+    falloff_curve_out: FloatProperty(name="Out", default=0.0, min=0.0, max=1.0)
+    falloff_auto_size: EnumProperty(name="Auto Size",
+                            items=[('NONE','None',''),
+                                   ('X','X',''),('Y','Y',''),('Z','Z','')],
+                            default='NONE')
+    falloff_reversed:  BoolProperty(name="Reversed", default=False)
 
     @classmethod
     def poll(cls, context):
@@ -3131,20 +3309,40 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
 
     def execute(self, context):
         """Apply the translation — called on commit and on redo."""
-        falloff_props = getattr(context.scene, 'modokit_falloff', None)
-        use_falloff   = (falloff_props is not None and falloff_props.enabled)
         has_live_data = hasattr(self, '_orig_verts') or hasattr(self, '_orig_matrices')
 
-        if has_live_data and use_falloff:
-            # Falloff active: re-apply the final delta once and confirm
-            # directly — restore + translate would lose the falloff weighting.
-            self._apply_live(context, self._last_delta)
-            self._orig_verts    = {}
-            self._orig_matrices = {}
-            return {'FINISHED'}
-
+        # Always restore to original first so the apply step is idempotent
+        # (same code path for first execution and F9 redo).
         if has_live_data:
             self._restore(context)
+            self._orig_verts    = {}
+            self._orig_matrices = {}
+
+        if self.use_falloff:
+            if self.falloff_auto_size != 'NONE':
+                coords = self._collect_coords(context)
+                if coords:
+                    s, e = _compute_falloff_start_end(coords, self.falloff_auto_size)
+                    self.falloff_start = s
+                    self.falloff_end   = e
+            delta = _Vector((self.delta_x, self.delta_y, self.delta_z))
+            fp = self._make_redo_falloff_props()
+            if context.mode == 'EDIT_MESH':
+                for obj in context.objects_in_mode_unique_data:
+                    if obj.type != 'MESH':
+                        continue
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    bm.verts.ensure_lookup_table()
+                    inv = obj.matrix_world.inverted()
+                    for v in bm.verts:
+                        if v.select:
+                            orig_w = obj.matrix_world @ v.co
+                            w = _falloff_linear_weight(orig_w, fp)
+                            v.co = inv @ orig_w.lerp(orig_w + delta, w)
+                    bmesh.update_edit_mesh(obj.data, destructive=False)
+            self._sync_falloff_to_scene(context)
+            return {'FINISHED'}
+
         delta = _Vector((self.delta_x, self.delta_y, self.delta_z))
         if delta.length < 1e-9:
             return {'FINISHED'}
@@ -3159,19 +3357,104 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             pass
         return {'FINISHED'}
 
+    def _make_redo_falloff_props(self):
+        """Build a lightweight namespace that mimics ModoKitFalloffProps for
+        _falloff_linear_weight / _apply_shape on the redo path."""
+        import types
+        fp = types.SimpleNamespace()
+        if self.falloff_reversed:
+            fp.start = tuple(self.falloff_end)
+            fp.end   = tuple(self.falloff_start)
+        else:
+            fp.start = tuple(self.falloff_start)
+            fp.end   = tuple(self.falloff_end)
+        fp.symmetric    = self.falloff_symmetric
+        fp.shape_preset = self.falloff_shape
+        fp.curve_in     = self.falloff_curve_in
+        fp.curve_out    = self.falloff_curve_out
+        return fp
+
+    def _collect_coords(self, context):
+        """Gather world-space selected vertex coords for auto-size on redo."""
+        coords = []
+        if context.mode == 'EDIT_MESH':
+            for obj in context.objects_in_mode_unique_data:
+                if obj.type != 'MESH':
+                    continue
+                bm = bmesh.from_edit_mesh(obj.data)
+                mx = obj.matrix_world
+                sel = [mx @ v.co for v in bm.verts if v.select]
+                coords.extend(sel if sel else [mx @ v.co for v in bm.verts])
+        return coords
+
+    def _sync_falloff_to_scene(self, context):
+        """Write operator falloff snapshot back into scene.modokit_falloff so
+        the wedge draw callback reflects the current redo-panel values."""
+        scene_fp = getattr(context.scene, 'modokit_falloff', None)
+        if scene_fp is None:
+            return
+        fp = self._make_redo_falloff_props()
+        scene_fp.start        = fp.start
+        scene_fp.end          = fp.end
+        scene_fp.symmetric    = self.falloff_symmetric
+        scene_fp.shape_preset = self.falloff_shape
+        scene_fp.curve_in     = self.falloff_curve_in
+        scene_fp.curve_out    = self.falloff_curve_out
+        if context.area:
+            context.area.tag_redraw()
+
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
         col = layout.column(align=True)
+        col.use_property_decorate = False
         col.prop(self, 'delta_x', text="Move X")
         col.prop(self, 'delta_y', text="Y")
         col.prop(self, 'delta_z', text="Z")
+        if self.use_falloff:
+            col.separator()
+            col.use_property_split = False
+            split = col.split(factor=0.4)
+            lbl = split.row()
+            lbl.alignment = 'RIGHT'
+            lbl.label(text="Auto Size")
+            row = split.row(align=True)
+            for ax in ('X', 'Y', 'Z'):
+                row.prop_enum(self, 'falloff_auto_size', ax)
+            row.prop(self, 'falloff_reversed', text="", icon='ARROW_LEFTRIGHT', toggle=True)
+            col.separator(factor=1.0)
+            split = col.split(factor=0.4)
+            lbl = split.row(); lbl.alignment = 'RIGHT'; lbl.label(text="Falloff Shape")
+            split.prop(self, 'falloff_shape', text="")
+            split = col.split(factor=0.4)
+            lbl = split.row(); lbl.alignment = 'RIGHT'; lbl.label(text="Symmetric")
+            split.prop(self, 'falloff_symmetric', text="")
+            if self.falloff_shape == 'CUSTOM':
+                split = col.split(factor=0.4)
+                split.row()  # empty label cell
+                sub = split.row(align=True)
+                sub.prop(self, 'falloff_curve_in',  text="In")
+                sub.prop(self, 'falloff_curve_out', text="Out")
 
     def _commit(self, context, delta):
         self.delta_x     = delta.x
         self.delta_y     = delta.y
         self.delta_z     = delta.z
         self.orient_type = self._orient_t
+        # Snapshot falloff
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        if fp is not None and fp.enabled:
+            self.use_falloff       = True
+            self.falloff_start     = tuple(fp.start)
+            self.falloff_end       = tuple(fp.end)
+            self.falloff_symmetric = fp.symmetric
+            self.falloff_shape     = fp.shape_preset
+            self.falloff_curve_in  = fp.curve_in
+            self.falloff_curve_out = fp.curve_out
+            self.falloff_auto_size = 'NONE'
+            self.falloff_reversed  = False
+        else:
+            self.use_falloff = False
         return self.execute(context)
 
     # ── modal ─────────────────────────────────────────────────────────────────
@@ -3222,6 +3505,28 @@ class VIEW3D_OT_modo_move_gizmo_drag(bpy.types.Operator):
             if context.area:
                 context.area.tag_redraw()
             return result
+
+        if event.type == 'S' and event.value == 'PRESS':
+            fp = getattr(context.scene, 'modokit_falloff', None)
+            if fp is not None and fp.enabled:
+                _SHAPES = ('LINEAR', 'EASE_IN', 'EASE_OUT', 'SMOOTH', 'CUSTOM')
+                idx = _SHAPES.index(fp.shape_preset) if fp.shape_preset in _SHAPES else 0
+                fp.shape_preset = _SHAPES[(idx + 1) % len(_SHAPES)]
+                self._apply_live(context, self._last_delta)
+                if context.area:
+                    context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'D' and event.value == 'PRESS':
+            fp = getattr(context.scene, 'modokit_falloff', None)
+            if fp is not None and fp.enabled:
+                old_start = tuple(fp.start)
+                fp.start = tuple(fp.end)
+                fp.end   = old_start
+                self._apply_live(context, self._last_delta)
+                if context.area:
+                    context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         if event.type in ('RIGHTMOUSE', 'ESC'):
             self._release_ctrl_snap(context)

@@ -27,10 +27,10 @@ class VIEW3D_PT_modo_selection(bpy.types.Panel):
         layout.separator()
         layout.label(text="Selection Tools:")
         row = layout.row()
-        row.operator("mesh.modo_select_shortest_path", text="Select Between (Shift+G)")
+        row.operator("mesh.modo_select_shortest_path", text="Select Between")
         layout.separator()
         row = layout.row()
-        row.operator("mesh.loop_multi_select", text="Select Loop (L)").ring = False
+        row.operator("mesh.loop_multi_select", text="Select Loop").ring = False
         row = layout.row()
         row.operator("mesh.loop_multi_select", text="Select Ring").ring = True
         layout.separator()
@@ -41,42 +41,6 @@ class VIEW3D_PT_modo_selection(bpy.types.Panel):
         row = layout.row()
         row.operator("mesh.modo_select_element_under_mouse", text="Remove").mode = 'remove'
         row.operator("mesh.modo_select_element_under_mouse", text="Toggle").mode = 'toggle'
-
-        # ── Falloff ───────────────────────────────────────────────────────────
-        layout.separator()
-        fp = getattr(context.scene, 'modokit_falloff', None)
-        if fp is None:
-            return
-
-        box = layout.box()
-        row = box.row()
-        icon = 'CHECKBOX_HLT' if fp.enabled else 'CHECKBOX_DEHLT'
-        row.operator('view3d.modo_linear_falloff',
-                     text="Linear Falloff",
-                     icon=icon,
-                     depress=fp.enabled)
-
-        if fp.enabled:
-            # Auto-size axis buttons + Reverse
-            row2 = box.row(align=True)
-            row2.label(text="Auto Size:")
-            for ax in ('X', 'Y', 'Z'):
-                op = row2.operator('view3d.modo_falloff_auto_size', text=ax)
-                op.axis = ax
-            row2.operator('view3d.modo_falloff_reverse', text="", icon='ARROW_LEFTRIGHT')
-
-            col = box.column(align=True)
-            col.prop(fp, 'symmetric')
-            col.prop(fp, 'shape_preset', text="Shape")
-            if fp.shape_preset == 'CUSTOM':
-                sub = col.row(align=True)
-                sub.prop(fp, 'curve_in',  text="In")
-                sub.prop(fp, 'curve_out', text="Out")
-            col.separator()
-            col.prop(fp, 'mix_mode')
-            col.prop(fp, 'use_world')
-            col.separator()
-            col.prop(fp, 'show', text="Show Falloff")
 
 
 class VIEW3D_MT_modo_falloff_picker(bpy.types.Menu):
@@ -103,6 +67,96 @@ class VIEW3D_MT_modo_falloff_picker(bpy.types.Menu):
         )
 
 
+class VIEW3D_PT_modokit_falloff(bpy.types.Panel):
+    """Falloff settings panel — separate N-panel tab."""
+    bl_label       = "Falloff"
+    bl_idname      = "VIEW3D_PT_modokit_falloff"
+    bl_space_type  = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category    = 'ModoKit'
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in ('OBJECT', 'EDIT_MESH')
+
+    def draw(self, context):
+        layout = self.layout
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        if fp is None:
+            return
+
+        if not fp.enabled:
+            layout.label(text="Enable falloff to see settings", icon='INFO')
+            return
+
+        col = layout.column()
+        col.label(text="Auto Size:")
+        row2 = col.row(align=True)
+        for ax in ('X', 'Y', 'Z'):
+            op = row2.operator('view3d.modo_falloff_auto_size', text=ax)
+            op.axis = ax
+        row2.operator('view3d.modo_falloff_reverse', text="", icon='ARROW_LEFTRIGHT')
+
+        col.separator()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(fp, 'symmetric')
+        col.prop(fp, 'shape_preset', text="Shape")
+        if fp.shape_preset == 'CUSTOM':
+            sub = col.row(align=True)
+            sub.prop(fp, 'curve_in',  text="In")
+            sub.prop(fp, 'curve_out', text="Out")
+        col.separator()
+        col.prop(fp, 'mix_mode')
+        col.prop(fp, 'use_world')
+        col.separator()
+        col.use_property_split = False
+        col.prop(fp, 'show', text="Show Falloff")
+
+
+class VIEW3D_PT_modo_falloff_header(bpy.types.Panel):
+    """Falloff settings popover shown in the 3D view header."""
+    bl_label       = "Linear Falloff"
+    bl_idname      = "VIEW3D_PT_modo_falloff_header"
+    bl_space_type  = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+    bl_ui_units_x  = 12
+
+    def draw(self, context):
+        layout = self.layout
+        fp = getattr(context.scene, 'modokit_falloff', None)
+        if fp is None:
+            return
+
+        row = layout.row()
+        icon = 'CHECKBOX_HLT' if fp.enabled else 'CHECKBOX_DEHLT'
+        row.operator('view3d.modo_linear_falloff',
+                     text="Linear Falloff",
+                     icon=icon,
+                     depress=fp.enabled)
+
+        if fp.enabled:
+            row2 = layout.row(align=True)
+            row2.label(text="Auto Size:")
+            for ax in ('X', 'Y', 'Z'):
+                op = row2.operator('view3d.modo_falloff_auto_size', text=ax)
+                op.axis = ax
+            row2.operator('view3d.modo_falloff_reverse', text="", icon='ARROW_LEFTRIGHT')
+
+            col = layout.column(align=True)
+            col.prop(fp, 'symmetric')
+            col.prop(fp, 'shape_preset', text="Shape")
+            if fp.shape_preset == 'CUSTOM':
+                sub = col.row(align=True)
+                sub.prop(fp, 'curve_in',  text="In")
+                sub.prop(fp, 'curve_out', text="Out")
+            col.separator()
+            col.prop(fp, 'mix_mode')
+            col.prop(fp, 'use_world')
+            col.separator()
+            col.prop(fp, 'show', text="Show Falloff")
+
+
 class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
     """Context menu for Modo-style selection.
     Appears on right-click when 2+ elements selected.
@@ -122,6 +176,21 @@ class MESH_MT_modo_selection_context_menu(bpy.types.Menu):
 
 
 # ── View menu injection ───────────────────────────────────────────────────────
+
+def _draw_falloff_header_button(self, context):
+    """Appended to VIEW3D_HT_header — Falloff toggle + settings popover."""
+    if context.mode not in ('OBJECT', 'EDIT_MESH'):
+        return
+    fp = getattr(context.scene, 'modokit_falloff', None)
+    if fp is None:
+        return
+    row = self.layout.row(align=True)
+    row.separator(factor=1.5)
+    row.operator('view3d.modo_linear_falloff',
+                 text="", icon='LINCURVE', depress=fp.enabled)
+    row.popover(panel='VIEW3D_PT_modo_falloff_header',
+                text="", icon='DOWNARROW_HLT')
+
 
 def _draw_falloff_view_menu(self, context):
     """Appended to VIEW3D_MT_view — adds the Show Falloff toggle."""

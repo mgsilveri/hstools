@@ -84,7 +84,9 @@ _ALL_CLASSES = (
     ops_object.OBJECT_OT_modo_lasso_select,
     ops_object.OBJECT_OT_smooth_by_uv,
     panel_menu.VIEW3D_PT_modo_selection,
+    panel_menu.VIEW3D_PT_modokit_falloff,
     panel_menu.VIEW3D_MT_modo_falloff_picker,
+    panel_menu.VIEW3D_PT_modo_falloff_header,
     panel_menu.MESH_MT_modo_selection_context_menu,
     component_mode.VIEW3D_OT_modo_component_mode,
     component_mode.MESH_OT_modo_boundary_select,
@@ -228,8 +230,9 @@ def register():
         state._orig_image_ht_header_draw = bpy.types.IMAGE_HT_header.draw
         bpy.types.IMAGE_HT_header.draw = ops_uv._patched_image_ht_header_draw
 
-    # Falloff — View menu Show Falloff toggle
+    # Falloff — View menu Show Falloff toggle + header popover button
     bpy.types.VIEW3D_MT_view.append(panel_menu._draw_falloff_view_menu)
+    bpy.types.VIEW3D_HT_header.append(panel_menu._draw_falloff_header_button)
 
     # Sharp by UV — Mesh and Object menus
     bpy.types.VIEW3D_MT_edit_mesh.append(panel_menu._draw_smooth_by_uv_edit_menu)
@@ -334,6 +337,7 @@ def unregister():
 
     bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
     bpy.types.VIEW3D_MT_view.remove(panel_menu._draw_falloff_view_menu)
+    bpy.types.VIEW3D_HT_header.remove(panel_menu._draw_falloff_header_button)
     bpy.types.VIEW3D_MT_edit_mesh.remove(panel_menu._draw_smooth_by_uv_edit_menu)
     bpy.types.VIEW3D_MT_object.remove(panel_menu._draw_smooth_by_uv_object_menu)
 
