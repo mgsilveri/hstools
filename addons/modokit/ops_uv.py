@@ -1334,12 +1334,18 @@ class IMAGE_OT_modo_uv_selection_guard(bpy.types.Operator):
             # gestures (e.g. Alt+Shift+LMB pan) and must not be consumed.
             if event.alt:
                 return {'PASS_THROUGH'}
-            # Pass through clicks that land on the header, toolbar, sidebar, or
-            # any other non-WINDOW region (e.g. snap menu in the header bar).
-            # Use absolute screen coordinates so the check is region-agnostic.
+            # Pass through clicks that land outside the current area, or on
+            # any non-WINDOW region within it (header, toolbar, sidebar, etc.).
+            # The top-bar (File / Edit / Render…) is a separate screen area,
+            # so an out-of-area check handles that case too.
+            mx, my = event.mouse_x, event.mouse_y
             area = context.area
             if area:
-                mx, my = event.mouse_x, event.mouse_y
+                # Click is outside this area → always pass through.
+                if not (area.x <= mx < area.x + area.width and
+                        area.y <= my < area.y + area.height):
+                    return {'PASS_THROUGH'}
+                # Click is inside a non-WINDOW region of this area → pass through.
                 for reg in area.regions:
                     if reg.type == 'WINDOW':
                         continue
