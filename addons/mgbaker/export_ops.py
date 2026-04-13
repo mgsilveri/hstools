@@ -768,11 +768,19 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
 
         tbscene_path = os.path.join(bakes, f"{out_name}.tbscene")
         tb_status = _p4_status_cache.get('tb', 'NONE')
-        synced_from_p4 = False
 
-        if tb_status in ('DEPOT_ONLY', 'OUTDATED') and p4._p4_available():
-            # Depot has a file we don't have (or are behind on) — sync + open it
-            # instead of regenerating the .tbscene from scratch.
+        # Always re-export FBX so the mesh on disk is current
+        group_fbx_pairs = _export_per_group_fbx(groups, bakes)
+        if not group_fbx_pairs:
+            self.report({'ERROR'}, "All FBX exports failed.")
+            return {'CANCELLED'}
+        for _, fbx_path in group_fbx_pairs:
+            log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
+
+        tbscene_open = False
+
+        # ── Case 1: file only in depot (not local) — sync then open ─────────
+        if not tbscene_open and tb_status in ('DEPOT_ONLY', 'OUTDATED') and p4._p4_available():
             synced = p4.p4_sync(tbscene_path)
             if synced and os.path.isfile(tbscene_path):
                 p4.p4_checkout(tbscene_path, p4.get_cl_description())
@@ -781,19 +789,19 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                 if prefs.launch_app_after_export:
                     os.system(f'start "" "{toolbag_exe}" "{tbscene_path}"')
                     log_lines.append("✓ Toolbag launched with existing .tbscene")
-                synced_from_p4 = True
+                tbscene_open = True
             else:
-                log_lines.append("⚠ P4 sync failed — falling back to full export")
+                log_lines.append("⚠ P4 sync failed — falling back to open/export")
 
-        if not synced_from_p4:
-            # Normal path: re-export all FBX + generate + run bake script
-            group_fbx_pairs = _export_per_group_fbx(groups, bakes)
-            if not group_fbx_pairs:
-                self.report({'ERROR'}, "All FBX exports failed.")
-                return {'CANCELLED'}
-            for _, fbx_path in group_fbx_pairs:
-                log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
+        # ── Case 2: file already exists locally — just open it ───────────────
+        if not tbscene_open and os.path.isfile(tbscene_path):
+            if prefs.launch_app_after_export:
+                os.system(f'start "" "{toolbag_exe}" "{tbscene_path}"')
+                log_lines.append("✓ Toolbag launched with existing .tbscene")
+            tbscene_open = True
 
+        # ── Case 3: no .tbscene anywhere — generate it from FBX ─────────────
+        if not tbscene_open:
             script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes, out_name)
 
             if prefs.launch_app_after_export:
@@ -811,7 +819,7 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                     tb_running = False
 
                 if tb_running:
-                    log_lines.append("⚠ Toolbag open — FBX updated on disk (auto-reloads). Close Toolbag and re-export to update baker settings.")
+                    log_lines.append("⚠ Toolbag open — close it and re-export to create the .tbscene.")
                 else:
                     os.system(f'start "" "{toolbag_exe}" "{script_path}"')
                     log_lines.append("✓ Toolbag launched")
