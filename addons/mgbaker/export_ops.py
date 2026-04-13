@@ -618,13 +618,68 @@ def _export_per_group_fbx(groups, bakes_dir):
 
 # ── Toolbag script generation ─────────────────────────────────────────────
 
-def _generate_toolbag_script(group_fbx_pairs, bakes_dir, out_name):
-    """Generate a Toolbag 5 Python script.
+def _toolbag_group_lines(group, fbx_esc, output_path):
+    """Return the script lines to create/configure one BakerObject.
+    importModel() is synchronous — texture sets exist immediately after,
+    so setTextureSetWidth/Height can be called right away.
+    """
+    var = f"baker_{group.name}"
+    res_x = int(group.res_x)
+    res_y = int(group.res_y)
 
-    Creates one ``BakerObject`` per group in Multiple texture-set mode
-    (tileMode=1).  ``outputPath`` is set to the bakes directory so Toolbag
-    produces ``<bakes_dir>/<TextureSetName><suffix>.png`` — one file per
-    material, named after the material/texture-set.
+    lines = [
+        f"# ── {group.name} ──",
+        f"{var} = mset.BakerObject()",
+        f"{var}.name = '{group.name}'",
+        f"{var}.outputPath = r'{output_path}'",
+        f"{var}.outputSamples = 32",
+        f"{var}.outputBits = 8",
+        f"{var}.edgePadding = 'Extreme'",
+        f"{var}.tileMode = 1",
+        f"{var}.importModel(r'{fbx_esc}')",
+        f"# Set resolution AFTER importModel — importModel resets outputWidth/Height",
+        f"{var}.outputWidth = {res_x}",
+        f"{var}.outputHeight = {res_y}",
+        f"for _i in range({var}.getTextureSetCount()):",
+        f"    {var}.setTextureSetWidth(_i, {res_x})",
+        f"    {var}.setTextureSetHeight(_i, {res_y})",
+    ]
+
+    enabled_maps = []
+    for prop_name, tb_map_name, suffix in _MAP_DEFS:
+        if getattr(group, prop_name, False):
+            enabled_maps.append((tb_map_name, suffix))
+
+    for map_name, suffix in enabled_maps:
+        tb_suffix = suffix.lstrip("_")
+        lines += [
+            f"try:",
+            f"    _m = {var}.getMap('{map_name}')",
+            f"    _m.enabled = True",
+            f"    _m.suffix = '{tb_suffix}'",
+        ]
+        if map_name == "Ambient Occlusion":
+            lines.append(f"    _m.rayCount = 4096")
+        lines += [
+            f"except Exception as _e:",
+            f"    print('[mgBaker] {group.name} {map_name}:', _e)",
+        ]
+
+    lines += [
+        f"try:",
+        f"    for _bg in {var}.getChildren():",
+        f"        for _t in _bg.getChildren():",
+        f"            _t.maxOffset = {round(group.cage_offset, 4)}",
+        f"except Exception as _e:",
+        f"    print('[mgBaker] {group.name} cage:', _e)",
+        "",
+    ]
+    return lines, var
+
+
+def _generate_toolbag_script(group_fbx_pairs, bakes_dir, out_name):
+    """Generate a Toolbag 5 Python script that creates one BakerObject per
+    group in Multiple texture-set mode (tileMode=1).
 
     Returns ``(script_path, tbscene_path)``.
     """
@@ -633,63 +688,17 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir, out_name):
     lines = [
         "import mset",
         "",
-        "# Save .tbscene early so the file exists even if baker setup fails",
         f"mset.saveScene(r'{tbscene_path}')",
         "",
     ]
 
+    baker_vars = []
     for group, fbx_path in group_fbx_pairs:
         fbx_esc = fbx_path.replace("\\", "/")
-        # outputPath must have a .png extension so Toolbag outputs PNG (not PSD).
-        # With tileMode=1 Toolbag produces: <group.name>_<TextureSetName>_<suffix>.png
         output_path = os.path.join(bakes_dir, f"{group.name}.png").replace("\\", "/")
-
-        enabled_maps = []
-        for prop_name, tb_map_name, suffix in _MAP_DEFS:
-            if getattr(group, prop_name, False):
-                enabled_maps.append((tb_map_name, suffix))
-
-        var = f"baker_{group.name}"
-        lines += [
-            f"# ── {group.name} ──",
-            f"{var} = mset.BakerObject()",
-            f"{var}.importModel(r'{fbx_esc}')",
-            f"{var}.outputPath = r'{output_path}'",
-            f"{var}.outputWidth = {group.res_x}",
-            f"{var}.outputHeight = {group.res_y}",
-            f"{var}.outputSamples = 32",
-            f"{var}.outputBits = 8",
-            f"{var}.edgePadding = 'Extreme'",
-            f"{var}.tileMode = 1  # Multiple — one output file per texture set",
-            "",
-        ]
-
-        for map_name, suffix in enabled_maps:
-            tb_suffix = suffix.lstrip("_")  # Toolbag adds its own _ separator
-            lines += [
-                f"try:",
-                f"    _m = {var}.getMap('{map_name}')",
-                f"    _m.enabled = True",
-                f"    _m.suffix = '{tb_suffix}'",
-            ]
-            if map_name == "Ambient Occlusion":
-                lines.append(f"    _m.rayCount = 4096")
-            lines += [
-                f"except Exception as _e:",
-                f"    print('[mgBaker] {group.name} map {map_name}:', _e)",
-            ]
-        lines.append("")
-
-        # Cage offset — baker -> BakeGroup -> BakerTargetObject
-        lines += [
-            f"try:",
-            f"    for _bg in {var}.getChildren():",
-            f"        for _t in _bg.getChildren():",
-            f"            _t.maxOffset = {round(group.cage_offset, 4)}",
-            f"except Exception as _e:",
-            f"    print('[mgBaker] {group.name} cage offset:', _e)",
-            "",
-        ]
+        grp_lines, var = _toolbag_group_lines(group, fbx_esc, output_path)
+        lines += grp_lines
+        baker_vars.append(var)
 
     lines.append(f"mset.saveScene(r'{tbscene_path}')")
 
@@ -703,6 +712,53 @@ def _generate_toolbag_script(group_fbx_pairs, bakes_dir, out_name):
 
     print(f"[mgBaker] Toolbag script written to {script_path}")
     return script_path, tbscene_path
+
+
+def _generate_toolbag_reload_script(group_fbx_pairs, tbscene_path):
+    """Generate a Toolbag 5 Python script that loads an existing .tbscene,
+    destroys+recreates each baker, and re-imports the FBX.
+
+    Returns the script path.
+    """
+    tbscene_esc = tbscene_path.replace("\\", "/")
+    bakes_dir = os.path.dirname(tbscene_path)
+
+    lines = [
+        "import mset",
+        "",
+        f"mset.loadScene(r'{tbscene_esc}')",
+        "",
+        "# Destroy existing bakers so no mesh objects accumulate",
+    ]
+
+    for group, _ in group_fbx_pairs:
+        lines += [
+            f"_old = mset.findObject('{group.name}')",
+            f"if _old is not None: _old.destroy()",
+        ]
+
+    lines.append("")
+
+    baker_vars = []
+    for group, fbx_path in group_fbx_pairs:
+        fbx_esc = fbx_path.replace("\\", "/")
+        output_path = os.path.join(bakes_dir, f"{group.name}.png").replace("\\", "/")
+        grp_lines, var = _toolbag_group_lines(group, fbx_esc, output_path)
+        lines += grp_lines
+        baker_vars.append(var)
+
+    lines.append(f"mset.saveScene(r'{tbscene_esc}')")
+
+    script_content = "\n".join(lines)
+    script_path = os.path.join(
+        tempfile.gettempdir(),
+        f"mgbaker_toolbag_reload_{int(time.time())}.py",
+    )
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_content)
+
+    print(f"[mgBaker] Toolbag reload script written to {script_path}")
+    return script_path
 
 
 # ── Export to Toolbag ─────────────────────────────────────────────────────
@@ -777,6 +833,20 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
         for _, fbx_path in group_fbx_pairs:
             log_lines.append(f"✓ {os.path.basename(fbx_path)} exported")
 
+        # Check once whether Toolbag is already running
+        exe_stem = os.path.splitext(os.path.basename(toolbag_exe))[0]
+        try:
+            result = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"if (Get-Process -Name '{exe_stem}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            tb_running = result.stdout.strip().lower() == "yes"
+        except Exception:
+            tb_running = False
+
         tbscene_open = False
 
         # ── Case 1: file only in depot (not local) — sync then open ─────────
@@ -786,8 +856,9 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                 p4.p4_checkout(tbscene_path, p4.get_cl_description())
                 verb = "synced" if tb_status == 'DEPOT_ONLY' else "updated to latest"
                 log_lines.append(f"✓ .tbscene {verb} from Perforce")
-                if prefs.launch_app_after_export:
-                    os.system(f'start "" "{toolbag_exe}" "{tbscene_path}"')
+                if prefs.launch_app_after_export and not tb_running:
+                    reload_script = _generate_toolbag_reload_script(group_fbx_pairs, tbscene_path)
+                    os.system(f'start "" "{toolbag_exe}" "{reload_script}"')
                     log_lines.append("✓ Toolbag launched with existing .tbscene")
                 tbscene_open = True
             else:
@@ -795,8 +866,9 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
 
         # ── Case 2: file already exists locally — just open it ───────────────
         if not tbscene_open and os.path.isfile(tbscene_path):
-            if prefs.launch_app_after_export:
-                os.system(f'start "" "{toolbag_exe}" "{tbscene_path}"')
+            if prefs.launch_app_after_export and not tb_running:
+                reload_script = _generate_toolbag_reload_script(group_fbx_pairs, tbscene_path)
+                os.system(f'start "" "{toolbag_exe}" "{reload_script}"')
                 log_lines.append("✓ Toolbag launched with existing .tbscene")
             tbscene_open = True
 
@@ -805,19 +877,6 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
             script_path, tbscene_out = _generate_toolbag_script(group_fbx_pairs, bakes, out_name)
 
             if prefs.launch_app_after_export:
-                exe_stem = os.path.splitext(os.path.basename(toolbag_exe))[0]
-                try:
-                    result = subprocess.run(
-                        [
-                            "powershell", "-NoProfile", "-Command",
-                            f"if (Get-Process -Name '{exe_stem}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
-                        ],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    tb_running = result.stdout.strip().lower() == "yes"
-                except Exception:
-                    tb_running = False
-
                 if tb_running:
                     log_lines.append("⚠ Toolbag open — close it and re-export to create the .tbscene.")
                 else:
@@ -835,13 +894,13 @@ class MG_OT_ExportToToolbag(bpy.types.Operator):
                         return None
                     bpy.app.timers.register(_delayed_script_cleanup, first_interval=30.0)
 
+        if tb_running:
+            log_lines.append("✓ FBX updated on disk — re-export after closing Toolbag to reload")
+
         refresh_p4_status(context)
         _store_log(context, log_lines)
 
-        if any(line.startswith("⚠") for line in log_lines):
-            self.report({'WARNING'}, "Toolbag is already open. Mesh will auto-reload. Close Toolbag and re-export if you changed bake settings.")
-        else:
-            self.report({'INFO'}, f"Exported {len(groups)} group(s) to Toolbag")
+        self.report({'INFO'}, f"Exported {len(groups)} group(s) to Toolbag")
         return {'FINISHED'}
 
 
