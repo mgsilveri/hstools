@@ -1062,7 +1062,10 @@ class MG_OT_ExportToPainter(bpy.types.Operator):
                 # Painter is open — just write the config; the plugin watcher will reload
                 log_lines.append("✓ Painter running — mesh will reload automatically")
             else:
-                cmd = [painter_exe, spp_out_path, "--mesh", lp_fbx]
+                game_textures_dir = textures_dir.replace("source", "game")
+                os.makedirs(game_textures_dir, exist_ok=True)
+                cmd = [painter_exe, spp_out_path, "--mesh", lp_fbx,
+                       "--export-path", game_textures_dir]
                 subprocess.Popen(cmd)
                 log_lines.append("✓ Painter launched")
 
