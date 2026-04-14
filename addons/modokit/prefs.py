@@ -162,6 +162,14 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         ),
         default=True,
     )
+    enable_outliner_focus: BoolProperty(
+        name="Outliner Auto-Focus",
+        description=(
+            "Automatically scroll the Outliner to reveal the selected objects "
+            "whenever the Object Mode selection changes"
+        ),
+        default=True,
+    )
     enable_preselect_highlight: BoolProperty(
         name="Pre-selection Highlight",
         description=(
@@ -501,6 +509,7 @@ class ModoSelectionPreferences(bpy.types.AddonPreferences):
         box = layout.box()
         box.label(text="Miscellaneous", icon='SETTINGS')
         box.prop(self, "enable_instance_tagging")
+        box.prop(self, "enable_outliner_focus")
 
         # ── Hotkeys ───────────────────────────────────────────────────────────
         layout.separator(factor=0.5)

@@ -221,6 +221,7 @@ def get_addon_preferences(context):
             enable_uv_boundary_overlay = True
             enable_uv_flipped_face_viz = True
             enable_instance_tagging = True
+            enable_outliner_focus = True
             enable_preselect_highlight = True
             preselect_color = (0.549, 0.710, 0.780)
             preselect_alpha = 0.75

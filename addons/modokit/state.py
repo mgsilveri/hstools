@@ -232,3 +232,7 @@ _mesh_modal_unsafe: bool = False
 # True while a deferred timer is pending to clear _mesh_modal_unsafe.
 # Prevents multiple clear timers being stacked.
 _mesh_modal_unsafe_clear_pending: bool = False
+
+# ── Outliner auto-focus ───────────────────────────────────────────────────────
+_outliner_focus_prev_selected: frozenset = frozenset()
+_outliner_focus_timer_pending:  bool      = False

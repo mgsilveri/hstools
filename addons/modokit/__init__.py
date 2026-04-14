@@ -38,6 +38,7 @@ from . import (
     ops_uv,
     uv_selection,
     instance_tagging,
+    outliner_focus,
     keymap,
 )
 
@@ -158,6 +159,11 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(
             instance_tagging._instance_tag_depsgraph_handler)
 
+    # Outliner auto-focus handler
+    if outliner_focus._outliner_focus_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            outliner_focus._outliner_focus_depsgraph_handler)
+
     # UV seam-partner redraw handler
     if uv_overlays._uv_seam_redraw_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(
@@ -191,6 +197,16 @@ def register():
             _uv_debug_log(f"[UV-INIT] EXCEPTION: {_ie}")
         return None
     bpy.app.timers.register(_initial_uv_cache_populate, first_interval=0.2)
+
+    # Undo/redo safety: block bmesh access during BMesh reconstruction
+    if uv_overlays._undo_pre_handler not in bpy.app.handlers.undo_pre:
+        bpy.app.handlers.undo_pre.append(uv_overlays._undo_pre_handler)
+    if uv_overlays._undo_post_handler not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(uv_overlays._undo_post_handler)
+    if uv_overlays._redo_pre_handler not in bpy.app.handlers.redo_pre:
+        bpy.app.handlers.redo_pre.append(uv_overlays._redo_pre_handler)
+    if uv_overlays._redo_post_handler not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(uv_overlays._redo_post_handler)
 
     # UV gizmo: resync handle after undo / redo
     if uv_overlays._uv_undo_redo_handler not in bpy.app.handlers.undo_post:
@@ -240,6 +256,9 @@ def register():
     # Falloff — View menu Show Falloff toggle + header popover button
     bpy.types.VIEW3D_MT_view.append(panel_menu._draw_falloff_view_menu)
     bpy.types.VIEW3D_HT_header.append(panel_menu._draw_falloff_header_button)
+
+    # Outliner Auto-Focus header toggle button
+    bpy.types.OUTLINER_HT_header.append(panel_menu._draw_outliner_focus_header_button)
 
     # Sharp by UV — Mesh and Object menus
     bpy.types.VIEW3D_MT_edit_mesh.append(panel_menu._draw_smooth_by_uv_edit_menu)
@@ -320,6 +339,14 @@ def unregister():
         state._uv_snap_highlight_draw_handle = None
     uv_overlays._stop_uv_gizmo()
 
+    if uv_overlays._undo_pre_handler in bpy.app.handlers.undo_pre:
+        bpy.app.handlers.undo_pre.remove(uv_overlays._undo_pre_handler)
+    if uv_overlays._undo_post_handler in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(uv_overlays._undo_post_handler)
+    if uv_overlays._redo_pre_handler in bpy.app.handlers.redo_pre:
+        bpy.app.handlers.redo_pre.remove(uv_overlays._redo_pre_handler)
+    if uv_overlays._redo_post_handler in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(uv_overlays._redo_post_handler)
     if uv_overlays._uv_undo_redo_handler in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.remove(uv_overlays._uv_undo_redo_handler)
     if uv_overlays._uv_undo_redo_handler in bpy.app.handlers.redo_post:
@@ -328,6 +355,10 @@ def unregister():
     if instance_tagging._instance_tag_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(
             instance_tagging._instance_tag_depsgraph_handler)
+
+    if outliner_focus._outliner_focus_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(
+            outliner_focus._outliner_focus_depsgraph_handler)
     try:
         col = bpy.data.collections.get(state._INST_COLLECTION)
         if col:
@@ -345,6 +376,7 @@ def unregister():
     bpy.types.IMAGE_PT_overlay.remove(_draw_uv_overlays_panel)
     bpy.types.VIEW3D_MT_view.remove(panel_menu._draw_falloff_view_menu)
     bpy.types.VIEW3D_HT_header.remove(panel_menu._draw_falloff_header_button)
+    bpy.types.OUTLINER_HT_header.remove(panel_menu._draw_outliner_focus_header_button)
     bpy.types.VIEW3D_MT_edit_mesh.remove(panel_menu._draw_smooth_by_uv_edit_menu)
     bpy.types.VIEW3D_MT_object.remove(panel_menu._draw_smooth_by_uv_object_menu)
 

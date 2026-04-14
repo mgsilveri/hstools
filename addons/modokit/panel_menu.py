@@ -210,6 +210,15 @@ def _draw_falloff_view_menu(self, context):
     sub.prop(fp, 'show', text="Show Falloff")
 
 
+def _draw_outliner_focus_header_button(self, context):
+    """Appended to OUTLINER_HT_header — Outliner Auto-Focus toggle."""
+    prefs = _get_prefs(context)
+    if prefs is None:
+        return
+    self.layout.prop(prefs, 'enable_outliner_focus',
+                     text="", icon='ZOOM_SELECTED', toggle=True)
+
+
 def _draw_smooth_by_uv_edit_menu(self, context):
     """Appended to VIEW3D_MT_edit_mesh — Smooth by UV under the Mesh menu."""
     if context.mode != 'EDIT_MESH':

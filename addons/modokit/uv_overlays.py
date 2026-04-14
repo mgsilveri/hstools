@@ -430,6 +430,48 @@ def _read_uv_gizmo_center_from_bmesh(context):
         return None
 
 
+# ── Undo / redo safety handlers ──────────────────────────────────────────────
+
+@bpy.app.handlers.persistent
+def _undo_pre_handler(scene):
+    """Block bmesh access during Blender's undo BMesh reconstruction.
+
+    Blender tears down and rebuilds the internal BMesh in C when processing
+    Ctrl+Z.  Any timer, draw callback, or depsgraph handler that calls
+    bmesh.from_edit_mesh() in that window causes an EXCEPTION_ACCESS_VIOLATION.
+    Setting _mesh_modal_unsafe here gates all such calls via the existing
+    _bmesh_is_unsafe() check and the dirty-rebuild deferral logic.
+    Also invalidate the topo cache — topology may change after undo.
+    """
+    state._mesh_modal_unsafe = True
+    import modokit.backface_viz as _bv
+    _bv._bec_topo_valid = False
+
+
+@bpy.app.handlers.persistent
+def _undo_post_handler(scene):
+    """Defer the unsafe flag clear until after the BMesh is fully settled."""
+    if not state._mesh_modal_unsafe_clear_pending:
+        state._mesh_modal_unsafe_clear_pending = True
+        bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.032)
+
+
+@bpy.app.handlers.persistent
+def _redo_pre_handler(scene):
+    """Same as _undo_pre_handler but for Ctrl+Shift+Z / redo."""
+    state._mesh_modal_unsafe = True
+    import modokit.backface_viz as _bv
+    _bv._bec_topo_valid = False
+
+
+@bpy.app.handlers.persistent
+def _redo_post_handler(scene):
+    """Same as _undo_post_handler but for redo."""
+    if not state._mesh_modal_unsafe_clear_pending:
+        state._mesh_modal_unsafe_clear_pending = True
+        bpy.app.timers.register(_unsafe_clear_timer, first_interval=0.032)
+
+
 # ── Undo / redo handler ───────────────────────────────────────────────────────
 
 @bpy.app.handlers.persistent
